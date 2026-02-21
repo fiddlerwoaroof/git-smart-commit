@@ -1,0 +1,321 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "httpx",
+# ]
+# ///
+"""
+git-smart-commit: Analyze unstaged changes, group into logical commits, execute them.
+
+Uses Qwen3-Coder-30B-A3B via Ollama for classification.
+
+Usage:
+    git-smart-commit [--repo PATH] [--dry-run] [--model MODEL] [--yes]
+
+Options:
+    --repo PATH     Path to git repository (default: current directory)
+    --dry-run       Print proposed commits without executing
+    --model MODEL   Ollama model to use (default: qwen2.5-coder:32b)
+    --yes           Skip confirmation prompt and commit immediately
+    --json          Output proposed commits as JSON and exit (implies --dry-run)
+    --help          Show this message
+
+Exit codes:
+    0   Success
+    1   No changes found
+    2   Model/Ollama error
+    3   Git error
+    4   User cancelled
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+import httpx
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+
+OLLAMA_BASE_URL = "http://localhost:11434"
+DEFAULT_MODEL = "qwen2.5-coder:32b"
+OLLAMA_TIMEOUT = 300.0
+MAX_DIFF_CHARS = 120_000  # ~30k tokens; truncate beyond this per-file
+
+# ── Git helpers ────────────────────────────────────────────────────────────────
+
+def git(args: list[str], cwd: Path) -> str:
+    """Run a git command and return stdout. Raises on non-zero exit."""
+    result = subprocess.run(
+        ["git"] + args,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed:\n{result.stderr.strip()}")
+    return result.stdout
+
+
+def get_changed_files(repo: Path) -> list[str]:
+    """Return list of files with unstaged or staged changes."""
+    # Both staged (cached) and unstaged, deduped
+    staged = git(["diff", "--cached", "--name-only"], repo).splitlines()
+    unstaged = git(["diff", "--name-only"], repo).splitlines()
+    untracked = git(["ls-files", "--others", "--exclude-standard"], repo).splitlines()
+    seen = set()
+    files = []
+    for f in staged + unstaged + untracked:
+        if f and f not in seen:
+            seen.add(f)
+            files.append(f)
+    return files
+
+
+def get_file_diff(repo: Path, filepath: str) -> str:
+    """Return the diff for a single file (staged + unstaged combined)."""
+    try:
+        # Try staged first
+        staged = git(["diff", "--cached", "--", filepath], repo)
+        unstaged = git(["diff", "--", filepath], repo)
+        # For untracked files show full content
+        full_path = repo / filepath
+        if not staged and not unstaged and full_path.exists():
+            content = full_path.read_text(errors="replace")
+            return f"--- /dev/null\n+++ b/{filepath}\n@@ new file @@\n" + "\n".join(
+                f"+{line}" for line in content.splitlines()
+            )
+        combined = (staged + "\n" + unstaged).strip()
+        return combined[:MAX_DIFF_CHARS] if len(combined) > MAX_DIFF_CHARS else combined
+    except Exception as e:
+        return f"(could not diff {filepath}: {e})"
+
+
+def build_diff_summary(repo: Path, files: list[str]) -> str:
+    """Build a compact summary of all changes suitable for the prompt."""
+    parts = []
+    for f in files:
+        diff = get_file_diff(repo, f)
+        if diff:
+            parts.append(f"### {f}\n{diff}")
+    return "\n\n".join(parts)
+
+
+# ── Ollama client ──────────────────────────────────────────────────────────────
+
+def call_ollama(model: str, prompt: str) -> str:
+    """Call Ollama chat completions and return the assistant message text."""
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "keep_alive": "1h",
+        "options": {
+            "temperature": 0.1,   # low temp for deterministic classification
+            "num_ctx": 131072,
+        },
+    }
+    try:
+        with httpx.Client(timeout=OLLAMA_TIMEOUT) as client:
+            response = client.post(
+                f"{OLLAMA_BASE_URL}/api/chat",
+                json=payload,
+            )
+            response.raise_for_status()
+            return response.json()["message"]["content"]
+    except httpx.ConnectError:
+        print("Error: Cannot connect to Ollama. Is it running? (ollama serve)", file=sys.stderr)
+        sys.exit(2)
+    except httpx.HTTPStatusError as e:
+        print(f"Error: Ollama returned {e.response.status_code}: {e.response.text}", file=sys.stderr)
+        sys.exit(2)
+    except KeyError:
+        print("Error: Unexpected response format from Ollama.", file=sys.stderr)
+        sys.exit(2)
+
+
+# ── Classification prompt ──────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = textwrap.dedent("""\
+    You are a senior software engineer helping organize messy working-tree changes
+    into clean, logical git commits.
+
+    Given a list of changed files and their diffs, your job is to group them into
+    one or more commits. Each commit should represent a single logical change
+    (e.g. "add feature X", "fix bug in Y", "update dependencies", "refactor Z").
+
+    Rules:
+    - Keep related changes together (same feature, same module, same concern)
+    - Separate unrelated concerns into different commits
+    - Dependency/lockfile changes belong with the commit that caused them
+    - Test files belong with the code they test
+    - Use conventional commit format for messages: type(scope): description
+      Types: feat, fix, refactor, chore, docs, test, style, build, ci
+    - Keep messages concise (under 72 chars)
+
+    Respond ONLY with a JSON array. No prose, no markdown fences. Example:
+    [
+      {
+        "message": "feat(auth): add JWT refresh token support",
+        "files": ["src/auth/refresh.py", "tests/test_refresh.py"]
+      },
+      {
+        "message": "chore(deps): bump httpx to 0.27",
+        "files": ["requirements.txt", "poetry.lock"]
+      }
+    ]
+""")
+
+
+def classify_changes(model: str, files: list[str], diff_summary: str) -> list[dict]:
+    """Ask the model to group files into logical commits. Returns list of commit dicts."""
+    file_list = "\n".join(f"  - {f}" for f in files)
+    prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"Changed files:\n{file_list}\n\n"
+        f"Diffs:\n{diff_summary}"
+    )
+
+    raw = call_ollama(model, prompt)
+
+    # Strip any accidental markdown fences the model might add
+    raw = raw.strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+    try:
+        commits = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"Error: Model returned invalid JSON: {e}", file=sys.stderr)
+        print(f"Raw output:\n{raw}", file=sys.stderr)
+        sys.exit(2)
+
+    if not isinstance(commits, list):
+        print("Error: Model returned unexpected structure (expected a JSON array).", file=sys.stderr)
+        sys.exit(2)
+
+    # Validate each entry
+    valid = []
+    for item in commits:
+        if isinstance(item, dict) and "message" in item and "files" in item:
+            valid.append(item)
+    if not valid:
+        print("Error: Model returned no valid commit groups.", file=sys.stderr)
+        sys.exit(2)
+
+    return valid
+
+
+# ── Commit execution ───────────────────────────────────────────────────────────
+
+def execute_commits(repo: Path, commits: list[dict]) -> None:
+    """Stage and commit each group in order."""
+    for i, commit in enumerate(commits, 1):
+        message = commit["message"]
+        files = commit["files"]
+
+        print(f"\n[{i}/{len(commits)}] {message}")
+
+        # Stage the files for this commit
+        for f in files:
+            try:
+                git(["add", "--", f], repo)
+                print(f"  + {f}")
+            except RuntimeError as e:
+                print(f"  ! Could not stage {f}: {e}", file=sys.stderr)
+
+        # Check something is actually staged
+        staged = git(["diff", "--cached", "--name-only"], repo).strip()
+        if not staged:
+            print("  (nothing staged, skipping)")
+            continue
+
+        try:
+            git(["commit", "-m", message], repo)
+            print(f"  ✓ Committed")
+        except RuntimeError as e:
+            print(f"  Error committing: {e}", file=sys.stderr)
+            sys.exit(3)
+
+
+# ── Display helpers ────────────────────────────────────────────────────────────
+
+def print_proposed_commits(commits: list[dict]) -> None:
+    print("\nProposed commits:")
+    print("─" * 60)
+    for i, commit in enumerate(commits, 1):
+        print(f"\n  [{i}] {commit['message']}")
+        for f in commit.get("files", []):
+            print(f"       {f}")
+    print()
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Group git changes into logical commits using Qwen3-Coder.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--repo", default=".", help="Path to git repository")
+    parser.add_argument("--dry-run", action="store_true", help="Show proposed commits without executing")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model (default: {DEFAULT_MODEL})")
+    parser.add_argument("--yes", "-y", action="store_true", help="Commit without confirmation")
+    parser.add_argument("--json", dest="json_out", action="store_true", help="Output JSON and exit")
+
+    args = parser.parse_args()
+    repo = Path(args.repo).resolve()
+
+    # Verify it's a git repo
+    try:
+        git(["rev-parse", "--git-dir"], repo)
+    except RuntimeError:
+        print(f"Error: {repo} is not a git repository.", file=sys.stderr)
+        sys.exit(3)
+
+    # Collect changed files
+    print("Scanning for changes...", file=sys.stderr)
+    files = get_changed_files(repo)
+    if not files:
+        print("No changes found.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Found {len(files)} changed file(s). Analyzing...", file=sys.stderr)
+
+    # Build diff and classify
+    diff_summary = build_diff_summary(repo, files)
+    commits = classify_changes(args.model, files, diff_summary)
+
+    # JSON mode: just dump and exit
+    if args.json_out:
+        print(json.dumps(commits, indent=2))
+        return
+
+    # Display proposed commits
+    print_proposed_commits(commits)
+
+    if args.dry_run:
+        return
+
+    # Confirm unless --yes
+    if not args.yes:
+        try:
+            answer = input("Proceed with these commits? [y/N] ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.")
+            sys.exit(4)
+        if answer not in ("y", "yes"):
+            print("Cancelled.")
+            sys.exit(4)
+
+    execute_commits(repo, commits)
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
