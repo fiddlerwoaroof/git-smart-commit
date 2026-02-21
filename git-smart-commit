@@ -151,41 +151,41 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     one or more commits. Each commit should represent a single logical change
     (e.g. "add feature X", "fix bug in Y", "update dependencies", "refactor Z").
 
-    You do not need to commit every file: if a file is junk, just
-    leave it unstaged and do not commit it.
+    You do not need to commit every file. Skip junk files (editor backups,
+    build artifacts, OS metadata). Instead, collect suggested .gitignore patterns
+    for them in the top-level "gitignore" field.
 
     Rules:
     - Keep related changes together (same feature, same module, same concern)
     - Separate unrelated concerns into different commits
     - Dependency/lockfile changes belong with the commit that caused them
     - Test files belong with the code they test
-    - Use conventional commit format for messages:
-       ```
-       type(scope): short description
-
-       long description
-       ```
+    - Use conventional commit format:
+        subject: type(scope): short description  (under 72 chars)
+        body: 4-10 lines, plain text, wrapped at 80 chars, no markdown
       Types: feat, fix, refactor, chore, docs, test, style, build, ci
-    - Keep short description concise (under 72 chars)
-    - Make long description relatively brief but informative (4-10 lines, wrapped at 80 chars, markdown format)
-    - Identify junk files from editors and the build process and do not include them but suggest .gitignore patterns
 
-    Respond ONLY with a JSON array. No prose, no markdown fences. Example:
-    [
-      {
-        "message": "feat(auth): add JWT refresh token support",
-        "files": ["src/auth/refresh.py", "tests/test_refresh.py"]
-      },
-      {
-        "message": "chore(deps): bump httpx to 0.27",
-        "files": ["requirements.txt", "poetry.lock"]
-      }
-    ]
+    Respond ONLY with a JSON object. No prose, no markdown fences. Schema:
+    {
+      "commits": [
+        {
+          "subject": "feat(auth): add JWT refresh token support",
+          "body": "Implements RFC 7519 refresh tokens with a 30-day expiry.\nAdds /auth/refresh endpoint and updates the token middleware\nto validate refresh tokens separately from access tokens.",
+          "files": ["src/auth/refresh.py", "tests/test_refresh.py"]
+        },
+        {
+          "subject": "chore(deps): bump httpx to 0.27",
+          "body": "Picks up the connection pool fix from upstream.",
+          "files": ["requirements.txt", "poetry.lock"]
+        }
+      ],
+      "gitignore": ["*.pyc", "__pycache__/", ".DS_Store"]
+    }
 """)
 
 
-def classify_changes(model: str, files: list[str], stat_summary: str) -> list[dict]:
-    """Ask the model to group files into logical commits. Returns list of commit dicts."""
+def classify_changes(model: str, files: list[str], stat_summary: str) -> tuple[list[dict], list[str]]:
+    """Ask the model to group files into logical commits. Returns (commits, gitignore_patterns)."""
     file_list = "\n".join(f"  - {f}" for f in files)
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
@@ -202,26 +202,40 @@ def classify_changes(model: str, files: list[str], stat_summary: str) -> list[di
         raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
 
     try:
-        commits = json.loads(raw)
+        result = json.loads(raw)
     except json.JSONDecodeError as e:
         print(f"Error: Model returned invalid JSON: {e}", file=sys.stderr)
         print(f"Raw output:\n{raw}", file=sys.stderr)
         sys.exit(2)
 
-    if not isinstance(commits, list):
-        print("Error: Model returned unexpected structure (expected a JSON array).", file=sys.stderr)
+    # Support both new object schema {"commits": [...], "gitignore": [...]}
+    # and old array schema [...] for backwards compatibility
+    if isinstance(result, list):
+        commits_raw = result
+        gitignore = []
+    elif isinstance(result, dict):
+        commits_raw = result.get("commits", [])
+        gitignore = result.get("gitignore", [])
+    else:
+        print("Error: Model returned unexpected structure.", file=sys.stderr)
         sys.exit(2)
 
-    # Validate each entry
+    # Validate each entry — accept both "subject" (new) and "message" (old) keys
     valid = []
-    for item in commits:
-        if isinstance(item, dict) and "message" in item and "files" in item:
+    for item in commits_raw:
+        if not isinstance(item, dict):
+            continue
+        if "subject" in item and "files" in item:
             valid.append(item)
+        elif "message" in item and "files" in item:
+            # normalise old schema to new
+            valid.append({"subject": item["message"], "body": "", "files": item["files"]})
+
     if not valid:
         print("Error: Model returned no valid commit groups.", file=sys.stderr)
         sys.exit(2)
 
-    return valid
+    return valid, gitignore
 
 
 # ── Commit execution ───────────────────────────────────────────────────────────
@@ -229,10 +243,12 @@ def classify_changes(model: str, files: list[str], stat_summary: str) -> list[di
 def execute_commits(repo: Path, commits: list[dict]) -> None:
     """Stage and commit each group in order."""
     for i, commit in enumerate(commits, 1):
-        message = commit["message"]
+        subject = commit["subject"]
+        body = commit.get("body", "").strip()
+        message = f"{subject}\n\n{body}" if body else subject
         files = commit["files"]
 
-        print(f"\n[{i}/{len(commits)}] {message}")
+        print(f"\n[{i}/{len(commits)}] {subject}")
 
         # Stage the files for this commit
         for f in files:
@@ -258,13 +274,21 @@ def execute_commits(repo: Path, commits: list[dict]) -> None:
 
 # ── Display helpers ────────────────────────────────────────────────────────────
 
-def print_proposed_commits(commits: list[dict]) -> None:
+def print_proposed_commits(commits: list[dict], gitignore: list[str]) -> None:
     print("\nProposed commits:")
     print("─" * 60)
     for i, commit in enumerate(commits, 1):
-        print(f"\n  [{i}] {commit['message']}")
+        print(f"\n  [{i}] {commit['subject']}")
+        body = commit.get("body", "").strip()
+        if body:
+            for line in body.splitlines():
+                print(f"       {line}")
         for f in commit.get("files", []):
-            print(f"       {f}")
+            print(f"       + {f}")
+    if gitignore:
+        print("\n  Suggested .gitignore patterns:")
+        for pattern in gitignore:
+            print(f"       {pattern}")
     print()
 
 
@@ -303,15 +327,15 @@ def main() -> None:
 
     # Build stat summary and classify
     stat_summary = build_stat_summary(repo)
-    commits = classify_changes(args.model, files, stat_summary)
+    commits, gitignore = classify_changes(args.model, files, stat_summary)
 
     # JSON mode: just dump and exit
     if args.json_out:
-        print(json.dumps(commits, indent=2))
+        print(json.dumps({"commits": commits, "gitignore": gitignore}, indent=2))
         return
 
     # Display proposed commits
-    print_proposed_commits(commits)
+    print_proposed_commits(commits, gitignore)
 
     if args.dry_run:
         return
