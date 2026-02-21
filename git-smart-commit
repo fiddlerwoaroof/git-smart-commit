@@ -35,6 +35,7 @@ import json
 import subprocess
 import sys
 import textwrap
+import inspect
 from pathlib import Path
 from typing import Any, Callable
 
@@ -115,7 +116,7 @@ def call_ollama_with_tool(
         content = content.lstrip("```json").lstrip("```").rstrip("```").strip()
         raw_args = json.loads(content)
 
-    return args_model.model_validate(raw_args)
+    return args_model.model_validate(raw_args).post_process()
 
 
 # ── Git helpers ────────────────────────────────────────────────────────────────
@@ -305,9 +306,17 @@ class Commit(BaseModel):
     body: str = Field(default="", description="4-10 line plain-text commit body, no markdown")
 
 
+    def post_process(self):
+        self.body = textwrap.fill(self.body, 80)
+        return self
+
 class ProposeCommitsArgs(BaseModel):
     commits: list[Commit] = Field(description="Logical commit groups")
     gitignore: list[str] = Field(default_factory=list, description="Suggested .gitignore patterns for junk files")
+
+    def post_process(self):
+        self.commits = [commit.post_process() for commit in self.commits]
+        return self
 
 
 @tool(ProposeCommitsArgs)
@@ -405,9 +414,10 @@ def print_proposed_commits(commits: list[dict], gitignore: list[str]) -> None:
     for i, commit in enumerate(commits, 1):
         print(f"\n  [{i}] {commit['subject']}")
         body = commit.get("body", "").strip()
+        print()
         if body:
             for line in body.splitlines():
-                print(f"       {line}")
+                print(f"      {line}")
         for f in commit.get("files", []):
             print(f"       + {f}")
         if (issues:= commit.get("issues")) != []:
