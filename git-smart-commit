@@ -43,7 +43,7 @@ import httpx
 OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_MODEL = "qwen3-coder:30b-a3b-q8_0"
 OLLAMA_TIMEOUT = 300.0
-NUM_CTX = 32768  # classification prompt is tiny with --stat approach
+NUM_CTX = 128000
 
 # ── Git helpers ────────────────────────────────────────────────────────────────
 
@@ -75,31 +75,123 @@ def get_changed_files(repo: Path) -> list[str]:
     return files
 
 
-def build_stat_summary(repo: Path) -> str:
-    """Return git diff --stat for staged+unstaged changes.
+DIFF_CHARS_PER_FILE = 6000    # files larger than this get hunk-summarized
+DIFF_TOTAL_CHARS   = 120000   # hard cap on total context sent to classifier
+HUNK_SUMMARIZE_CTX = 8192     # smaller context for summarization calls (faster)
 
-    This is the classification pass input — one compact line per file showing
-    what changed (insertions/deletions), not the full patch. Keeps the prompt
-    tiny regardless of diff size.
+
+def split_hunks(diff_text: str) -> list[str]:
+    """Split a unified diff into individual hunks (each starting with @@)."""
+    lines = diff_text.splitlines(keepends=True)
+    hunks: list[str] = []
+    header_lines: list[str] = []
+    current: list[str] = []
+
+    for line in lines:
+        if line.startswith("@@"):
+            if current:
+                hunks.append("".join(current))
+            current = header_lines + [line]
+        elif line.startswith(("diff --git", "index ", "--- ", "+++ ")):
+            header_lines.append(line)
+            if current:
+                # flush any open hunk first
+                hunks.append("".join(current))
+                current = []
+        else:
+            if current:
+                current.append(line)
+            # lines before the first @@ go into header_lines
+            elif not line.startswith("@@"):
+                header_lines.append(line)
+
+    if current:
+        hunks.append("".join(current))
+
+    return hunks or [diff_text]   # fallback: treat whole diff as one hunk
+
+
+PRIOR_HUNK_WINDOW = 3   # how many previous hunk summaries to include as context
+
+
+def summarize_file_diff(model: str, fname: str, diff_text: str) -> str:
+    """Ask the model to summarize each hunk, passing the last 3 summaries as context."""
+    hunks = split_hunks(diff_text)
+    hunk_summaries: list[str] = []
+
+    for i, hunk in enumerate(hunks, 1):
+        hunk_snippet = hunk if len(hunk) <= 4000 else hunk[:4000] + "\n... (hunk truncated)"
+
+        prior_context = ""
+        if hunk_summaries:
+            window = hunk_summaries[-PRIOR_HUNK_WINDOW:]
+            start_idx = i - len(window)
+            prior_context = "Previous hunks in this file:\n" + "\n".join(
+                f"  Hunk {start_idx + j}: {s}" for j, s in enumerate(window)
+            ) + "\n\n"
+
+        prompt = textwrap.dedent(f"""\
+            Summarize hunk {i} of {len(hunks)} from '{fname}' in 1-3 plain English sentences.
+            Focus on WHAT changed and WHY it matters (if inferable). No jargon, no bullet points.
+            Do not mention line numbers. Output only the summary, nothing else.
+
+            {prior_context}Hunk {i}:
+            {hunk_snippet}
+        """)
+        summary = call_ollama(model, prompt, num_ctx=HUNK_SUMMARIZE_CTX)
+        hunk_summaries.append(summary.strip())
+
+    return f"[summarized — {len(hunks)} hunk(s)]\n" + "\n".join(
+        f"  Hunk {i}: {s}" for i, s in enumerate(hunk_summaries, 1)
+    )
+
+
+def build_diff_summary(repo: Path, model: str) -> str:
+    """Return diff context for the classifier.
+
+    Small files: include raw diff.
+    Large files: summarize each hunk via a fast model call, then include summaries.
     """
-    # Combine staged and unstaged stat output
-    staged_stat = git(["diff", "--cached", "--stat", "--no-color"], repo).strip()
-    unstaged_stat = git(["diff", "--stat", "--no-color"], repo).strip()
-    untracked = git(["ls-files", "--others", "--exclude-standard"], repo).splitlines()
+    parts: list[str] = []
+    total_chars = 0
 
-    parts = []
-    if staged_stat:
-        parts.append(f"Staged:\n{staged_stat}")
-    if unstaged_stat:
-        parts.append(f"Unstaged:\n{unstaged_stat}")
+    for label, extra_args in [("Staged", ["--cached"]), ("Unstaged", [])]:
+        stat = git(["diff"] + extra_args + ["--stat", "--no-color"], repo).strip()
+        if not stat:
+            continue
+        parts.append(f"{label}:\n{stat}\n")
+
+        changed = git(["diff"] + extra_args + ["--name-only"], repo).splitlines()
+        for fname in changed:
+            file_diff = git(["diff"] + extra_args + ["--no-color", "--", fname], repo)
+
+            if len(file_diff) <= DIFF_CHARS_PER_FILE:
+                content = file_diff
+            else:
+                print(f"  Summarizing large diff: {fname} ({len(file_diff):,} chars)…",
+                      file=sys.stderr)
+                content = summarize_file_diff(model, fname, file_diff)
+
+            parts.append(content)
+            total_chars += len(content)
+
+            if total_chars >= DIFF_TOTAL_CHARS:
+                parts.append("\n... (remaining diffs omitted — total size limit reached)")
+                break
+        else:
+            continue
+        break   # hit total limit inside inner loop
+
+    untracked = git(["ls-files", "--others", "--exclude-standard"], repo).splitlines()
     if untracked:
         parts.append("Untracked (new files):\n" + "\n".join(f"  {f}" for f in untracked))
-    return "\n\n".join(parts)
+
+    return "\n".join(parts)
 
 
 # ── Ollama client ──────────────────────────────────────────────────────────────
 
-def call_ollama(model: str, prompt: str) -> str:
+def call_ollama(model: str, prompt: str, num_ctx: int = NUM_CTX) -> str:
     """Call Ollama chat completions and return the assistant message text."""
     payload = {
         "model": model,
@@ -108,7 +200,7 @@ def call_ollama(model: str, prompt: str) -> str:
         "keep_alive": "1h",
         "options": {
             "temperature": 0.1,   # low temp for deterministic classification
-            "num_ctx": NUM_CTX,
+            "num_ctx": num_ctx,
         },
     }
     # try:
@@ -184,13 +276,13 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 """)
 
 
-def classify_changes(model: str, files: list[str], stat_summary: str) -> tuple[list[dict], list[str]]:
+def classify_changes(model: str, files: list[str], diff_summary: str) -> tuple[list[dict], list[str]]:
     """Ask the model to group files into logical commits. Returns (commits, gitignore_patterns)."""
     file_list = "\n".join(f"  - {f}" for f in files)
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
         f"Changed files:\n{file_list}\n\n"
-        f"Change summary (git diff --stat):\n{stat_summary}"
+        f"Diffs:\n{diff_summary}"
     )
 
     raw = call_ollama(model, prompt)
@@ -326,8 +418,8 @@ def main() -> None:
     print(f"Found {len(files)} changed file(s). Analyzing...", file=sys.stderr)
 
     # Build stat summary and classify
-    stat_summary = build_stat_summary(repo)
-    commits, gitignore = classify_changes(args.model, files, stat_summary)
+    diff_summary = build_diff_summary(repo, args.model)
+    commits, gitignore = classify_changes(args.model, files, diff_summary)
 
     # JSON mode: just dump and exit
     if args.json_out:
