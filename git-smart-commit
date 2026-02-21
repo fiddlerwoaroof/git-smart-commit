@@ -98,20 +98,10 @@ def call_ollama_with_tool(
             "num_ctx": num_ctx,
         },
     }
-    try:
-        with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
-            response = client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
-            response.raise_for_status()
-            data = response.json()
-    except httpx.ConnectError:
-        print("Error: Cannot connect to Ollama. Is it running? (ollama serve)", file=sys.stderr)
-        sys.exit(2)
-    except httpx.ReadTimeout:
-        print("Error: Ollama timed out. Try a smaller model or reduce diff size.", file=sys.stderr)
-        sys.exit(2)
-    except httpx.HTTPStatusError as e:
-        print(f"Error: Ollama returned {e.response.status_code}: {e.response.text}", file=sys.stderr)
-        sys.exit(2)
+    with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
+        response = client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+        response.raise_for_status()
+        data = response.json()
 
     tool_calls = data.get("message", {}).get("tool_calls", [])
     if tool_calls:
@@ -123,18 +113,9 @@ def call_ollama_with_tool(
         # Fallback: parse message content as JSON
         content = data.get("message", {}).get("content", "").strip()
         content = content.lstrip("```json").lstrip("```").rstrip("```").strip()
-        try:
-            raw_args = json.loads(content)
-        except json.JSONDecodeError:
-            print(f"Error: Model did not call tool and returned invalid JSON.\nRaw: {content}", file=sys.stderr)
-            sys.exit(2)
+        raw_args = json.loads(content)
 
-    try:
-        return args_model.model_validate(raw_args)
-    except Exception as e:
-        print(f"Error: Tool arguments failed validation: {e}", file=sys.stderr)
-        sys.exit(2)
-
+    return args_model.model_validate(raw_args)
 
 
 # ── Git helpers ────────────────────────────────────────────────────────────────
@@ -318,6 +299,7 @@ def call_ollama(model: str, prompt: str, num_ctx: int = NUM_CTX) -> str:
 # ── Tool definitions ───────────────────────────────────────────────────────────
 
 class Commit(BaseModel):
+    issues: list[str] = Field(default_factory=list, description="Issues noticed in the code being committed")
     subject: str = Field(description="Conventional commit subject line (type(scope): desc), under 72 chars")
     files: list[str] = Field(description="Repository-relative paths to include in this commit")
     body: str = Field(default="", description="4-10 line plain-text commit body, no markdown")
@@ -356,6 +338,7 @@ SYSTEM_PROMPT = textwrap.dedent("""\
       Types: feat, fix, refactor, chore, docs, test, style, build, ci
     - Write body content based only on what you observe in the diff.
       Do not reference issue numbers or details not visible in the changes.
+    - Also, call out any potential issues in each commit for review.
 
     Call the propose_commits tool with your answer.
 """)
@@ -374,8 +357,7 @@ def classify_changes(model: str, files: list[str], diff_summary: str) -> tuple[l
 
     commits = [c.model_dump() for c in result.commits]
     if not commits:
-        print("Error: Model returned no valid commit groups.", file=sys.stderr)
-        sys.exit(2)
+        raise Exception("Error: Model returned no valid commit groups.")
 
     return commits, result.gitignore
 
@@ -412,8 +394,7 @@ def execute_commits(repo: Path, commits: list[dict]) -> None:
             git(["commit", "-m", message], repo)
             print(f"  ✓ Committed")
         except RuntimeError as e:
-            print(f"  Error committing: {e}", file=sys.stderr)
-            sys.exit(3)
+            raise Exception(f"  Error committing: {e}", file=sys.stderr)
 
 
 # ── Display helpers ────────────────────────────────────────────────────────────
@@ -429,6 +410,10 @@ def print_proposed_commits(commits: list[dict], gitignore: list[str]) -> None:
                 print(f"       {line}")
         for f in commit.get("files", []):
             print(f"       + {f}")
+        if (issues:= commit.get("issues")) != []:
+            print("Issues in this commit:")
+            for issue in issues:
+                print(f"\t- {issue.strip()}")
     if gitignore:
         print("\n  Suggested .gitignore patterns:")
         for pattern in gitignore:
@@ -457,15 +442,13 @@ def main() -> None:
     try:
         git(["rev-parse", "--git-dir"], repo)
     except RuntimeError:
-        print(f"Error: {repo} is not a git repository.", file=sys.stderr)
-        sys.exit(3)
+        raise Exception(f"Error: {repo} is not a git repository.", file=sys.stderr)
 
     # Collect changed files
     print("Scanning for changes...", file=sys.stderr)
     files = get_changed_files(repo)
     if not files:
-        print("No changes found.", file=sys.stderr)
-        sys.exit(1)
+        raise Exception("No changes found.")
 
     print(f"Found {len(files)} changed file(s). Analyzing...", file=sys.stderr)
 
@@ -486,14 +469,13 @@ def main() -> None:
 
     # Confirm unless --yes
     if not args.yes:
+        success = False
         try:
             answer = input("Proceed with these commits? [y/N] ").strip().lower()
         except (KeyboardInterrupt, EOFError):
-            print("\nCancelled.")
-            sys.exit(4)
+            raise Exception("\nCancelled.")
         if answer not in ("y", "yes"):
-            print("Cancelled.")
-            sys.exit(4)
+            raise Exception("Cancelled.")
 
     execute_commits(repo, commits)
     print("\nDone.")
