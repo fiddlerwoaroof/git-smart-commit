@@ -41,9 +41,9 @@ import httpx
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 OLLAMA_BASE_URL = "http://localhost:11434"
-DEFAULT_MODEL = "qwen2.5-coder:32b"
+DEFAULT_MODEL = "qwen3-coder:30b-a3b-q8_0"
 OLLAMA_TIMEOUT = 300.0
-MAX_DIFF_CHARS = 120_000  # ~30k tokens; truncate beyond this per-file
+NUM_CTX = 32768  # classification prompt is tiny with --stat approach
 
 # ── Git helpers ────────────────────────────────────────────────────────────────
 
@@ -75,32 +75,25 @@ def get_changed_files(repo: Path) -> list[str]:
     return files
 
 
-def get_file_diff(repo: Path, filepath: str) -> str:
-    """Return the diff for a single file (staged + unstaged combined)."""
-    try:
-        # Try staged first
-        staged = git(["diff", "--cached", "--", filepath], repo)
-        unstaged = git(["diff", "--", filepath], repo)
-        # For untracked files show full content
-        full_path = repo / filepath
-        if not staged and not unstaged and full_path.exists():
-            content = full_path.read_text(errors="replace")
-            return f"--- /dev/null\n+++ b/{filepath}\n@@ new file @@\n" + "\n".join(
-                f"+{line}" for line in content.splitlines()
-            )
-        combined = (staged + "\n" + unstaged).strip()
-        return combined[:MAX_DIFF_CHARS] if len(combined) > MAX_DIFF_CHARS else combined
-    except Exception as e:
-        return f"(could not diff {filepath}: {e})"
+def build_stat_summary(repo: Path) -> str:
+    """Return git diff --stat for staged+unstaged changes.
 
+    This is the classification pass input — one compact line per file showing
+    what changed (insertions/deletions), not the full patch. Keeps the prompt
+    tiny regardless of diff size.
+    """
+    # Combine staged and unstaged stat output
+    staged_stat = git(["diff", "--cached", "--stat", "--no-color"], repo).strip()
+    unstaged_stat = git(["diff", "--stat", "--no-color"], repo).strip()
+    untracked = git(["ls-files", "--others", "--exclude-standard"], repo).splitlines()
 
-def build_diff_summary(repo: Path, files: list[str]) -> str:
-    """Build a compact summary of all changes suitable for the prompt."""
     parts = []
-    for f in files:
-        diff = get_file_diff(repo, f)
-        if diff:
-            parts.append(f"### {f}\n{diff}")
+    if staged_stat:
+        parts.append(f"Staged:\n{staged_stat}")
+    if unstaged_stat:
+        parts.append(f"Unstaged:\n{unstaged_stat}")
+    if untracked:
+        parts.append("Untracked (new files):\n" + "\n".join(f"  {f}" for f in untracked))
     return "\n\n".join(parts)
 
 
@@ -111,30 +104,41 @@ def call_ollama(model: str, prompt: str) -> str:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
+        "stream": True,
         "keep_alive": "1h",
         "options": {
             "temperature": 0.1,   # low temp for deterministic classification
-            "num_ctx": 131072,
+            "num_ctx": NUM_CTX,
         },
     }
-    try:
-        with httpx.Client(timeout=OLLAMA_TIMEOUT) as client:
-            response = client.post(
-                f"{OLLAMA_BASE_URL}/api/chat",
-                json=payload,
-            )
+    # try:
+    with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=5.0)) as client:
+        with client.stream("POST", f"{OLLAMA_BASE_URL}/api/chat", json=payload) as response:
             response.raise_for_status()
-            return response.json()["message"]["content"]
-    except httpx.ConnectError:
-        print("Error: Cannot connect to Ollama. Is it running? (ollama serve)", file=sys.stderr)
-        sys.exit(2)
-    except httpx.HTTPStatusError as e:
-        print(f"Error: Ollama returned {e.response.status_code}: {e.response.text}", file=sys.stderr)
-        sys.exit(2)
-    except KeyError:
-        print("Error: Unexpected response format from Ollama.", file=sys.stderr)
-        sys.exit(2)
+            chunks = []
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                content = data.get("message", {}).get("content", "")
+                if content:
+                    chunks.append(content)
+                if data.get("done"):
+                    break
+            return "".join(chunks)
+    #except httpx.ConnectError:
+    #    print("Error: Cannot connect to Ollama. Is it running? (ollama serve)", file=sys.stderr)
+    #    sys.exit(2)
+    #except httpx.HTTPStatusError as e:
+    #    try:
+    #        body = e.response.read().decode()
+    #    except Exception:
+    #        body = "(unreadable)"
+    #    print(f"Error: Ollama returned {e.response.status_code} for {e.request.url}: {body}", file=sys.stderr)
+    #    sys.exit(2)
 
 
 # ── Classification prompt ──────────────────────────────────────────────────────
@@ -147,14 +151,24 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     one or more commits. Each commit should represent a single logical change
     (e.g. "add feature X", "fix bug in Y", "update dependencies", "refactor Z").
 
+    You do not need to commit every file: if a file is junk, just
+    leave it unstaged and do not commit it.
+
     Rules:
     - Keep related changes together (same feature, same module, same concern)
     - Separate unrelated concerns into different commits
     - Dependency/lockfile changes belong with the commit that caused them
     - Test files belong with the code they test
-    - Use conventional commit format for messages: type(scope): description
+    - Use conventional commit format for messages:
+       ```
+       type(scope): short description
+
+       long description
+       ```
       Types: feat, fix, refactor, chore, docs, test, style, build, ci
-    - Keep messages concise (under 72 chars)
+    - Keep short description concise (under 72 chars)
+    - Make long description relatively brief but informative (4-10 lines, wrapped at 80 chars, markdown format)
+    - Identify junk files from editors and the build process and do not include them but suggest .gitignore patterns
 
     Respond ONLY with a JSON array. No prose, no markdown fences. Example:
     [
@@ -170,13 +184,13 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 """)
 
 
-def classify_changes(model: str, files: list[str], diff_summary: str) -> list[dict]:
+def classify_changes(model: str, files: list[str], stat_summary: str) -> list[dict]:
     """Ask the model to group files into logical commits. Returns list of commit dicts."""
     file_list = "\n".join(f"  - {f}" for f in files)
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
         f"Changed files:\n{file_list}\n\n"
-        f"Diffs:\n{diff_summary}"
+        f"Change summary (git diff --stat):\n{stat_summary}"
     )
 
     raw = call_ollama(model, prompt)
@@ -287,9 +301,9 @@ def main() -> None:
 
     print(f"Found {len(files)} changed file(s). Analyzing...", file=sys.stderr)
 
-    # Build diff and classify
-    diff_summary = build_diff_summary(repo, files)
-    commits = classify_changes(args.model, files, diff_summary)
+    # Build stat summary and classify
+    stat_summary = build_stat_summary(repo)
+    commits = classify_changes(args.model, files, stat_summary)
 
     # JSON mode: just dump and exit
     if args.json_out:
