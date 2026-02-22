@@ -9,18 +9,22 @@
 """
 git-smart-commit: Analyze unstaged changes, group into logical commits, execute them.
 
-Uses Qwen3-Coder-30B-A3B via Ollama for classification.
+Uses an LLM for classification. Supports Ollama (default) and any OpenAI-compatible
+API (OpenRouter, Anthropic, Together, etc.) via --api-base.
 
 Usage:
     git-smart-commit [--repo PATH] [--dry-run] [--model MODEL] [--yes]
+                     [--api-base URL] [--api-key KEY]
 
 Options:
     --repo PATH     Path to git repository (default: current directory)
     --dry-run       Print proposed commits without executing
-    --model MODEL   Ollama model to use (default: qwen2.5-coder:32b)
+    --model MODEL   Model name (default: qwen3-coder:30b-a3b-q8_0)
     --yes           Skip confirmation prompt and commit immediately
     --json          Output proposed commits as JSON and exit (implies --dry-run)
-    --verbose -v    Print model thought process and debug info
+    --api-base URL  API base URL (default: http://localhost:11434 for Ollama)
+                    Use https://openrouter.ai/api/v1 for OpenRouter, etc.
+    --api-key KEY   API key for authenticated endpoints (or set LLM_API_KEY env var)
     --help          Show this message
 
 Exit codes:
@@ -40,9 +44,11 @@ import ast
 import httpx
 import inspect
 import json
+import os
 import subprocess
 import sys
 import textwrap
+from dataclasses import dataclass
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -128,8 +134,38 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_MODEL = "qwen3-coder:30b-a3b-q8_0"
-OLLAMA_TIMEOUT = 300.0
+API_TIMEOUT = 300.0
 NUM_CTX = 128000
+
+
+@dataclass
+class ApiConfig:
+    """API connection configuration."""
+    base_url: str = OLLAMA_BASE_URL
+    model: str = DEFAULT_MODEL
+    api_key: str | None = None
+
+    @property
+    def is_ollama(self) -> bool:
+        """True when targeting a native Ollama endpoint (not OpenAI-compatible)."""
+        # OpenAI-compatible APIs use /v1 in the path; Ollama doesn't.
+        return "/v1" not in self.base_url
+
+    @property
+    def chat_url(self) -> str:
+        if self.is_ollama:
+            return f"{self.base_url}/api/chat"
+        return f"{self.base_url}/chat/completions"
+
+    @property
+    def auth_headers(self) -> dict[str, str]:
+        if self.api_key:
+            return {"Authorization": f"Bearer {self.api_key}"}
+        return {}
+
+
+# Module-level config, set from main() before any API calls.
+_api_config = ApiConfig()
 
 # ── Tool registry ──────────────────────────────────────────────────────────────
 #
@@ -144,7 +180,7 @@ _TOOL_REGISTRY: dict[str, dict] = {}
 
 
 def tool(args_model: type[BaseModel]):
-    """Decorator factory. @tool(MyArgsModel) registers a function as an Ollama tool."""
+    """Decorator factory. @tool(MyArgsModel) registers a function as an LLM tool."""
     def decorator(fn: Callable) -> Callable:
         spec = {
             "type": "function",
@@ -161,15 +197,76 @@ def tool(args_model: type[BaseModel]):
     return decorator
 
 
+def _build_payload(prompt: str, tools: list[dict] | None = None,
+                   stream: bool = False) -> dict:
+    """Build an API request payload, adapting to Ollama or OpenAI format."""
+    cfg = _api_config
+    if cfg.is_ollama:
+        payload: dict[str, Any] = {
+            "model": cfg.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": stream,
+            "keep_alive": "1h",
+            "options": {
+                "temperature": 0.2,
+                "num_ctx": NUM_CTX,
+            },
+        }
+        if tools:
+            payload["tools"] = tools
+    else:
+        payload = {
+            "model": cfg.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": stream,
+            "temperature": 0.2,
+        }
+        if tools:
+            payload["tools"] = tools
+            # Force the model to call the specific tool
+            payload["tool_choice"] = {
+                "type": "function",
+                "function": {"name": tools[0]["function"]["name"]},
+            }
+    return payload
+
+
+def _extract_tool_args(data: dict) -> dict | None:
+    """Extract tool-call arguments from a response, handling both API formats."""
+    cfg = _api_config
+    if cfg.is_ollama:
+        tool_calls = data.get("message", {}).get("tool_calls", [])
+        if tool_calls:
+            raw = tool_calls[0]["function"]["arguments"]
+            return json.loads(raw) if isinstance(raw, str) else raw
+        # Fallback: content as JSON
+        content = data.get("message", {}).get("content", "").strip()
+    else:
+        choices = data.get("choices", [])
+        if not choices:
+            return None
+        msg = choices[0].get("message", {})
+        tool_calls = msg.get("tool_calls", [])
+        if tool_calls:
+            raw = tool_calls[0]["function"]["arguments"]
+            return json.loads(raw) if isinstance(raw, str) else raw
+        content = msg.get("content", "").strip()
+
+    # Fallback: parse content as JSON (both backends)
+    if content:
+        content = content.lstrip("```json").lstrip("```").rstrip("```").strip()
+        return json.loads(content)
+    return None
+
+
 def call_ollama_with_tool(
     ollama_model: str,
     prompt: str,
     tool_fn: Callable,
     num_ctx: int = NUM_CTX,
-    verbose: bool = False,
     **tool_kwargs,
 ) -> Any:
-    """Call Ollama forcing tool_fn to be called.
+    """Call the LLM forcing tool_fn to be called.
 
     Parses and validates the response into the tool's args model, then calls
     tool_fn(validated_args, **tool_kwargs) and returns its result.
@@ -181,40 +278,16 @@ def call_ollama_with_tool(
     failures = []
     while True:
         retries += 1
-        payload = {
-            "model": ollama_model,
-            "messages": [{"role": "user", "content": actual_prompt}],
-            "tools": [spec],
-            "stream": False,
-            "keep_alive": "1h",
-            "options": {
-                "temperature": 0.2,
-                "num_ctx": num_ctx,
-            },
-        }
+        payload = _build_payload(actual_prompt, tools=[spec], stream=False)
+        headers = {**_api_config.auth_headers, "Content-Type": "application/json"}
         with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
-            if verbose:
-                print(f"\n[VERBOSE] Sending request to {ollama_model} (Attempt {retries})...", file=sys.stderr)
-
-            response = client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+            response = client.post(_api_config.chat_url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
 
-        if verbose and (content := data.get("message", {}).get("content")):
-            print(f"\n[VERBOSE] Model Thoughts:\n{textwrap.indent(content.strip(), '  ')}\n", file=sys.stderr)
-
-        tool_calls = data.get("message", {}).get("tool_calls", [])
-        if tool_calls:
-            raw_args = tool_calls[0]["function"]["arguments"]
-            # Ollama may return arguments as a string or already-parsed dict
-            if isinstance(raw_args, str):
-                raw_args = json.loads(raw_args)
-
-        else:
-            # Fallback: parse message content as JSON
-            content = data.get("message", {}).get("content", "").strip()
-            content = content.lstrip("```json").lstrip("```").rstrip("```").strip()
-            raw_args = json.loads(content)
+        raw_args = _extract_tool_args(data)
+        if raw_args is None:
+            raw_args = {}
 
         # Fix stringified nested values: some models return e.g.
         # {"commits": "[{'subject': ...}]"} instead of a proper nested structure.
@@ -237,10 +310,9 @@ def call_ollama_with_tool(
             if retries > 5:
                 raise
 
-            failure_set = '\n'.join(set(failures))
             actual_prompt = textwrap.dedent(f"""
             Your previous ({len(failures)}) attempts failed with a validation error:
-            {failure_set}
+            {'\n'.join(set(failures))}
 
             Try again following this prompt exactly:
             {prompt}
@@ -339,6 +411,7 @@ def summarize_file_diff(model: str, fname: str, diff_text: str, max_chars: int) 
             {prior_context}Hunk {i}:
             {hunk}
         """)
+        first_hunk = i
 
         summary = call_ollama(model, prompt, num_ctx=HUNK_SUMMARIZE_CTX)
 
@@ -393,35 +466,40 @@ def build_diff_summary(repo: Path, model: str) -> str:
     return "\n".join(parts)
 
 
-# ── Ollama client ──────────────────────────────────────────────────────────────
+# ── LLM client (streaming) ────────────────────────────────────────────────────
 
 def call_ollama(model: str, prompt: str, num_ctx: int = NUM_CTX) -> str:
-    """Call Ollama chat completions and return the assistant message text."""
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": True,
-        "keep_alive": "1h",
-        "options": {
-            "temperature": 0.2,   # low temp for deterministic classification
-            "num_ctx": num_ctx,
-        },
-    }
+    """Call the LLM with streaming and return the assistant message text."""
+    cfg = _api_config
+    payload = _build_payload(prompt, stream=True)
+    headers = {**cfg.auth_headers, "Content-Type": "application/json"}
     with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=5.0)) as client:
-        with client.stream("POST", f"{OLLAMA_BASE_URL}/api/chat", json=payload) as response:
+        with client.stream("POST", cfg.chat_url, json=payload, headers=headers) as response:
             response.raise_for_status()
             chunks = []
             for line in response.iter_lines():
                 if not line:
                     continue
+                # OpenAI SSE format: lines prefixed with "data: "
+                if line.startswith("data: "):
+                    line = line[6:]
+                if line.strip() == "[DONE]":
+                    break
                 try:
                     data = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                content = data.get("message", {}).get("content", "")
+                if cfg.is_ollama:
+                    content = data.get("message", {}).get("content", "")
+                    done = data.get("done", False)
+                else:
+                    delta = (data.get("choices", [{}])[0]
+                             .get("delta", {}))
+                    content = delta.get("content", "")
+                    done = data.get("choices", [{}])[0].get("finish_reason") is not None
                 if content:
                     chunks.append(content)
-                if data.get("done"):
+                if done:
                     break
             return "".join(chunks)
 
@@ -471,13 +549,13 @@ SAMPLE_OUTPUT = ProposeCommitsArgs(
 
 
 @tool(ProposeCommitsArgs)
-def propose_commits(result: ProposeCommitsArgs, model: str, verbose: bool = False) -> tuple[list[dict], list[str]]:
+def propose_commits(result: ProposeCommitsArgs, model: str) -> tuple[list[dict], list[str]]:
     """Group working-tree changes into logical commits and suggest .gitignore patterns for junk files."""
     commits = [c.model_dump() for c in result.commits]
     if not commits:
         raise Exception("Error: Model returned no valid commit groups.")
 
-    commits = merge_overlapping_commits(model, commits, verbose=verbose)
+    commits = merge_overlapping_commits(model, commits)
     return commits, result.gitignore
 
 
@@ -491,7 +569,7 @@ class MergeCommitsArgs(BaseModel):
 
 
 @tool(MergeCommitsArgs)
-def merge_commits(result: MergeCommitsArgs, all_files: list[str], all_issues: list[dict], verbose: bool = False) -> dict:
+def merge_commits(result: MergeCommitsArgs, all_files: list[str], all_issues: list[dict]) -> dict:
     """Merge multiple overlapping commits into a single coherent commit."""
     commit = result.commit.model_dump()
     # Ensure all files and issues are preserved regardless of what the model returns
@@ -521,7 +599,7 @@ MERGE_PROMPT = textwrap.dedent("""\
 """)
 
 
-def merge_overlapping_commits(model: str, commits: list[dict], verbose: bool = False) -> list[dict]:
+def merge_overlapping_commits(model: str, commits: list[dict]) -> list[dict]:
     """Merge commits whose file sets overlap, since partial staging isn't supported.
 
     Uses union-find to detect groups, then asks the model to write a single
@@ -590,13 +668,12 @@ def merge_overlapping_commits(model: str, commits: list[dict], verbose: bool = F
         merged.append(call_ollama_with_tool(
             model, prompt, merge_commits,
             all_files=all_files, all_issues=all_issues,
-            verbose=verbose
         ))
 
     return merged
 
 
-def classify_changes(model: str, files: list[str], diff_summary: str, verbose: bool = False) -> tuple[list[dict], list[str]]:
+def classify_changes(model: str, files: list[str], diff_summary: str) -> tuple[list[dict], list[str]]:
     """Ask the model to group files into logical commits. Returns (commits, gitignore_patterns)."""
     file_list = "\n".join(f"  - {f}" for f in files)
     prompt = (
@@ -606,7 +683,7 @@ def classify_changes(model: str, files: list[str], diff_summary: str, verbose: b
         f"Diffs:\n{diff_summary}"
     )
 
-    return call_ollama_with_tool(model, prompt, propose_commits, model=model, verbose=verbose)
+    return call_ollama_with_tool(model, prompt, propose_commits, model=model)
 
 
 
@@ -680,13 +757,31 @@ def main() -> None:
     )
     parser.add_argument("--repo", default=".", help="Path to git repository")
     parser.add_argument("--dry-run", action="store_true", help="Show proposed commits without executing")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model (default: {DEFAULT_MODEL})")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model name (default: {DEFAULT_MODEL})")
     parser.add_argument("--yes", "-y", action="store_true", help="Commit without confirmation")
     parser.add_argument("--json", dest="json_out", action="store_true", help="Output JSON and exit")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Print model thought process and debug info")
+    parser.add_argument(
+        "--api-base", default=None,
+        help="API base URL (default: http://localhost:11434 for Ollama). "
+             "Use https://openrouter.ai/api/v1 for OpenRouter. "
+             "Or set LLM_API_BASE env var.",
+    )
+    parser.add_argument(
+        "--api-key", default=None,
+        help="API key for authenticated endpoints (or set LLM_API_KEY env var)",
+    )
 
     args = parser.parse_args()
     repo = Path(args.repo).resolve()
+
+    # Configure API backend
+    global _api_config
+    _api_config = ApiConfig(
+        base_url=(args.api_base
+                  or os.environ.get("LLM_API_BASE", OLLAMA_BASE_URL)).rstrip("/"),
+        model=args.model,
+        api_key=args.api_key or os.environ.get("LLM_API_KEY"),
+    )
 
     # Verify it's a git repo
     try:
@@ -705,7 +800,7 @@ def main() -> None:
 
     # Build stat summary and classify
     diff_summary = build_diff_summary(repo, args.model)
-    commits, gitignore = classify_changes(args.model, files, diff_summary, verbose=args.verbose)
+    commits, gitignore = classify_changes(args.model, files, diff_summary)
 
     # JSON mode: just dump and exit
     if args.json_out:
@@ -720,6 +815,7 @@ def main() -> None:
 
     # Confirm unless --yes
     if not args.yes:
+        success = False
         try:
             answer = input("Proceed with these commits? [y/N] ").strip().lower()
         except (KeyboardInterrupt, EOFError):
