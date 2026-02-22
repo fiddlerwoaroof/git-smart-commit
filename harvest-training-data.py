@@ -22,11 +22,13 @@ Usage:
                           [--max-files MAX] [--max-diff-chars MAX]
                           [--min-commits MIN] [--max-commits MAX]
                           [--seed SEED] [--bundle-dir DIR]
+                          [--max-per-repo N] [--all-branches]
                           [--fetch] [--dry-run]
 
 Each output line is a JSON object:
 {
     "repo_url": "github.com/owner/repo",
+    "branch": "main",
     "base_commit": "abc123...",
     "head_commit": "def456...",
     "n_commits": 3,
@@ -237,17 +239,28 @@ def fetch_all(repo: Path) -> bool:
 
 
 def get_default_branch(repo: Path) -> str | None:
-    """Get the default branch (main/master) for the repo."""
+    """Get the default branch for the repo.
+
+    Tries HEAD first, then common branch names.
+    """
     out = git_ok(["symbolic-ref", "--short", "HEAD"], repo)
     if out:
         return out.strip()
 
-    for branch in ["main", "master", "develop"]:
+    for branch in ["main", "master", "trunk", "develop", "stable", "production"]:
         r = git(["rev-parse", "--verify", branch], repo)
         if r.returncode == 0:
             return branch
 
     return None
+
+
+def get_local_branches(repo: Path) -> list[str]:
+    """List all local branch names."""
+    out = git_ok(["for-each-ref", "--format=%(refname:short)", "refs/heads/"], repo)
+    if not out:
+        return []
+    return [line.strip() for line in out.strip().splitlines() if line.strip()]
 
 
 def is_merge_commit(repo: Path, sha: str) -> bool:
@@ -407,20 +420,21 @@ def find_repos(repo_dirs: list[str]) -> list[Path]:
             file=sys.stderr,
         )
 
-    # Filter out repos with no commits
+    # Filter out repos with too few commits to produce useful training data
+    min_repo_commits = 10
     filtered = []
-    n_empty = 0
+    n_small = 0
     for r in deduped:
         branch = get_default_branch(r)
-        commits = get_first_parent_commits(r, branch, max_count=2)
-        if len(commits) >= 2:
+        commits = get_first_parent_commits(r, branch, max_count=min_repo_commits)
+        if len(commits) >= min_repo_commits:
             filtered.append(r)
         else:
-            n_empty += 1
+            n_small += 1
 
-    if n_empty:
+    if n_small:
         print(
-            f"  Filtered {n_empty} repo(s) with <2 commits.",
+            f"  Filtered {n_small} repo(s) with <{min_repo_commits} commits.",
             file=sys.stderr,
         )
 
@@ -437,13 +451,21 @@ def harvest_one(
     max_files: int,
     max_diff_chars: int,
     bundle_dir: Path | None,
+    all_branches: bool = False,
 ) -> dict | None:
     """Try to generate one training example from a repo.
 
     All operations are read-only (bundle create writes to bundle_dir only).
     Returns None on failure.
     """
-    branch = get_default_branch(repo)
+    if all_branches:
+        branches = get_local_branches(repo)
+        if not branches:
+            return None
+        branch = rng.choice(branches)
+    else:
+        branch = get_default_branch(repo)
+
     commits = get_first_parent_commits(repo, branch)
     if len(commits) < min_commits + 1:
         return None
@@ -504,6 +526,7 @@ def harvest_one(
 
     result = {
         "repo_url": repo_url,
+        "branch": branch,
         "base_commit": base_sha,
         "head_commit": head_sha,
         "n_commits": n,
@@ -571,6 +594,10 @@ def main():
         help="Run 'git fetch --all' on each repo before harvesting",
     )
     parser.add_argument(
+        "--all-branches", action="store_true",
+        help="Sample from all local branches, not just the default branch",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Just discover repos and print stats, don't generate",
     )
@@ -612,28 +639,60 @@ def main():
                 print(" ✗ (fetch failed, using existing)", file=sys.stderr)
 
     if args.dry_run:
-        print(
-            f"\n{'Repo':<60} {'Commits':>8}  {'Branch':<12}  Languages",
-            file=sys.stderr,
-        )
-        print("─" * 110, file=sys.stderr)
+        if args.all_branches:
+            print(
+                f"\n{'Repo':<55} {'Branches':>8} {'Commits':>8}  "
+                f"{'Default':<12}  Languages",
+                file=sys.stderr,
+            )
+            print("─" * 120, file=sys.stderr)
+        else:
+            print(
+                f"\n{'Repo':<60} {'Commits':>8}  {'Branch':<12}  Languages",
+                file=sys.stderr,
+            )
+            print("─" * 110, file=sys.stderr)
+
         for r in repos:
             url = get_remote_url(r) or str(r)
             branch = get_default_branch(r) or "?"
-            commits = get_first_parent_commits(r, branch, max_count=500)
 
-            if len(commits) > 1:
-                recent_files = get_changed_files(r, commits[-1], commits[0])
+            if args.all_branches:
+                branches = get_local_branches(r)
+                # Count commits across all branches (deduplicated)
+                all_shas = set()
+                for b in branches:
+                    for sha in get_first_parent_commits(r, b, max_count=500):
+                        all_shas.add(sha)
+                total_commits = len(all_shas)
+
+                default_commits = get_first_parent_commits(r, branch, max_count=500)
+                if len(default_commits) > 1:
+                    recent_files = get_changed_files(r, default_commits[-1], default_commits[0])
+                else:
+                    recent_files = []
+                langs = detect_languages(recent_files)
+
+                url_display = url[:53] if len(url) > 53 else url
+                print(
+                    f"  {url_display:<55} {len(branches):>6} {total_commits:>8}  "
+                    f"{branch:<12}  {', '.join(langs) or '-'}",
+                    file=sys.stderr,
+                )
             else:
-                recent_files = []
-            langs = detect_languages(recent_files)
+                commits = get_first_parent_commits(r, branch, max_count=500)
+                if len(commits) > 1:
+                    recent_files = get_changed_files(r, commits[-1], commits[0])
+                else:
+                    recent_files = []
+                langs = detect_languages(recent_files)
 
-            url_display = url[:58] if len(url) > 58 else url
-            print(
-                f"  {url_display:<60} {len(commits):>6}  "
-                f"{branch:<12}  {', '.join(langs) or '-'}",
-                file=sys.stderr,
-            )
+                url_display = url[:58] if len(url) > 58 else url
+                print(
+                    f"  {url_display:<60} {len(commits):>6}  "
+                    f"{branch:<12}  {', '.join(langs) or '-'}",
+                    file=sys.stderr,
+                )
         sys.exit(0)
 
     # Generate examples, sampling randomly across repos for diversity
@@ -658,6 +717,7 @@ def main():
                 max_files=args.max_files,
                 max_diff_chars=args.max_diff_chars,
                 bundle_dir=bundle_dir,
+                all_branches=args.all_branches,
             )
 
             if example is None:
