@@ -358,15 +358,18 @@ def find_repos(repo_dirs: list[str]) -> list[Path]:
     Handles:
     - Direct repos: DIR is itself a git repo
     - Nested repos: ~/git-repos/github.com/owner/repo
+
+    Deduplicates by both resolved filesystem path and remote URL.
+    Filters out repos with no commits on their default branch.
     """
-    repos = []
+    candidates = []
     for d in repo_dirs:
         root = Path(d).expanduser()
         if not root.exists():
             continue
 
         if (root / ".git").exists():
-            repos.append(root)
+            candidates.append(root)
             continue
 
         # Walk up to 4 levels deep (host/owner/repo or just owner/repo)
@@ -374,18 +377,54 @@ def find_repos(repo_dirs: list[str]) -> list[Path]:
             pattern = "/".join(["*"] * depth)
             for candidate in root.glob(pattern):
                 if (candidate / ".git").exists():
-                    repos.append(candidate)
+                    candidates.append(candidate)
 
-    # Deduplicate by resolved path
-    seen = set()
-    deduped = []
-    for r in repos:
+    # Deduplicate by resolved path first
+    seen_paths: set[Path] = set()
+    path_deduped = []
+    for r in candidates:
         resolved = r.resolve()
-        if resolved not in seen:
-            seen.add(resolved)
-            deduped.append(r)
+        if resolved not in seen_paths:
+            seen_paths.add(resolved)
+            path_deduped.append(r)
 
-    return sorted(deduped, key=lambda p: str(p))
+    # Deduplicate by remote URL (keep the first occurrence)
+    seen_urls: set[str] = set()
+    deduped = []
+    n_url_dupes = 0
+    for r in path_deduped:
+        url = get_remote_url(r)
+        if url:
+            if url in seen_urls:
+                n_url_dupes += 1
+                continue
+            seen_urls.add(url)
+        deduped.append(r)
+
+    if n_url_dupes:
+        print(
+            f"  Removed {n_url_dupes} duplicate(s) (same remote URL).",
+            file=sys.stderr,
+        )
+
+    # Filter out repos with no commits
+    filtered = []
+    n_empty = 0
+    for r in deduped:
+        branch = get_default_branch(r)
+        commits = get_first_parent_commits(r, branch, max_count=2)
+        if len(commits) >= 2:
+            filtered.append(r)
+        else:
+            n_empty += 1
+
+    if n_empty:
+        print(
+            f"  Filtered {n_empty} repo(s) with <2 commits.",
+            file=sys.stderr,
+        )
+
+    return sorted(filtered, key=lambda p: str(p))
 
 
 # ── Main harvest logic ────────────────────────────────────────────────────────
@@ -523,6 +562,11 @@ def main():
         help="Directory to write git bundles (default: no bundles)",
     )
     parser.add_argument(
+        "--max-per-repo", type=int, default=None,
+        help="Max examples per repo (default: unlimited). "
+             "Useful to prevent large repos from dominating the dataset.",
+    )
+    parser.add_argument(
         "--fetch", action="store_true",
         help="Run 'git fetch --all' on each repo before harvesting",
     )
@@ -596,11 +640,15 @@ def main():
     generated = 0
     attempts = 0
     max_attempts = args.count * 20
+    repo_counts: dict[str, int] = {}  # repo path -> examples generated
+    max_per_repo = args.max_per_repo
+    available_repos = list(repos)
 
     with open(args.output, "w") as f:
-        while generated < args.count and attempts < max_attempts:
+        while generated < args.count and attempts < max_attempts and available_repos:
             attempts += 1
-            repo = rng.choice(repos)
+            repo = rng.choice(available_repos)
+            repo_key = str(repo)
 
             example = harvest_one(
                 repo,
@@ -617,11 +665,21 @@ def main():
 
             f.write(json.dumps(example) + "\n")
             generated += 1
+            repo_counts[repo_key] = repo_counts.get(repo_key, 0) + 1
+
+            # Remove repo from pool if it hit the cap
+            if max_per_repo and repo_counts[repo_key] >= max_per_repo:
+                available_repos = [r for r in available_repos if str(r) != repo_key]
+                if not available_repos:
+                    print(
+                        f"  All repos exhausted (hit --max-per-repo={max_per_repo}).",
+                        file=sys.stderr,
+                    )
 
             if generated % 50 == 0:
                 print(
                     f"  Generated {generated}/{args.count} "
-                    f"({attempts} attempts across {len(repos)} repos)",
+                    f"({attempts} attempts, {len(available_repos)} repos remaining)",
                     file=sys.stderr,
                 )
 
@@ -637,6 +695,7 @@ def main():
         lang_counts: dict[str, int] = {}
         commit_counts: list[int] = []
         n_with_bundle = 0
+        repo_url_counts: dict[str, int] = {}
         with open(args.output) as f:
             for line in f:
                 data = json.loads(line)
@@ -646,9 +705,12 @@ def main():
                     n_with_bundle += 1
                 for lang in data.get("languages", []):
                     lang_counts[lang] = lang_counts.get(lang, 0) + 1
+                url = data.get("repo_url", "?")
+                repo_url_counts[url] = repo_url_counts.get(url, 0) + 1
 
         print("\nStats:", file=sys.stderr)
         print(f"  Examples: {generated}", file=sys.stderr)
+        print(f"  Unique repos used: {len(repo_url_counts)}", file=sys.stderr)
         print(f"  Avg line size: {sum(sizes)//len(sizes):,} chars", file=sys.stderr)
         print(
             f"  Commits unwound: min={min(commit_counts)} "
@@ -659,13 +721,24 @@ def main():
         if bundle_dir:
             print(f"  Bundles created: {n_with_bundle}", file=sys.stderr)
             total_bundle_size = sum(
-                f.stat().st_size for f in bundle_dir.iterdir() if f.suffix == ".bundle"
+                p.stat().st_size
+                for p in bundle_dir.iterdir()
+                if p.suffix == ".bundle"
             )
             print(
                 f"  Total bundle size: {total_bundle_size / 1024 / 1024:.1f} MB",
                 file=sys.stderr,
             )
         print(f"  Languages: {json.dumps(lang_counts, indent=4)}", file=sys.stderr)
+
+        # Show top repos by example count
+        top_repos = sorted(
+            repo_url_counts.items(), key=lambda x: x[1], reverse=True,
+        )[:15]
+        print("  Top repos:", file=sys.stderr)
+        for url, count in top_repos:
+            url_display = url[:55] if len(url) > 55 else url
+            print(f"    {url_display:<58} {count:>4}", file=sys.stderr)
 
 
 if __name__ == "__main__":
