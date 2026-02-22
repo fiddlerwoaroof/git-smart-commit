@@ -5,7 +5,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt update &&\
     apt full-upgrade -y
 
-RUN apt install -y curl bash git
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt install -y curl bash git
 
 USER ubuntu
 
