@@ -445,12 +445,44 @@ def propose_commits() -> None:
     """Group working-tree changes into logical commits and suggest .gitignore patterns for junk files."""
 
 
-def merge_overlapping_commits(commits: list[dict]) -> list[dict]:
+class MergeCommitsArgs(BaseModel):
+    commit: Commit = Field(description="REQUIRED. A single merged commit covering all the provided changes")
+    gitignore: list[str] = Field(default_factory=list, description="Suggested .gitignore patterns for junk files")
+
+    def post_process(self):
+        self.commit = self.commit.post_process()
+        return self
+
+
+@tool(MergeCommitsArgs)
+def merge_commits() -> None:
+    """Merge multiple overlapping commits into a single coherent commit."""
+
+
+MERGE_PROMPT = textwrap.dedent("""\
+    You are merging multiple proposed commits that all touch overlapping files
+    and therefore cannot be committed separately (partial staging is not supported).
+
+    Combine them into a SINGLE commit that:
+    - Has one conventional commit subject line (type(scope): desc), under 72 chars
+    - Has a body (4-10 lines) summarizing ALL the changes coherently
+    - Lists ALL affected files (deduped)
+    - Collects ALL issues (deduped)
+
+    Do NOT just concatenate the subjects. Write a new, coherent subject and body
+    that covers the full set of changes as a single logical unit.
+
+    Call the merge_commits tool with your answer.
+
+    Here are the commits to merge:
+""")
+
+
+def merge_overlapping_commits(model: str, commits: list[dict]) -> list[dict]:
     """Merge commits whose file sets overlap, since partial staging isn't supported.
 
-    Uses union-find: if commit A and commit B share any file, they must be
-    merged into a single commit.  Subjects are joined with "; ", bodies are
-    concatenated, files and issues are unioned.
+    Uses union-find to detect groups, then asks the model to write a single
+    coherent commit message for each merged group.
     """
     if len(commits) <= 1:
         return commits
@@ -484,7 +516,10 @@ def merge_overlapping_commits(commits: list[dict]) -> list[dict]:
     for i in range(len(commits)):
         groups.setdefault(find(i), []).append(i)
 
-    # Merge each group
+    # Check if any merging is actually needed
+    if all(len(idxs) == 1 for idxs in groups.values()):
+        return commits
+
     merged = []
     for indices in groups.values():
         if len(indices) == 1:
@@ -492,8 +527,9 @@ def merge_overlapping_commits(commits: list[dict]) -> list[dict]:
             continue
 
         group = [commits[i] for i in indices]
-        # Use the first commit's subject as primary, note the merge
-        primary = group[0]
+        print(f"  Merging {len(group)} overlapping commits…", file=sys.stderr)
+
+        # Collect all files and issues for the merged commit
         all_files = list(dict.fromkeys(f for c in group for f in c.get("files", [])))
         all_issues = []
         seen_issues = set()
@@ -503,14 +539,17 @@ def merge_overlapping_commits(commits: list[dict]) -> list[dict]:
                 if key not in seen_issues:
                     seen_issues.add(key)
                     all_issues.append(issue)
-        # Combine bodies, skipping empties
-        bodies = [c.get("body", "").strip() for c in group if c.get("body", "").strip()]
-        merged.append({
-            "subject": primary["subject"],
-            "files": all_files,
-            "body": "\n\n".join(bodies),
-            "issues": all_issues,
-        })
+
+        # Format the commits for the merge prompt
+        commits_desc = json.dumps(group, indent=2)
+        prompt = MERGE_PROMPT + commits_desc
+
+        result: MergeCommitsArgs = call_ollama_with_tool(model, prompt, merge_commits)
+        commit = result.commit.model_dump()
+        # Ensure all files and issues are preserved regardless of what the model returns
+        commit["files"] = all_files
+        commit["issues"] = all_issues
+        merged.append(commit)
 
     return merged
 
@@ -531,7 +570,7 @@ def classify_changes(model: str, files: list[str], diff_summary: str) -> tuple[l
     if not commits:
         raise Exception("Error: Model returned no valid commit groups.")
 
-    commits = merge_overlapping_commits(commits)
+    commits = merge_overlapping_commits(model, commits)
 
     return commits, result.gitignore
 
