@@ -20,6 +20,7 @@ Options:
     --model MODEL   Ollama model to use (default: qwen2.5-coder:32b)
     --yes           Skip confirmation prompt and commit immediately
     --json          Output proposed commits as JSON and exit (implies --dry-run)
+    --verbose -v    Print model thought process and debug info
     --help          Show this message
 
 Exit codes:
@@ -165,6 +166,7 @@ def call_ollama_with_tool(
     prompt: str,
     tool_fn: Callable,
     num_ctx: int = NUM_CTX,
+    verbose: bool = False,
     **tool_kwargs,
 ) -> Any:
     """Call Ollama forcing tool_fn to be called.
@@ -191,9 +193,15 @@ def call_ollama_with_tool(
             },
         }
         with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
+            if verbose:
+                print(f"\n[VERBOSE] Sending request to {ollama_model} (Attempt {retries})...", file=sys.stderr)
+
             response = client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
             response.raise_for_status()
             data = response.json()
+
+        if verbose and (content := data.get("message", {}).get("content")):
+            print(f"\n[VERBOSE] Model Thoughts:\n{textwrap.indent(content.strip(), '  ')}\n", file=sys.stderr)
 
         tool_calls = data.get("message", {}).get("tool_calls", [])
         if tool_calls:
@@ -229,9 +237,10 @@ def call_ollama_with_tool(
             if retries > 5:
                 raise
 
+            failure_set = '\n'.join(set(failures))
             actual_prompt = textwrap.dedent(f"""
             Your previous ({len(failures)}) attempts failed with a validation error:
-            {'\n'.join(set(failures))}
+            {failure_set}
 
             Try again following this prompt exactly:
             {prompt}
@@ -330,7 +339,6 @@ def summarize_file_diff(model: str, fname: str, diff_text: str, max_chars: int) 
             {prior_context}Hunk {i}:
             {hunk}
         """)
-        first_hunk = i
 
         summary = call_ollama(model, prompt, num_ctx=HUNK_SUMMARIZE_CTX)
 
@@ -463,13 +471,13 @@ SAMPLE_OUTPUT = ProposeCommitsArgs(
 
 
 @tool(ProposeCommitsArgs)
-def propose_commits(result: ProposeCommitsArgs, model: str) -> tuple[list[dict], list[str]]:
+def propose_commits(result: ProposeCommitsArgs, model: str, verbose: bool = False) -> tuple[list[dict], list[str]]:
     """Group working-tree changes into logical commits and suggest .gitignore patterns for junk files."""
     commits = [c.model_dump() for c in result.commits]
     if not commits:
         raise Exception("Error: Model returned no valid commit groups.")
 
-    commits = merge_overlapping_commits(model, commits)
+    commits = merge_overlapping_commits(model, commits, verbose=verbose)
     return commits, result.gitignore
 
 
@@ -483,7 +491,7 @@ class MergeCommitsArgs(BaseModel):
 
 
 @tool(MergeCommitsArgs)
-def merge_commits(result: MergeCommitsArgs, all_files: list[str], all_issues: list[dict]) -> dict:
+def merge_commits(result: MergeCommitsArgs, all_files: list[str], all_issues: list[dict], verbose: bool = False) -> dict:
     """Merge multiple overlapping commits into a single coherent commit."""
     commit = result.commit.model_dump()
     # Ensure all files and issues are preserved regardless of what the model returns
@@ -513,7 +521,7 @@ MERGE_PROMPT = textwrap.dedent("""\
 """)
 
 
-def merge_overlapping_commits(model: str, commits: list[dict]) -> list[dict]:
+def merge_overlapping_commits(model: str, commits: list[dict], verbose: bool = False) -> list[dict]:
     """Merge commits whose file sets overlap, since partial staging isn't supported.
 
     Uses union-find to detect groups, then asks the model to write a single
@@ -582,12 +590,13 @@ def merge_overlapping_commits(model: str, commits: list[dict]) -> list[dict]:
         merged.append(call_ollama_with_tool(
             model, prompt, merge_commits,
             all_files=all_files, all_issues=all_issues,
+            verbose=verbose
         ))
 
     return merged
 
 
-def classify_changes(model: str, files: list[str], diff_summary: str) -> tuple[list[dict], list[str]]:
+def classify_changes(model: str, files: list[str], diff_summary: str, verbose: bool = False) -> tuple[list[dict], list[str]]:
     """Ask the model to group files into logical commits. Returns (commits, gitignore_patterns)."""
     file_list = "\n".join(f"  - {f}" for f in files)
     prompt = (
@@ -597,7 +606,7 @@ def classify_changes(model: str, files: list[str], diff_summary: str) -> tuple[l
         f"Diffs:\n{diff_summary}"
     )
 
-    return call_ollama_with_tool(model, prompt, propose_commits, model=model)
+    return call_ollama_with_tool(model, prompt, propose_commits, model=model, verbose=verbose)
 
 
 
@@ -674,6 +683,7 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model (default: {DEFAULT_MODEL})")
     parser.add_argument("--yes", "-y", action="store_true", help="Commit without confirmation")
     parser.add_argument("--json", dest="json_out", action="store_true", help="Output JSON and exit")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Print model thought process and debug info")
 
     args = parser.parse_args()
     repo = Path(args.repo).resolve()
@@ -695,7 +705,7 @@ def main() -> None:
 
     # Build stat summary and classify
     diff_summary = build_diff_summary(repo, args.model)
-    commits, gitignore = classify_changes(args.model, files, diff_summary)
+    commits, gitignore = classify_changes(args.model, files, diff_summary, verbose=args.verbose)
 
     # JSON mode: just dump and exit
     if args.json_out:
@@ -710,7 +720,6 @@ def main() -> None:
 
     # Confirm unless --yes
     if not args.yes:
-        success = False
         try:
             answer = input("Proceed with these commits? [y/N] ").strip().lower()
         except (KeyboardInterrupt, EOFError):
