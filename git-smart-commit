@@ -30,17 +30,18 @@ Exit codes:
     4   User cancelled
 """
 
+from pathlib import Path
+from pydantic import BaseModel, Field, ValidationError
+from typing import Any, Callable
+
 import argparse
+import ast
+import httpx
+import inspect
 import json
 import subprocess
 import sys
 import textwrap
-import inspect
-from pathlib import Path
-from typing import Any, Callable
-
-import httpx
-from pydantic import BaseModel, Field, ValidationError
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -107,6 +108,8 @@ SYSTEM_PROMPT = textwrap.dedent("""\
         * refactor: Structural changes that DO NOT change external behavior. If it adds a feature, it is a 'feat'.
         * chore: Routine maintenance, dependency bumps, or minor environment tweaks with no new logic.
         * (Other types: docs, test, style, build, ci)
+    - feat is the highest priority commit type
+    - chore is the lowest priority commit type
     - Do not repeat the commit type in the subject description (e.g., avoid "refactor(tools): refactor the parser").
     - Write body content based only on what you observe in the diff.
       Do not reference issue numbers or details not visible in the changes.
@@ -183,7 +186,7 @@ def call_ollama_with_tool(
             "stream": False,
             "keep_alive": "1h",
             "options": {
-                "temperature": 0.1,
+                "temperature": 0.2,
                 "num_ctx": num_ctx,
             },
         }
@@ -198,11 +201,25 @@ def call_ollama_with_tool(
             # Ollama may return arguments as a string or already-parsed dict
             if isinstance(raw_args, str):
                 raw_args = json.loads(raw_args)
+
         else:
             # Fallback: parse message content as JSON
             content = data.get("message", {}).get("content", "").strip()
             content = content.lstrip("```json").lstrip("```").rstrip("```").strip()
             raw_args = json.loads(content)
+
+        # Fix stringified nested values: some models return e.g.
+        # {"commits": "[{'subject': ...}]"} instead of a proper nested structure.
+        # Detect strings that look like Python lists/dicts and try to parse them.
+        for key, val in raw_args.items():
+            if isinstance(val, str) and val.strip().startswith(("[", "{")):
+                try:
+                    raw_args[key] = json.loads(val)
+                except json.JSONDecodeError:
+                    try:
+                        raw_args[key] = ast.literal_eval(val)
+                    except (ValueError, SyntaxError):
+                        pass  # leave as-is, let pydantic report the error
 
         try:
             validated = args_model.model_validate(raw_args).post_process()
@@ -378,7 +395,7 @@ def call_ollama(model: str, prompt: str, num_ctx: int = NUM_CTX) -> str:
         "stream": True,
         "keep_alive": "1h",
         "options": {
-            "temperature": 0.1,   # low temp for deterministic classification
+            "temperature": 0.2,   # low temp for deterministic classification
             "num_ctx": num_ctx,
         },
     }
@@ -484,6 +501,8 @@ MERGE_PROMPT = textwrap.dedent("""\
     - Has a body (4-10 lines) summarizing ALL the changes coherently
     - Lists ALL affected files (deduped)
     - Collects ALL issues (deduped)
+    - If any commit is a feat type, it must take priority over the others (although the others should be mentioned in the commit body)
+    - chore should only be used if no other category applies.
 
     Do NOT just concatenate the subjects. Write a new, coherent subject and body
     that covers the full set of changes as a single logical unit.
