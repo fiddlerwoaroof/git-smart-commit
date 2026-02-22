@@ -7,11 +7,11 @@
 harvest-training-data: Generate git-smart-commit training inputs from local repos.
 
 Walks existing local git repositories, picks random commits, rewinds N commits
-along first-parent, captures the diff and a minimal git bundle for
-reconstruction, and writes ready-to-use JSONL training inputs.
+along first-parent, captures the diff, and writes ready-to-use JSONL training
+inputs.
 
 SAFE: Never modifies your working tree. All operations are read-only git
-commands (log, diff, diff-tree, show, bundle). No checkout, no stash, no
+commands (log, diff, diff-tree, show, rev-list). No checkout, no stash, no
 worktree.
 
 The expensive frontier model step is NOT done here — this just produces inputs.
@@ -21,8 +21,7 @@ Usage:
     harvest-training-data [--repo-dirs DIR ...] [--output FILE] [--count N]
                           [--max-files MAX] [--max-diff-chars MAX]
                           [--min-commits MIN] [--max-commits MAX]
-                          [--seed SEED] [--bundle-dir DIR]
-                          [--max-per-repo N] [--all-branches]
+                          [--seed SEED] [--max-per-repo N] [--all-branches]
                           [--fetch] [--dry-run]
 
 Each output line is a JSON object:
@@ -36,12 +35,11 @@ Each output line is a JSON object:
     "changed_files": ["a.py", "b.py"],
     "original_commits": [{"sha": "...", "subject": "...", "files": [...]}],
     "existing_gitignore": ["*.pyc", "__pycache__/", ...],
-    "languages": ["python", "rust"],
-    "bundle_path": "bundles/github.com_owner_repo_abc123_def456.bundle"
+    "languages": ["python", "rust"]
 }
 
-The bundle contains just base_commit..head_commit, enough to reconstruct the
-diff without cloning the full repo.
+Reconstruction: clone from repo_url, checkout base_commit, then the diff
+covers everything up to head_commit.
 """
 
 import argparse
@@ -179,20 +177,32 @@ def mine_gitignore(repo: Path, commit: str) -> list[str]:
 # ── Git helpers ───────────────────────────────────────────────────────────────
 
 def git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    """Run a git command, return CompletedProcess."""
+    """Run a git command, return CompletedProcess.
+
+    Uses surrogateescape for non-UTF-8 output (e.g. binary diffs that
+    slip past git's binary detection).
+    """
     return subprocess.run(
         ["git"] + args,
         cwd=cwd,
         capture_output=True,
-        text=True,
+        text=False,  # raw bytes
         timeout=120,
     )
 
 
 def git_ok(args: list[str], cwd: Path) -> str | None:
-    """Run git command, return stdout on success, None on failure."""
+    """Run git command, return stdout as string on success, None on failure.
+
+    Returns None if the output is not valid UTF-8 (binary content).
+    """
     r = git(args, cwd)
-    return r.stdout if r.returncode == 0 else None
+    if r.returncode != 0:
+        return None
+    try:
+        return r.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def get_remote_url(repo: Path) -> str | None:
@@ -253,14 +263,6 @@ def get_default_branch(repo: Path) -> str | None:
             return branch
 
     return None
-
-
-def get_local_branches(repo: Path) -> list[str]:
-    """List all local branch names."""
-    out = git_ok(["for-each-ref", "--format=%(refname:short)", "refs/heads/"], repo)
-    if not out:
-        return []
-    return [line.strip() for line in out.strip().splitlines() if line.strip()]
 
 
 def is_merge_commit(repo: Path, sha: str) -> bool:
@@ -327,40 +329,6 @@ def has_binary_files(repo: Path, base: str, head: str) -> bool:
         if line.startswith("-\t-\t"):
             return True
     return False
-
-
-def create_bundle(
-    repo: Path, base: str, head: str, bundle_dir: Path,
-    repo_url: str,
-) -> str | None:
-    """Create a minimal git bundle containing base..head.
-
-    Returns the relative path to the bundle file, or None on failure.
-    """
-    bundle_dir.mkdir(parents=True, exist_ok=True)
-
-    # Sanitize repo URL for filename
-    safe_name = repo_url.replace("/", "_").replace(":", "_")
-    bundle_name = f"{safe_name}_{base[:12]}_{head[:12]}.bundle"
-    bundle_path = bundle_dir / bundle_name
-
-    if bundle_path.exists():
-        return str(bundle_path.relative_to(bundle_dir.parent))
-
-    r = subprocess.run(
-        ["git", "bundle", "create", str(bundle_path), f"{base}..{head}"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-
-    if r.returncode != 0:
-        # Clean up partial file
-        bundle_path.unlink(missing_ok=True)
-        return None
-
-    return str(bundle_path.relative_to(bundle_dir.parent))
 
 
 # ── Repo discovery ────────────────────────────────────────────────────────────
@@ -443,6 +411,34 @@ def find_repos(repo_dirs: list[str]) -> list[Path]:
 
 # ── Main harvest logic ────────────────────────────────────────────────────────
 
+def get_all_commits(repo: Path, max_count: int = 5000) -> list[str]:
+    """Get all commit SHAs in the repo across all branches, topo-sorted."""
+    out = git_ok(
+        ["rev-list", "--all", "--topo-order", f"--max-count={max_count}"],
+        repo,
+    )
+    if not out:
+        return []
+    return [line.strip() for line in out.strip().splitlines() if line.strip()]
+
+
+def get_parent_chain(repo: Path, start: str, length: int) -> list[str] | None:
+    """Get a first-parent chain of `length` commits starting from `start` (inclusive).
+
+    Returns None if the chain is shorter than requested.
+    """
+    out = git_ok(
+        ["rev-list", "--first-parent", f"--max-count={length}", start],
+        repo,
+    )
+    if not out:
+        return None
+    chain = [line.strip() for line in out.strip().splitlines() if line.strip()]
+    if len(chain) < length:
+        return None
+    return chain
+
+
 def harvest_one(
     repo: Path,
     rng: random.Random,
@@ -450,36 +446,45 @@ def harvest_one(
     max_commits: int,
     max_files: int,
     max_diff_chars: int,
-    bundle_dir: Path | None,
     all_branches: bool = False,
 ) -> dict | None:
     """Try to generate one training example from a repo.
 
-    All operations are read-only (bundle create writes to bundle_dir only).
+    All operations are read-only.
     Returns None on failure.
     """
     if all_branches:
-        branches = get_local_branches(repo)
-        if not branches:
+        # Pick a random commit from anywhere in the repo
+        all_shas = get_all_commits(repo)
+        if not all_shas:
             return None
-        branch = rng.choice(branches)
+
+        n = rng.randint(min_commits, max_commits)
+        # Need n+1 commits in the chain (n to unwind + 1 for the base)
+        start = rng.choice(all_shas)
+        chain = get_parent_chain(repo, start, n + 1)
+        if chain is None:
+            return None
+
+        head_sha = chain[0]
+        base_sha = chain[-1]
+        # The commits being unwound are chain[0..n-1], base is chain[n]
+        commit_shas = chain[:-1]
+        branch = None  # unknown / multi-branch
     else:
         branch = get_default_branch(repo)
+        commits = get_first_parent_commits(repo, branch)
+        if len(commits) < min_commits + 1:
+            return None
 
-    commits = get_first_parent_commits(repo, branch)
-    if len(commits) < min_commits + 1:
-        return None
-
-    # Pick how many commits to unwind
-    n = rng.randint(min_commits, min(max_commits, len(commits) - 1))
-
-    # Pick a random starting point (head), ensuring we have n commits behind it
-    max_head_idx = len(commits) - n - 1
-    if max_head_idx < 0:
-        return None
-    head_idx = rng.randint(0, max_head_idx)
-    head_sha = commits[head_idx]
-    base_sha = commits[head_idx + n]
+        n = rng.randint(min_commits, min(max_commits, len(commits) - 1))
+        max_head_idx = len(commits) - n - 1
+        if max_head_idx < 0:
+            return None
+        head_idx = rng.randint(0, max_head_idx)
+        head_sha = commits[head_idx]
+        base_sha = commits[head_idx + n]
+        commit_shas = commits[head_idx:head_idx + n]
 
     # Get changed files
     changed_files = get_changed_files(repo, base_sha, head_sha)
@@ -501,8 +506,8 @@ def harvest_one(
 
     # Get info about each original commit in the range
     original_commits = []
-    for i in range(head_idx, head_idx + n):
-        info = get_commit_info(repo, commits[i])
+    for sha in commit_shas:
+        info = get_commit_info(repo, sha)
         if info:
             original_commits.append(info)
 
@@ -519,11 +524,6 @@ def harvest_one(
     # Get repo URL
     repo_url = get_remote_url(repo) or str(repo)
 
-    # Create bundle if requested
-    bundle_path = None
-    if bundle_dir is not None:
-        bundle_path = create_bundle(repo, base_sha, head_sha, bundle_dir, repo_url)
-
     result = {
         "repo_url": repo_url,
         "branch": branch,
@@ -536,9 +536,6 @@ def harvest_one(
         "existing_gitignore": existing_gitignore,
         "languages": languages,
     }
-
-    if bundle_path is not None:
-        result["bundle_path"] = bundle_path
 
     return result
 
@@ -581,10 +578,6 @@ def main():
         help="Random seed (default: 42)",
     )
     parser.add_argument(
-        "--bundle-dir", default=None,
-        help="Directory to write git bundles (default: no bundles)",
-    )
-    parser.add_argument(
         "--max-per-repo", type=int, default=None,
         help="Max examples per repo (default: unlimited). "
              "Useful to prevent large repos from dominating the dataset.",
@@ -604,8 +597,6 @@ def main():
 
     args = parser.parse_args()
     rng = random.Random(args.seed)
-
-    bundle_dir = Path(args.bundle_dir) if args.bundle_dir else None
 
     # Expand globs in repo-dirs
     expanded_dirs = []
@@ -641,11 +632,11 @@ def main():
     if args.dry_run:
         if args.all_branches:
             print(
-                f"\n{'Repo':<55} {'Branches':>8} {'Commits':>8}  "
+                f"\n{'Repo':<55} {'Commits':>8}  "
                 f"{'Default':<12}  Languages",
                 file=sys.stderr,
             )
-            print("─" * 120, file=sys.stderr)
+            print("─" * 110, file=sys.stderr)
         else:
             print(
                 f"\n{'Repo':<60} {'Commits':>8}  {'Branch':<12}  Languages",
@@ -658,41 +649,28 @@ def main():
             branch = get_default_branch(r) or "?"
 
             if args.all_branches:
-                branches = get_local_branches(r)
-                # Count commits across all branches (deduplicated)
-                all_shas = set()
-                for b in branches:
-                    for sha in get_first_parent_commits(r, b, max_count=500):
-                        all_shas.add(sha)
+                all_shas = get_all_commits(r)
                 total_commits = len(all_shas)
-
-                default_commits = get_first_parent_commits(r, branch, max_count=500)
-                if len(default_commits) > 1:
-                    recent_files = get_changed_files(r, default_commits[-1], default_commits[0])
-                else:
-                    recent_files = []
-                langs = detect_languages(recent_files)
-
-                url_display = url[:53] if len(url) > 53 else url
-                print(
-                    f"  {url_display:<55} {len(branches):>6} {total_commits:>8}  "
-                    f"{branch:<12}  {', '.join(langs) or '-'}",
-                    file=sys.stderr,
-                )
             else:
                 commits = get_first_parent_commits(r, branch, max_count=500)
-                if len(commits) > 1:
-                    recent_files = get_changed_files(r, commits[-1], commits[0])
-                else:
-                    recent_files = []
-                langs = detect_languages(recent_files)
+                total_commits = len(commits)
 
-                url_display = url[:58] if len(url) > 58 else url
-                print(
-                    f"  {url_display:<60} {len(commits):>6}  "
-                    f"{branch:<12}  {', '.join(langs) or '-'}",
-                    file=sys.stderr,
+            # Language detection from default branch
+            default_commits = get_first_parent_commits(r, branch, max_count=500)
+            if len(default_commits) > 1:
+                recent_files = get_changed_files(
+                    r, default_commits[-1], default_commits[0],
                 )
+            else:
+                recent_files = []
+            langs = detect_languages(recent_files)
+
+            url_display = url[:58] if len(url) > 58 else url
+            print(
+                f"  {url_display:<60} {total_commits:>6}  "
+                f"{branch:<12}  {', '.join(langs) or '-'}",
+                file=sys.stderr,
+            )
         sys.exit(0)
 
     # Generate examples, sampling randomly across repos for diversity
@@ -716,7 +694,6 @@ def main():
                 max_commits=args.max_commits,
                 max_files=args.max_files,
                 max_diff_chars=args.max_diff_chars,
-                bundle_dir=bundle_dir,
                 all_branches=args.all_branches,
             )
 
@@ -754,15 +731,12 @@ def main():
         sizes = []
         lang_counts: dict[str, int] = {}
         commit_counts: list[int] = []
-        n_with_bundle = 0
         repo_url_counts: dict[str, int] = {}
         with open(args.output) as f:
             for line in f:
                 data = json.loads(line)
                 sizes.append(len(line))
                 commit_counts.append(data["n_commits"])
-                if data.get("bundle_path"):
-                    n_with_bundle += 1
                 for lang in data.get("languages", []):
                     lang_counts[lang] = lang_counts.get(lang, 0) + 1
                 url = data.get("repo_url", "?")
@@ -778,17 +752,6 @@ def main():
             f"avg={sum(commit_counts)/len(commit_counts):.1f}",
             file=sys.stderr,
         )
-        if bundle_dir:
-            print(f"  Bundles created: {n_with_bundle}", file=sys.stderr)
-            total_bundle_size = sum(
-                p.stat().st_size
-                for p in bundle_dir.iterdir()
-                if p.suffix == ".bundle"
-            )
-            print(
-                f"  Total bundle size: {total_bundle_size / 1024 / 1024:.1f} MB",
-                file=sys.stderr,
-            )
         print(f"  Languages: {json.dumps(lang_counts, indent=4)}", file=sys.stderr)
 
         # Show top repos by example count
