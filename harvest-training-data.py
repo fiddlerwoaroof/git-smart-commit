@@ -7,19 +7,21 @@
 harvest-training-data: Generate git-smart-commit training inputs from local repos.
 
 Walks existing local git repositories, picks random commits, rewinds N commits
-along first-parent, captures the diff (including new files), optionally injects
-contextual noise files, and writes ready-to-use JSONL training inputs.
+along first-parent, captures the diff and a minimal git bundle for
+reconstruction, and writes ready-to-use JSONL training inputs.
 
 SAFE: Never modifies your working tree. All operations are read-only git
-commands (log, diff, diff-tree, show). No checkout, no stash, no worktree.
+commands (log, diff, diff-tree, show, bundle). No checkout, no stash, no
+worktree.
 
 The expensive frontier model step is NOT done here — this just produces inputs.
+Noise file injection happens at reconstruction time (not here).
 
 Usage:
     harvest-training-data [--repo-dirs DIR ...] [--output FILE] [--count N]
                           [--max-files MAX] [--max-diff-chars MAX]
                           [--min-commits MIN] [--max-commits MAX]
-                          [--seed SEED] [--noise-prob PROB]
+                          [--seed SEED] [--bundle-dir DIR]
                           [--fetch] [--dry-run]
 
 Each output line is a JSON object:
@@ -29,12 +31,15 @@ Each output line is a JSON object:
     "head_commit": "def456...",
     "n_commits": 3,
     "diff": "...",
-    "noise_files": {"path": "content", ...},
     "changed_files": ["a.py", "b.py"],
     "original_commits": [{"sha": "...", "subject": "...", "files": [...]}],
     "existing_gitignore": ["*.pyc", "__pycache__/", ...],
-    "languages": ["python", "rust"]
+    "languages": ["python", "rust"],
+    "bundle_path": "bundles/github.com_owner_repo_abc123_def456.bundle"
 }
+
+The bundle contains just base_commit..head_commit, enough to reconstruct the
+diff without cloning the full repo.
 """
 
 import argparse
@@ -54,7 +59,7 @@ EXTENSION_TO_LANGUAGE = {
     ".pyx": "python",
     ".pyi": "python",
     ".java": "java",
-    ".kt": "java",       # kotlin, same ecosystem
+    ".kt": "kotlin",
     ".gradle": "java",
     ".lisp": "common-lisp",
     ".lsp": "common-lisp",
@@ -68,7 +73,6 @@ EXTENSION_TO_LANGUAGE = {
     ".rake": "ruby",
     ".gemspec": "ruby",
     ".rs": "rust",
-    ".toml": "rust",      # could be generic, but often Cargo.toml
     ".js": "javascript",
     ".ts": "typescript",
     ".jsx": "javascript",
@@ -97,205 +101,41 @@ EXTENSION_TO_LANGUAGE = {
     ".mli": "ocaml",
 }
 
+FILENAME_TO_LANGUAGE = {
+    "cargo.toml": "rust",
+    "cargo.lock": "rust",
+    "pom.xml": "java",
+    "build.gradle": "java",
+    "build.gradle.kts": "kotlin",
+    "gemfile": "ruby",
+    "rakefile": "ruby",
+    "setup.py": "python",
+    "pyproject.toml": "python",
+    "requirements.txt": "python",
+    "project.clj": "clojure",
+    "deps.edn": "clojure",
+    "package.json": "javascript",
+    "yarn.lock": "javascript",
+    "go.mod": "go",
+    "go.sum": "go",
+    "flake.nix": "nix",
+    "mix.exs": "elixir",
+    "stack.yaml": "haskell",
+    "cabal.project": "haskell",
+}
+
 
 def detect_languages(changed_files: list[str]) -> list[str]:
-    """Detect programming languages from file extensions."""
+    """Detect programming languages from file extensions and known filenames."""
     langs = set()
     for f in changed_files:
         ext = Path(f).suffix.lower()
         if ext in EXTENSION_TO_LANGUAGE:
             langs.add(EXTENSION_TO_LANGUAGE[ext])
-        # Check for known filenames too
         name = Path(f).name.lower()
-        if name in ("cargo.toml", "cargo.lock"):
-            langs.add("rust")
-        elif name in ("pom.xml", "build.gradle", "build.gradle.kts"):
-            langs.add("java")
-        elif name in ("gemfile", "rakefile"):
-            langs.add("ruby")
-        elif name in ("setup.py", "pyproject.toml", "requirements.txt"):
-            langs.add("python")
-        elif name in ("project.clj", "deps.edn"):
-            langs.add("clojure")
-        elif name in ("package.json", "yarn.lock"):
-            langs.add("javascript")
-        elif name in ("go.mod", "go.sum"):
-            langs.add("go")
-        elif name == "flake.nix":
-            langs.add("nix")
+        if name in FILENAME_TO_LANGUAGE:
+            langs.add(FILENAME_TO_LANGUAGE[name])
     return sorted(langs)
-
-
-# ── Noise generation ──────────────────────────────────────────────────────────
-
-# Language/ecosystem-specific noise patterns
-NOISE_BY_LANGUAGE = {
-    "python": [
-        ("__pycache__/{stem}.cpython-311.pyc", b""),
-        (".mypy_cache/3.11/{stem}.data.json", b'{{"mtime": 0}}'),
-        (".pytest_cache/v/cache/lastfailed", b"{}"),
-        (".ruff_cache/content", b""),
-        ("{parent}/.ipynb_checkpoints/{stem}-checkpoint.ipynb", b'{{"cells":[]}}'),
-        (".venv/lib/python3.11/site-packages/pip/__init__.py", b""),
-    ],
-    "java": [
-        ("{parent}/target/classes/{stem}.class", b"\xca\xfe\xba\xbe"),
-        (".idea/workspace.xml", b'<?xml version="1.0"?>\n<project version="4"/>\n'),
-        (".idea/.gitignore", b""),
-        (".idea/modules.xml", b'<?xml version="1.0"?>\n'),
-        ("{parent}/{stem}.class", b"\xca\xfe\xba\xbe"),
-        ("build/classes/java/main/App.class", b"\xca\xfe\xba\xbe"),
-        (".gradle/caches/journal-1/file-access.bin", b""),
-    ],
-    "common-lisp": [
-        ("{parent}/{stem}.fasl", b""),
-        ("{parent}/{stem}.fas", b""),
-        ("{parent}/{stem}.lx64fsl", b""),
-    ],
-    "clojure": [
-        ("target/classes/clojure/core.class", b"\xca\xfe\xba\xbe"),
-        (".cpcache/orchard.edn", b"{}"),
-        (".nrepl-port", b"12345"),
-        (".lsp/sqlite.db", b""),
-    ],
-    "ruby": [
-        (".bundle/config", b'---\nBUNDLE_PATH: "vendor/bundle"\n'),
-        ("vendor/bundle/ruby/3.2.0/gems/.keep", b""),
-        ("coverage/.resultset.json", b'{{"coverage": {{}}}}'),
-        ("tmp/pids/server.pid", b"12345"),
-    ],
-    "rust": [
-        ("target/debug/.fingerprint/.keep", b""),
-        ("target/debug/build/.keep", b""),
-        ("target/debug/deps/.keep", b""),
-        ("target/.rustc_info.json", b'{{"host": "x86_64"}}'),
-    ],
-    "javascript": [
-        ("node_modules/.package-lock.json", b'{{"lockfileVersion": 3}}'),
-        ("node_modules/.cache/.keep", b""),
-        ("dist/bundle.js", b"// generated\nvar a=1;\n"),
-        (".next/cache/.keep", b""),
-        ("coverage/lcov.info", b""),
-    ],
-    "typescript": [
-        ("node_modules/.package-lock.json", b'{{"lockfileVersion": 3}}'),
-        ("dist/index.js", b'"use strict";\n'),
-        (".tsbuildinfo", b'{{"program":{{}}}}'),
-    ],
-    "go": [
-        ("vendor/modules.txt", b""),
-    ],
-    "haskell": [
-        (".stack-work/dist/.keep", b""),
-        ("dist-newstyle/cache/.keep", b""),
-    ],
-    "nix": [
-        ("result", b""),  # symlink, but content doesn't matter for training
-    ],
-}
-
-# Editor-specific noise
-EDITOR_NOISE = {
-    "vim": [
-        (".{name}.swp", b""),
-        (".{name}.swo", b""),
-        ("{parent}/.netrwhist", b""),
-        ("Session.vim", b""),
-        ("{parent}/tags", b"!_TAG_FILE_FORMAT\t2\n"),
-    ],
-    "emacs": [
-        ("{parent}/#{name}#", b""),
-        ("{parent}/.#{name}", b""),
-        ("{parent}/{name}~", b""),
-        (".projectile", b""),
-        ("TAGS", b"\x0c\n"),
-    ],
-    "intellij": [
-        (".idea/workspace.xml", b'<?xml version="1.0"?>\n<project version="4"/>\n'),
-        (".idea/misc.xml", b'<?xml version="1.0"?>\n'),
-        (".idea/.gitignore", b""),
-        (".idea/dictionaries/edwlan.xml", b"<component/>"),
-        ("{parent}/{stem}.iml", b""),
-        ("out/production/classes/.keep", b""),
-    ],
-    "vscode": [
-        (".vscode/settings.json", b'{{"editor.fontSize": 14}}\n'),
-        (".vscode/launch.json", b'{{"version": "0.2.0"}}\n'),
-        (".vscode/.browse.db", b""),
-    ],
-}
-
-# OS-level noise (always possible)
-OS_NOISE = [
-    (".DS_Store", b"\x00\x00\x00\x01Bud1"),
-    ("Thumbs.db", b""),
-    (".directory", b"[Desktop Entry]\nIcon=folder\n"),
-    (".env", b"SECRET_KEY=changeme\nDATABASE_URL=postgres://localhost/dev\n"),
-    (".env.local", b"API_KEY=test123\n"),
-]
-
-# Editors to simulate, weighted by usage
-EDITORS = ["vim", "emacs", "intellij", "vscode"]
-
-
-def generate_noise(
-    changed_files: list[str],
-    languages: list[str],
-    rng: random.Random,
-) -> dict[str, str]:
-    """Generate contextual noise files based on languages and editors in use."""
-    count = rng.randint(1, 5)
-    noise = {}
-
-    # Build candidate pool
-    candidates = []
-
-    # Add language-specific noise
-    for lang in languages:
-        candidates.extend(NOISE_BY_LANGUAGE.get(lang, []))
-
-    # Add editor noise (pick 1-2 editors)
-    n_editors = rng.randint(1, 2)
-    editors = rng.sample(EDITORS, min(n_editors, len(EDITORS)))
-    for editor in editors:
-        candidates.extend(EDITOR_NOISE.get(editor, []))
-
-    # Always include OS noise as candidates
-    candidates.extend(OS_NOISE)
-
-    if not candidates:
-        return {}
-
-    # Pick a reference file for template expansion
-    ref_files = [f for f in changed_files if Path(f).suffix] or changed_files
-    if not ref_files:
-        return {}
-
-    selected = rng.sample(candidates, min(count, len(candidates)))
-
-    for template, content in selected:
-        ref = rng.choice(ref_files)
-        ref_path = Path(ref)
-
-        parent = str(ref_path.parent) if str(ref_path.parent) != "." else "."
-
-        # Expand templates
-        try:
-            path = template.format(
-                name=ref_path.name,
-                stem=ref_path.stem,
-                parent=parent,
-            )
-        except (KeyError, IndexError):
-            continue
-
-        # Don't shadow real files
-        if path in changed_files:
-            continue
-
-        noise[path] = content.decode("utf-8", errors="replace") if content else ""
-
-    return noise
 
 
 # ── Gitignore mining ──────────────────────────────────────────────────────────
@@ -304,14 +144,11 @@ def mine_gitignore(repo: Path, commit: str) -> list[str]:
     """Extract .gitignore patterns from the repo at a given commit.
 
     Checks the root .gitignore and any nested .gitignore files.
+    All read-only: uses git show and git ls-tree.
     """
     patterns = []
 
-    # List all .gitignore files at this commit
-    out = git_ok(
-        ["ls-tree", "-r", "--name-only", commit],
-        repo,
-    )
+    out = git_ok(["ls-tree", "-r", "--name-only", commit], repo)
     if not out:
         return []
 
@@ -324,13 +161,11 @@ def mine_gitignore(repo: Path, commit: str) -> list[str]:
         content = git_ok(["show", f"{commit}:{gi_path}"], repo)
         if not content:
             continue
+        parent = str(Path(gi_path).parent)
         for line in content.splitlines():
             line = line.strip()
-            # Skip comments and empty lines
             if not line or line.startswith("#"):
                 continue
-            # Prefix with directory if it's a nested .gitignore
-            parent = str(Path(gi_path).parent)
             if parent != ".":
                 patterns.append(f"{parent}/{line}")
             else:
@@ -403,18 +238,25 @@ def fetch_all(repo: Path) -> bool:
 
 def get_default_branch(repo: Path) -> str | None:
     """Get the default branch (main/master) for the repo."""
-    # Try HEAD
     out = git_ok(["symbolic-ref", "--short", "HEAD"], repo)
     if out:
         return out.strip()
 
-    # Try common names
     for branch in ["main", "master", "develop"]:
         r = git(["rev-parse", "--verify", branch], repo)
         if r.returncode == 0:
             return branch
 
     return None
+
+
+def is_merge_commit(repo: Path, sha: str) -> bool:
+    """Check if a commit is a merge commit by counting its parents."""
+    out = git_ok(["cat-file", "-p", sha], repo)
+    if not out:
+        return False
+    parent_count = sum(1 for line in out.splitlines() if line.startswith("parent "))
+    return parent_count > 1
 
 
 def get_first_parent_commits(
@@ -431,15 +273,14 @@ def get_first_parent_commits(
 
 
 def get_commit_info(repo: Path, sha: str) -> dict | None:
-    """Get subject and changed files for a commit."""
+    """Get subject and changed files for a commit. Returns None for merges."""
+    if is_merge_commit(repo, sha):
+        return None
+
     out = git_ok(["show", "--no-patch", "--format=%s", sha], repo)
     if not out:
         return None
     subject = out.strip()
-
-    # Skip merge commits
-    if subject.startswith("Merge "):
-        return None
 
     out = git_ok(["diff-tree", "--no-commit-id", "-r", "--name-only", sha], repo)
     files = [f for f in (out or "").strip().splitlines() if f.strip()]
@@ -448,10 +289,7 @@ def get_commit_info(repo: Path, sha: str) -> dict | None:
 
 
 def get_diff(repo: Path, base: str, head: str) -> str | None:
-    """Get the full diff between two commits, including new files.
-
-    This is a pure read-only operation — no checkout needed.
-    """
+    """Get the full diff between two commits. Read-only."""
     out = git_ok(
         ["diff", "--no-color", "--no-ext-diff", base, head],
         repo,
@@ -478,6 +316,40 @@ def has_binary_files(repo: Path, base: str, head: str) -> bool:
     return False
 
 
+def create_bundle(
+    repo: Path, base: str, head: str, bundle_dir: Path,
+    repo_url: str,
+) -> str | None:
+    """Create a minimal git bundle containing base..head.
+
+    Returns the relative path to the bundle file, or None on failure.
+    """
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    # Sanitize repo URL for filename
+    safe_name = repo_url.replace("/", "_").replace(":", "_")
+    bundle_name = f"{safe_name}_{base[:12]}_{head[:12]}.bundle"
+    bundle_path = bundle_dir / bundle_name
+
+    if bundle_path.exists():
+        return str(bundle_path.relative_to(bundle_dir.parent))
+
+    r = subprocess.run(
+        ["git", "bundle", "create", str(bundle_path), f"{base}..{head}"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    if r.returncode != 0:
+        # Clean up partial file
+        bundle_path.unlink(missing_ok=True)
+        return None
+
+    return str(bundle_path.relative_to(bundle_dir.parent))
+
+
 # ── Repo discovery ────────────────────────────────────────────────────────────
 
 def find_repos(repo_dirs: list[str]) -> list[Path]:
@@ -486,7 +358,6 @@ def find_repos(repo_dirs: list[str]) -> list[Path]:
     Handles:
     - Direct repos: DIR is itself a git repo
     - Nested repos: ~/git-repos/github.com/owner/repo
-    - Bare repos (skipped)
     """
     repos = []
     for d in repo_dirs:
@@ -526,11 +397,12 @@ def harvest_one(
     max_commits: int,
     max_files: int,
     max_diff_chars: int,
-    noise_prob: float,
+    bundle_dir: Path | None,
 ) -> dict | None:
     """Try to generate one training example from a repo.
 
-    All operations are read-only. Returns None on failure.
+    All operations are read-only (bundle create writes to bundle_dir only).
+    Returns None on failure.
     """
     branch = get_default_branch(repo)
     commits = get_first_parent_commits(repo, branch)
@@ -573,7 +445,7 @@ def harvest_one(
         if info:
             original_commits.append(info)
 
-    # Skip if all commits were merge commits (filtered out by get_commit_info)
+    # Skip if all commits were merges
     if not original_commits:
         return None
 
@@ -583,26 +455,30 @@ def harvest_one(
     # Mine .gitignore patterns from the base commit
     existing_gitignore = mine_gitignore(repo, base_sha)
 
-    # Generate noise
-    noise = {}
-    if rng.random() < noise_prob:
-        noise = generate_noise(changed_files, languages, rng)
-
     # Get repo URL
     repo_url = get_remote_url(repo) or str(repo)
 
-    return {
+    # Create bundle if requested
+    bundle_path = None
+    if bundle_dir is not None:
+        bundle_path = create_bundle(repo, base_sha, head_sha, bundle_dir, repo_url)
+
+    result = {
         "repo_url": repo_url,
         "base_commit": base_sha,
         "head_commit": head_sha,
         "n_commits": n,
         "diff": diff,
-        "noise_files": noise,
         "changed_files": changed_files,
         "original_commits": original_commits,
         "existing_gitignore": existing_gitignore,
         "languages": languages,
     }
+
+    if bundle_path is not None:
+        result["bundle_path"] = bundle_path
+
+    return result
 
 
 def main():
@@ -643,8 +519,8 @@ def main():
         help="Random seed (default: 42)",
     )
     parser.add_argument(
-        "--noise-prob", type=float, default=0.3,
-        help="Probability of injecting noise files (default: 0.3)",
+        "--bundle-dir", default=None,
+        help="Directory to write git bundles (default: no bundles)",
     )
     parser.add_argument(
         "--fetch", action="store_true",
@@ -658,16 +534,21 @@ def main():
     args = parser.parse_args()
     rng = random.Random(args.seed)
 
+    bundle_dir = Path(args.bundle_dir) if args.bundle_dir else None
+
     # Expand globs in repo-dirs
     expanded_dirs = []
     for pattern in args.repo_dirs:
-        matches = glob.glob(os.path.expanduser(pattern))
+        matches = glob.glob(os.path.expanduser(pattern), recursive=True)
         if matches:
             expanded_dirs.extend(matches)
         else:
             expanded_dirs.append(os.path.expanduser(pattern))
 
-    print(f"Scanning for repos in {len(expanded_dirs)} director(ies)...", file=sys.stderr)
+    print(
+        f"Scanning for repos in {len(expanded_dirs)} director(ies)...",
+        file=sys.stderr,
+    )
     repos = find_repos(expanded_dirs)
     print(f"Found {len(repos)} repositories.", file=sys.stderr)
 
@@ -697,7 +578,6 @@ def main():
             branch = get_default_branch(r) or "?"
             commits = get_first_parent_commits(r, branch, max_count=500)
 
-            # Quick language detection from recent files
             if len(commits) > 1:
                 recent_files = get_changed_files(r, commits[-1], commits[0])
             else:
@@ -729,7 +609,7 @@ def main():
                 max_commits=args.max_commits,
                 max_files=args.max_files,
                 max_diff_chars=args.max_diff_chars,
-                noise_prob=args.noise_prob,
+                bundle_dir=bundle_dir,
             )
 
             if example is None:
@@ -754,25 +634,21 @@ def main():
     # Print stats
     if generated > 0:
         sizes = []
-        n_with_noise = 0
         lang_counts: dict[str, int] = {}
         commit_counts: list[int] = []
+        n_with_bundle = 0
         with open(args.output) as f:
             for line in f:
                 data = json.loads(line)
                 sizes.append(len(line))
-                if data.get("noise_files"):
-                    n_with_noise += 1
                 commit_counts.append(data["n_commits"])
+                if data.get("bundle_path"):
+                    n_with_bundle += 1
                 for lang in data.get("languages", []):
                     lang_counts[lang] = lang_counts.get(lang, 0) + 1
 
-        print(f"\nStats:", file=sys.stderr)
+        print("\nStats:", file=sys.stderr)
         print(f"  Examples: {generated}", file=sys.stderr)
-        print(
-            f"  With noise: {n_with_noise} ({100*n_with_noise//generated}%)",
-            file=sys.stderr,
-        )
         print(f"  Avg line size: {sum(sizes)//len(sizes):,} chars", file=sys.stderr)
         print(
             f"  Commits unwound: min={min(commit_counts)} "
@@ -780,9 +656,16 @@ def main():
             f"avg={sum(commit_counts)/len(commit_counts):.1f}",
             file=sys.stderr,
         )
-        print(
-            f"  Languages: {json.dumps(lang_counts, indent=4)}", file=sys.stderr,
-        )
+        if bundle_dir:
+            print(f"  Bundles created: {n_with_bundle}", file=sys.stderr)
+            total_bundle_size = sum(
+                f.stat().st_size for f in bundle_dir.iterdir() if f.suffix == ".bundle"
+            )
+            print(
+                f"  Total bundle size: {total_bundle_size / 1024 / 1024:.1f} MB",
+                file=sys.stderr,
+            )
+        print(f"  Languages: {json.dumps(lang_counts, indent=4)}", file=sys.stderr)
 
 
 if __name__ == "__main__":
