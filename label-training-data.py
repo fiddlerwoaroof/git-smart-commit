@@ -311,6 +311,8 @@ async def call_teacher(
     api_url: str,
     api_key: str,
     model: str,
+    max_tokens: int = 4096,
+    reasoning_effort: str | None = None,
     max_retries: int = 3,
 ) -> tuple[dict, dict]:
     """Call teacher model. Returns (parsed_result, usage_dict).
@@ -336,20 +338,29 @@ async def call_teacher(
                     }
                 ]
 
+            body: dict = {
+                "model": model,
+                "messages": current_messages,
+                "temperature": 0.2,
+                "max_completion_tokens": max_tokens,
+            }
+            if reasoning_effort:
+                body["reasoning_effort"] = reasoning_effort
+
             response = await client.post(
                 f"{api_url}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": model,
-                    "messages": current_messages,
-                    "temperature": 0.2,
-                    "max_tokens": 4096,
-                },
+                json=body,
             )
             response.raise_for_status()
             data = response.json()
 
-            content = data["choices"][0]["message"]["content"] or ""
+            msg = data["choices"][0]["message"]
+            content = msg.get("content") or ""
+            # Reasoning models (GPT-OSS, Step 3.5 Flash, etc.) may put
+            # output in reasoning_content when content is empty/null.
+            if not content.strip() and msg.get("reasoning_content"):
+                content = msg["reasoning_content"]
             usage = data.get("usage", {})
 
             try:
@@ -453,6 +464,8 @@ async def process_one(
             api_url=args.api_url,
             api_key=args.api_key,
             model=args.model,
+            max_tokens=args.max_tokens,
+            reasoning_effort=args.reasoning_effort,
         )
     except Exception as e:
         key = example_key(example)
@@ -507,7 +520,7 @@ async def run(args: argparse.Namespace) -> None:
     out_lock = asyncio.Lock()
     progress = Progress(len(pending))
 
-    timeout = httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=5.0)
+    timeout = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         with open(args.output, "a") as out_f:
             tasks = [
@@ -570,6 +583,14 @@ def main() -> None:
     parser.add_argument(
         "--seed", type=int, default=42,
         help="Base random seed for noise injection (default: 42)",
+    )
+    parser.add_argument(
+        "--reasoning-effort", default=None, choices=["low", "medium", "high"],
+        help="Reasoning effort for reasoning models (default: none/not set)",
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=4096,
+        help="Max output tokens per request (default: 4096)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
