@@ -40,9 +40,81 @@ from pathlib import Path
 from typing import Any, Callable
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 # ── Configuration ──────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = textwrap.dedent("""\
+    You are a senior software engineer helping organize messy working-tree changes
+    into clean, logical git commits.
+
+    Given a list of changed files and their diffs, your job is to group them into
+    one or more commits. Each commit should represent a single logical change
+    (e.g. "add feature X", "fix bug in Y", "update dependencies",
+    "refactor Z"). If multiple logical changes affect the same file
+    and cannot be separated without partial staging, group them into a
+    single commit.
+
+    You do not need to commit every file. Skip junk files (editor backups,
+    build artifacts, OS metadata). Instead, collect suggested .gitignore patterns
+    for them in the gitignore argument.
+
+    You also actively look for common coding issues that a linter
+    would catch and code smells such as using conditionals where
+    polymorphism is more appropriate or violations of the Law of
+    Demeter: misused APIs, suspicious code patterns, etc. For example:
+
+    ```java
+    // missing if braces
+    if (a == 1) # wrong, add an issue "missing braces for if statement"
+       b;
+       c;
+    d;
+    ```
+
+    ```c
+    // incorrect arguments for well-known functions and Constructors
+    printf(1); # wrong, add an issue "printf called with invalid arguments"
+    ```
+
+    ```python
+    // Wrong keyword for the programming language
+    if True:
+        throw new Exception("foo") # wrong, add an issue "invalid keywords for python"
+
+    ```
+
+    ```python
+    # Using exceptions for control flow instead of sys.exit
+    if answer == "no":
+        raise Exception("Cancelled.")  # wrong: should be sys.exit(0) or return
+    ```
+
+    Any detected issues should be added to the list of issues in a
+    particular commit.
+
+    Rules:
+    - Keep related changes together (same feature, same module, same concern)
+    - Separate unrelated concerns into different commits
+    - Dependency/lockfile changes belong with the commit that caused them
+    - Test files belong with the code they test
+    - Use conventional commit format:
+        subject: type(scope): short description  (under 72 chars)
+        body: 4-10 lines, plain text, wrapped at 80 chars, no markdown
+      Types: feat, fix, refactor, chore, docs, test, style, build, ci
+    - Write body content based only on what you observe in the diff.
+      Do not reference issue numbers or details not visible in the changes.
+    - In the issues field, call out any bugs, incorrect API usage, or suspicious
+      patterns you observe in the diff. Examples: wrong number of arguments,
+      misused stdlib functions, unreachable code, obvious logic errors. Be specific:
+      include the file, the offending line or pattern, and why it's wrong.
+      Leave issues empty only if you find nothing suspicious.
+    - Watch specifically for arguments passed to constructors or functions that
+      don't accept them (e.g. Exception() does not accept a file= keyword argument).
+
+    Call the propose_commits tool with your answer.
+""")
+
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_MODEL = "qwen3-coder:30b-a3b-q8_0"
@@ -88,35 +160,55 @@ def call_ollama_with_tool(
     """Call Ollama forcing tool_fn to be called. Returns a validated pydantic model instance."""
     spec = tool_fn._tool_spec
     args_model: type[BaseModel] = tool_fn._tool_model
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "tools": [spec],
-        "stream": False,
-        "keep_alive": "1h",
-        "options": {
-            "temperature": 0.1,
-            "num_ctx": num_ctx,
-        },
-    }
-    with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
-        response = client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
-        response.raise_for_status()
-        data = response.json()
+    actual_prompt = prompt
+    retries = 0
+    failures = []
+    while True:
+        retries += 1
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": actual_prompt}],
+            "tools": [spec],
+            "stream": False,
+            "keep_alive": "1h",
+            "options": {
+                "temperature": 0.1,
+                "num_ctx": num_ctx,
+            },
+        }
+        with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
+            response = client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+            response.raise_for_status()
+            data = response.json()
 
-    tool_calls = data.get("message", {}).get("tool_calls", [])
-    if tool_calls:
-        raw_args = tool_calls[0]["function"]["arguments"]
-        # Ollama may return arguments as a string or already-parsed dict
-        if isinstance(raw_args, str):
-            raw_args = json.loads(raw_args)
-    else:
-        # Fallback: parse message content as JSON
-        content = data.get("message", {}).get("content", "").strip()
-        content = content.lstrip("```json").lstrip("```").rstrip("```").strip()
-        raw_args = json.loads(content)
+        tool_calls = data.get("message", {}).get("tool_calls", [])
+        if tool_calls:
+            raw_args = tool_calls[0]["function"]["arguments"]
+            # Ollama may return arguments as a string or already-parsed dict
+            if isinstance(raw_args, str):
+                raw_args = json.loads(raw_args)
+        else:
+            # Fallback: parse message content as JSON
+            content = data.get("message", {}).get("content", "").strip()
+            content = content.lstrip("```json").lstrip("```").rstrip("```").strip()
+            raw_args = json.loads(content)
 
-    return args_model.model_validate(raw_args).post_process()
+        try:
+            return args_model.model_validate(raw_args).post_process()
+        except ValidationError as e:
+            failures.append(str(e))
+            if retries > 5:
+                raise
+
+            actual_prompt = textwrap.dedent(f"""
+            Your previous output was: {json.dumps(data)}
+
+            This failed with a validation error:
+            {'\n'.join(failures)}
+
+            Try again following this prompt exactly:
+            {prompt}
+            """)
 
 
 # ── Git helpers ────────────────────────────────────────────────────────────────
@@ -186,17 +278,15 @@ def split_hunks(diff_text: str) -> list[str]:
     return hunks or [diff_text]   # fallback: treat whole diff as one hunk
 
 
-PRIOR_HUNK_WINDOW = 3   # how many previous hunk summaries to include as context
+PRIOR_HUNK_WINDOW = 4   # how many previous hunk summaries to include as context
 
 
-def summarize_file_diff(model: str, fname: str, diff_text: str) -> str:
+def summarize_file_diff(model: str, fname: str, diff_text: str, max_chars: int) -> str:
     """Ask the model to summarize each hunk, passing the last 3 summaries as context."""
     hunks = split_hunks(diff_text)
     hunk_summaries: list[str] = []
 
     for i, hunk in enumerate(hunks, 1):
-        hunk_snippet = hunk if len(hunk) <= 4000 else hunk[:4000] + "\n... (hunk truncated)"
-
         prior_context = ""
         if hunk_summaries:
             window = hunk_summaries[-PRIOR_HUNK_WINDOW:]
@@ -207,15 +297,19 @@ def summarize_file_diff(model: str, fname: str, diff_text: str) -> str:
 
         prompt = textwrap.dedent(f"""\
             Summarize hunk {i} of {len(hunks)} from '{fname}' in 1-3 plain English sentences.
-            Focus on WHAT changed and WHY it matters (if inferable). No jargon, no bullet points.
-            Do not mention line numbers. Output only the summary, nothing else.
+            Focus on WHAT changed. Preserve verbatim any code that looks buggy or suspicious
+            (wrong arguments, misused APIs, incorrect syntax). Output only the summary.
 
             {prior_context}Hunk {i}:
-            {hunk_snippet}
+            {hunk}
         """)
+        first_hunk = i
+
         summary = call_ollama(model, prompt, num_ctx=HUNK_SUMMARIZE_CTX)
+
         hunk_summaries.append(summary.strip())
 
+    print()
     return f"[summarized — {len(hunks)} hunk(s)]\n" + "\n".join(
         f"  Hunk {i}: {s}" for i, s in enumerate(hunk_summaries, 1)
     )
@@ -236,16 +330,16 @@ def build_diff_summary(repo: Path, model: str) -> str:
             continue
         parts.append(f"{label}:\n{stat}\n")
 
-        changed = git(["diff"] + extra_args + ["--name-only"], repo).splitlines()
+        changed = git(["diff"] + extra_args + ["--name-only", "--no-ext-diff"], repo).splitlines()
         for fname in changed:
-            file_diff = git(["diff"] + extra_args + ["--no-color", "--", fname], repo)
+            file_diff = git(["diff"] + extra_args + ["--no-color", "--no-ext-diff", "--", fname], repo)
 
             if len(file_diff) <= DIFF_CHARS_PER_FILE:
                 content = file_diff
             else:
                 print(f"  Summarizing large diff: {fname} ({len(file_diff):,} chars)…",
                       file=sys.stderr)
-                content = summarize_file_diff(model, fname, file_diff)
+                content = summarize_file_diff(model, fname, file_diff, DIFF_CHARS_PER_FILE)
 
             parts.append(content)
             total_chars += len(content)
@@ -299,11 +393,15 @@ def call_ollama(model: str, prompt: str, num_ctx: int = NUM_CTX) -> str:
 
 # ── Tool definitions ───────────────────────────────────────────────────────────
 
+class Issue(BaseModel):
+    message: str = Field(description="REQUIRED. A brief description of a code issue, including a line number")
+    path: str = Field(description="REQUIRED. The path affected by the issue")
+
 class Commit(BaseModel):
-    issues: list[str] = Field(default_factory=list, description="Issues noticed in the code being committed")
-    subject: str = Field(description="Conventional commit subject line (type(scope): desc), under 72 chars")
-    files: list[str] = Field(description="Repository-relative paths to include in this commit")
+    subject: str = Field(description="REQUIRED. Conventional commit subject line (type(scope): desc), under 72 chars")
+    files: list[str] = Field(description="REQUIRED. Repository-relative paths to include in this commit")
     body: str = Field(default="", description="4-10 line plain-text commit body, no markdown")
+    issues: list[Issue] = Field(default_factory=list, description="Issues noticed in the code being committed")
 
 
     def post_process(self):
@@ -311,12 +409,30 @@ class Commit(BaseModel):
         return self
 
 class ProposeCommitsArgs(BaseModel):
-    commits: list[Commit] = Field(description="Logical commit groups")
+    commits: list[Commit] = Field(description="REQUIRED. Logical commit groups")
     gitignore: list[str] = Field(default_factory=list, description="Suggested .gitignore patterns for junk files")
 
     def post_process(self):
         self.commits = [commit.post_process() for commit in self.commits]
         return self
+
+sample_issue = Issue(
+    message="Unused import 'os' on line 1",
+    path="main.py"
+)
+
+sample_commit = Commit(
+    subject="refactor(main): cleanup imports",
+    files=["main.py"],
+    body="Removed unnecessary imports to improve load time and code cleanliness.",
+    issues=[sample_issue]
+)
+
+SAMPLE_OUTPUT = ProposeCommitsArgs(
+    commits=[sample_commit],
+    gitignore=["*.pyc", "__pycache__/"]
+)
+
 
 
 @tool(ProposeCommitsArgs)
@@ -324,33 +440,74 @@ def propose_commits() -> None:
     """Group working-tree changes into logical commits and suggest .gitignore patterns for junk files."""
 
 
-SYSTEM_PROMPT = textwrap.dedent("""\
-    You are a senior software engineer helping organize messy working-tree changes
-    into clean, logical git commits.
+def merge_overlapping_commits(commits: list[dict]) -> list[dict]:
+    """Merge commits whose file sets overlap, since partial staging isn't supported.
 
-    Given a list of changed files and their diffs, your job is to group them into
-    one or more commits. Each commit should represent a single logical change
-    (e.g. "add feature X", "fix bug in Y", "update dependencies", "refactor Z").
+    Uses union-find: if commit A and commit B share any file, they must be
+    merged into a single commit.  Subjects are joined with "; ", bodies are
+    concatenated, files and issues are unioned.
+    """
+    if len(commits) <= 1:
+        return commits
 
-    You do not need to commit every file. Skip junk files (editor backups,
-    build artifacts, OS metadata). Instead, collect suggested .gitignore patterns
-    for them in the gitignore argument.
+    # Build a mapping from each file to the indices of commits that touch it
+    file_to_indices: dict[str, list[int]] = {}
+    for i, c in enumerate(commits):
+        for f in c.get("files", []):
+            file_to_indices.setdefault(f, []).append(i)
 
-    Rules:
-    - Keep related changes together (same feature, same module, same concern)
-    - Separate unrelated concerns into different commits
-    - Dependency/lockfile changes belong with the commit that caused them
-    - Test files belong with the code they test
-    - Use conventional commit format:
-        subject: type(scope): short description  (under 72 chars)
-        body: 4-10 lines, plain text, wrapped at 80 chars, no markdown
-      Types: feat, fix, refactor, chore, docs, test, style, build, ci
-    - Write body content based only on what you observe in the diff.
-      Do not reference issue numbers or details not visible in the changes.
-    - Also, call out any potential issues in each commit for review.
+    # Union-find to group commits sharing files
+    parent = list(range(len(commits)))
 
-    Call the propose_commits tool with your answer.
-""")
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for indices in file_to_indices.values():
+        for idx in indices[1:]:
+            union(indices[0], idx)
+
+    # Group commits by their root
+    groups: dict[int, list[int]] = {}
+    for i in range(len(commits)):
+        groups.setdefault(find(i), []).append(i)
+
+    # Merge each group
+    merged = []
+    for indices in groups.values():
+        if len(indices) == 1:
+            merged.append(commits[indices[0]])
+            continue
+
+        group = [commits[i] for i in indices]
+        # Use the first commit's subject as primary, note the merge
+        primary = group[0]
+        all_files = list(dict.fromkeys(f for c in group for f in c.get("files", [])))
+        all_issues = []
+        seen_issues = set()
+        for c in group:
+            for issue in c.get("issues", []):
+                key = (issue.get("path", ""), issue.get("message", ""))
+                if key not in seen_issues:
+                    seen_issues.add(key)
+                    all_issues.append(issue)
+        # Combine bodies, skipping empties
+        bodies = [c.get("body", "").strip() for c in group if c.get("body", "").strip()]
+        merged.append({
+            "subject": primary["subject"],
+            "files": all_files,
+            "body": "\n\n".join(bodies),
+            "issues": all_issues,
+        })
+
+    return merged
 
 
 def classify_changes(model: str, files: list[str], diff_summary: str) -> tuple[list[dict], list[str]]:
@@ -358,6 +515,7 @@ def classify_changes(model: str, files: list[str], diff_summary: str) -> tuple[l
     file_list = "\n".join(f"  - {f}" for f in files)
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
+        f"Sample Output:\n{SAMPLE_OUTPUT.model_dump_json()}\n\n"
         f"Changed files:\n{file_list}\n\n"
         f"Diffs:\n{diff_summary}"
     )
@@ -367,6 +525,8 @@ def classify_changes(model: str, files: list[str], diff_summary: str) -> tuple[l
     commits = [c.model_dump() for c in result.commits]
     if not commits:
         raise Exception("Error: Model returned no valid commit groups.")
+
+    commits = merge_overlapping_commits(commits)
 
     return commits, result.gitignore
 
@@ -403,7 +563,8 @@ def execute_commits(repo: Path, commits: list[dict]) -> None:
             git(["commit", "-m", message], repo)
             print(f"  ✓ Committed")
         except RuntimeError as e:
-            raise Exception(f"  Error committing: {e}", file=sys.stderr)
+            print(f"   Error committing: {e}", file=sys.stderr)
+            raise
 
 
 # ── Display helpers ────────────────────────────────────────────────────────────
@@ -421,9 +582,9 @@ def print_proposed_commits(commits: list[dict], gitignore: list[str]) -> None:
         for f in commit.get("files", []):
             print(f"       + {f}")
         if (issues:= commit.get("issues")) != []:
-            print("Issues in this commit:")
+            print("  Issues in this commit:")
             for issue in issues:
-                print(f"\t- {issue.strip()}")
+                print(f"    - {issue["path"]}: {issue["message"]}")
     if gitignore:
         print("\n  Suggested .gitignore patterns:")
         for pattern in gitignore:
@@ -452,7 +613,8 @@ def main() -> None:
     try:
         git(["rev-parse", "--git-dir"], repo)
     except RuntimeError:
-        raise Exception(f"Error: {repo} is not a git repository.", file=sys.stderr)
+        print(f"Error: {repo} is not a git repository.", file=sys.stderr)
+        sys.exit(3)
 
     # Collect changed files
     print("Scanning for changes...", file=sys.stderr)
@@ -483,9 +645,10 @@ def main() -> None:
         try:
             answer = input("Proceed with these commits? [y/N] ").strip().lower()
         except (KeyboardInterrupt, EOFError):
-            raise Exception("\nCancelled.")
+            return
         if answer not in ("y", "yes"):
-            raise Exception("Cancelled.")
+            print("Cancelled.")
+            return
 
     execute_commits(repo, commits)
     print("\nDone.")
