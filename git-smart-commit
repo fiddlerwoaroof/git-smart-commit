@@ -93,6 +93,7 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 
     Rules:
     - CRITICAL: You can only commit WHOLE FILES. Partial staging is NOT supported. If a single file contains multiple unrelated changes, you MUST group them together into one single commit. Do not split a file across multiple commits.
+    - CRITICAL: Tool calls must use JSON for arguments. Other formats will result in failure. In particular, strings must be surrounded by double-quotes (") and if one occurs literally, escape with backslashes.
     - Keep related changes together (same feature, same module, same concern).
     - Separate unrelated concerns into different commits, provided they do not violate the whole-file rule above.
     - Dependency/lockfile changes belong with the commit that caused them.
@@ -157,12 +158,17 @@ def tool(args_model: type[BaseModel]):
 
 
 def call_ollama_with_tool(
-    model: str,
+    ollama_model: str,
     prompt: str,
     tool_fn: Callable,
     num_ctx: int = NUM_CTX,
-) -> BaseModel:
-    """Call Ollama forcing tool_fn to be called. Returns a validated pydantic model instance."""
+    **tool_kwargs,
+) -> Any:
+    """Call Ollama forcing tool_fn to be called.
+
+    Parses and validates the response into the tool's args model, then calls
+    tool_fn(validated_args, **tool_kwargs) and returns its result.
+    """
     spec = tool_fn._tool_spec
     args_model: type[BaseModel] = tool_fn._tool_model
     actual_prompt = prompt
@@ -171,7 +177,7 @@ def call_ollama_with_tool(
     while True:
         retries += 1
         payload = {
-            "model": model,
+            "model": ollama_model,
             "messages": [{"role": "user", "content": actual_prompt}],
             "tools": [spec],
             "stream": False,
@@ -199,17 +205,16 @@ def call_ollama_with_tool(
             raw_args = json.loads(content)
 
         try:
-            return args_model.model_validate(raw_args).post_process()
+            validated = args_model.model_validate(raw_args).post_process()
+            return tool_fn(validated, **tool_kwargs)
         except ValidationError as e:
             failures.append(str(e))
             if retries > 5:
                 raise
 
             actual_prompt = textwrap.dedent(f"""
-            Your previous output was: {json.dumps(data)}
-
-            This failed with a validation error:
-            {'\n'.join(failures)}
+            Your previous ({len(failures)}) attempts failed with a validation error:
+            {'\n'.join(set(failures))}
 
             Try again following this prompt exactly:
             {prompt}
@@ -441,8 +446,14 @@ SAMPLE_OUTPUT = ProposeCommitsArgs(
 
 
 @tool(ProposeCommitsArgs)
-def propose_commits() -> None:
+def propose_commits(result: ProposeCommitsArgs, model: str) -> tuple[list[dict], list[str]]:
     """Group working-tree changes into logical commits and suggest .gitignore patterns for junk files."""
+    commits = [c.model_dump() for c in result.commits]
+    if not commits:
+        raise Exception("Error: Model returned no valid commit groups.")
+
+    commits = merge_overlapping_commits(model, commits)
+    return commits, result.gitignore
 
 
 class MergeCommitsArgs(BaseModel):
@@ -455,8 +466,13 @@ class MergeCommitsArgs(BaseModel):
 
 
 @tool(MergeCommitsArgs)
-def merge_commits() -> None:
+def merge_commits(result: MergeCommitsArgs, all_files: list[str], all_issues: list[dict]) -> dict:
     """Merge multiple overlapping commits into a single coherent commit."""
+    commit = result.commit.model_dump()
+    # Ensure all files and issues are preserved regardless of what the model returns
+    commit["files"] = all_files
+    commit["issues"] = all_issues
+    return commit
 
 
 MERGE_PROMPT = textwrap.dedent("""\
@@ -544,12 +560,10 @@ def merge_overlapping_commits(model: str, commits: list[dict]) -> list[dict]:
         commits_desc = json.dumps(group, indent=2)
         prompt = MERGE_PROMPT + commits_desc
 
-        result: MergeCommitsArgs = call_ollama_with_tool(model, prompt, merge_commits)
-        commit = result.commit.model_dump()
-        # Ensure all files and issues are preserved regardless of what the model returns
-        commit["files"] = all_files
-        commit["issues"] = all_issues
-        merged.append(commit)
+        merged.append(call_ollama_with_tool(
+            model, prompt, merge_commits,
+            all_files=all_files, all_issues=all_issues,
+        ))
 
     return merged
 
@@ -564,15 +578,7 @@ def classify_changes(model: str, files: list[str], diff_summary: str) -> tuple[l
         f"Diffs:\n{diff_summary}"
     )
 
-    result: ProposeCommitsArgs = call_ollama_with_tool(model, prompt, propose_commits)
-
-    commits = [c.model_dump() for c in result.commits]
-    if not commits:
-        raise Exception("Error: Model returned no valid commit groups.")
-
-    commits = merge_overlapping_commits(model, commits)
-
-    return commits, result.gitignore
+    return call_ollama_with_tool(model, prompt, propose_commits, model=model)
 
 
 
