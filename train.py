@@ -202,6 +202,7 @@ def main() -> None:
             per_device_train_batch_size=args.batch_size,
             per_device_eval_batch_size=args.batch_size,
             gradient_accumulation_steps=args.grad_accum,
+            gradient_checkpointing_kwargs = {"use_reentrant": True},
             num_train_epochs=args.epochs,
             learning_rate=args.lr,
             warmup_ratio=args.warmup_ratio,
