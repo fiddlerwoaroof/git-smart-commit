@@ -44,6 +44,7 @@ import ast
 import httpx
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -131,13 +132,106 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 """)
 
 
+AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
+    You are a senior software engineer helping organize messy working-tree changes
+    into clean, logical git commits.
+
+    You have investigation tools to gather information before proposing commits:
+    - read_file(path): Read the full current content of any file in the repository
+    - get_diff(path, staged): Get the raw diff for a specific file on demand
+      (staged=true for staged only, staged=false for unstaged only, omit for both)
+    - get_git_log(n): Get the last n commit subjects to learn this project's conventions
+    - search_diff(pattern, context_lines): Search all diffs for a regex pattern
+
+    Investigation strategy:
+    - Start with the file list and stats you receive
+    - Use get_git_log early to learn this project's commit style conventions
+    - Use get_diff on files whose grouping is unclear from stats alone
+    - Use read_file when you need full file context (imports, class structure, etc.)
+    - Use search_diff to find patterns across all changes (debug prints, TODOs, etc.)
+    - Investigate as many files as needed, then call propose_commits when confident
+
+    You do not need to commit every file. Skip junk files (editor backups,
+    build artifacts, OS metadata). Instead, collect suggested .gitignore patterns
+    for them in the gitignore argument.
+
+    You also actively look for common coding issues that a linter
+    would catch and code smells such as using conditionals where
+    polymorphism is more appropriate or violations of the Law of
+    Demeter: misused APIs, suspicious code patterns, etc. For example:
+
+    ```java
+    // missing if braces
+    if (a == 1) # wrong, add an issue "missing braces for if statement"
+       b;
+       c;
+    d;
+    ```
+
+    ```c
+    // incorrect arguments for well-known functions and Constructors
+    printf(1); # wrong, add an issue "printf called with invalid arguments"
+    ```
+
+    ```python
+    // Wrong keyword for the programming language
+    if True:
+        throw new Exception("foo") # wrong, add an issue "invalid keywords for python"
+
+    ```
+
+    ```python
+    # Using exceptions for control flow instead of sys.exit
+    if answer == "no":
+        raise Exception("Cancelled.")  # wrong: should be sys.exit(0) or return
+    ```
+
+    Any detected issues should be added to the list of issues in a
+    particular commit.
+
+    Rules:
+    - CRITICAL: You can only commit WHOLE FILES. Partial staging is NOT supported. If a single file contains multiple unrelated changes, you MUST group them together into one single commit. Do not split a file across multiple commits.
+    - CRITICAL: Tool calls must use JSON for arguments. Other formats will result in failure. In particular, strings must be surrounded by double-quotes (") and if one occurs literally, escape with backslashes.
+    - Keep related changes together (same feature, same module, same concern).
+    - Separate unrelated concerns into different commits, provided they do not violate the whole-file rule above.
+    - Dependency/lockfile changes belong with the commit that caused them.
+    - Test files belong with the code they test.
+    - Use strict conventional commit format:
+        subject: type(scope): short description  (under 72 chars)
+        body: 4-10 lines, plain text, wrapped at 80 chars, no markdown
+    - Type Definitions:
+        * feat: Adds a net-new capability, flag, or behavior (e.g., adding .venv support, new CLI flags). Use this even for personal tools/dotfiles!
+        * fix: Resolves a bug, crash, or incorrect behavior.
+        * refactor: Structural changes that DO NOT change external behavior. If it adds a feature, it is a 'feat'.
+        * chore: Routine maintenance, dependency bumps, or minor environment tweaks with no new logic.
+        * (Other types: docs, test, style, build, ci)
+    - feat is the highest priority commit type
+    - chore is the lowest priority commit type
+    - Do not repeat the commit type in the subject description (e.g., avoid "refactor(tools): refactor the parser").
+    - Write body content based only on what you observe in the diff.
+      Do not reference issue numbers or details not visible in the changes.
+    - In the issues field, call out any bugs, incorrect API usage, or suspicious
+      patterns you observe in the diff. Examples: wrong number of arguments,
+      misused stdlib functions, unreachable code, obvious logic errors. Be specific:
+      include the file, the offending line or pattern, and why it's wrong.
+      Leave issues empty only if you find nothing suspicious.
+    - Watch specifically for arguments passed to constructors or functions that
+      don't accept them (e.g. Exception() does not accept a file= keyword argument).
+
+    When you have investigated enough to be confident in your groupings, call the
+    propose_commits tool with your answer.
+""")
+
+
 OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_MODEL = "qwen3-coder:30b-a3b-q8_0"
 
 DIFF_CHARS_PER_FILE = 6000    # files larger than this get hunk-summarized
 DIFF_TOTAL_CHARS   = 120000   # hard cap on total context sent to classifier
 HUNK_SUMMARIZE_CTX = 8192     # smaller context for summarization calls (faster)
-PRIOR_HUNK_WINDOW  = 4        # how many previous hunk summaries to include as context
+PRIOR_HUNK_WINDOW  = 4
+
+MAX_AGENTIC_TURNS = 20   # safeguard for the agentic investigation loop        # how many previous hunk summaries to include as context
 
 
 @dataclass
@@ -167,6 +261,14 @@ class ApiConfig:
         return {}
 
 
+@dataclass
+class ToolCall:
+    """Represents a tool call extracted from an LLM response."""
+    name: str
+    arguments: dict
+    call_id: str | None = None
+
+
 # ── Tool decorator ─────────────────────────────────────────────────────────────
 #
 # Defining a new tool:
@@ -191,6 +293,14 @@ def tool(args_model: type[BaseModel]):
         fn._tool_model = args_model
         return fn
     return decorator
+
+
+def _summarize_args(arguments: dict, max_len: int = 80) -> str:
+    """Return a compact one-line summary of tool call arguments for logging."""
+    raw = json.dumps(arguments, separators=(",", ":"))
+    if len(raw) <= max_len:
+        return raw
+    return raw[:max_len - 3] + "..."
 
 
 # ── LLM client ────────────────────────────────────────────────────────────────
@@ -258,6 +368,120 @@ class LLMClient:
             content = content.removeprefix("```json").removeprefix("```").strip().removesuffix("```").strip()
             return json.loads(content)
         return None
+
+    def _build_payload_messages(self, messages: list[dict],
+                                tools: list[dict] | None = None,
+                                tool_choice: str | dict | None = None,
+                                stream: bool = False) -> dict:
+        """Build a payload from a full conversation history (messages list)."""
+        if self.config.is_ollama:
+            payload: dict[str, Any] = {
+                "model": self.config.model,
+                "messages": messages,
+                "stream": stream,
+                "keep_alive": "1h",
+                "options": {
+                    "temperature": 0.2,
+                    "num_ctx": self.config.num_ctx,
+                },
+            }
+            if tools:
+                payload["tools"] = tools
+            # Ollama does not support tool_choice — omit it
+        else:
+            payload = {
+                "model": self.config.model,
+                "messages": messages,
+                "stream": stream,
+                "temperature": 0.2,
+            }
+            if tools:
+                payload["tools"] = tools
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
+        return payload
+
+    def _extract_tool_call(self, data: dict) -> ToolCall | None:
+        """Extract a tool call from an API response, handling both Ollama and OpenAI formats."""
+        if self.config.is_ollama:
+            tool_calls = data.get("message", {}).get("tool_calls", [])
+            if tool_calls:
+                tc = tool_calls[0]
+                raw = tc["function"]["arguments"]
+                args = json.loads(raw) if isinstance(raw, str) else raw
+                return ToolCall(
+                    name=tc["function"]["name"],
+                    arguments=args,
+                    call_id=tc.get("id"),
+                )
+        else:
+            choices = data.get("choices", [])
+            if not choices:
+                return None
+            msg = choices[0].get("message", {})
+            tool_calls = msg.get("tool_calls", [])
+            if tool_calls:
+                tc = tool_calls[0]
+                raw = tc["function"]["arguments"]
+                args = json.loads(raw) if isinstance(raw, str) else raw
+                return ToolCall(
+                    name=tc["function"]["name"],
+                    arguments=args,
+                    call_id=tc.get("id"),
+                )
+        return None
+
+    def _extract_text_content(self, data: dict) -> str | None:
+        """Extract plain text content from a response when no tool call is present."""
+        if self.config.is_ollama:
+            content = data.get("message", {}).get("content", "").strip()
+        else:
+            choices = data.get("choices", [])
+            if not choices:
+                return None
+            content = choices[0].get("message", {}).get("content", "").strip()
+        return content or None
+
+    def _format_assistant_tool_call(self, tool_call: ToolCall) -> dict:
+        """Format an assistant tool-call message for conversation history."""
+        if self.config.is_ollama:
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "name": tool_call.name,
+                        "arguments": json.dumps(tool_call.arguments),
+                    },
+                }],
+            }
+        else:
+            return {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": tool_call.call_id or "call_0",
+                    "type": "function",
+                    "function": {
+                        "name": tool_call.name,
+                        "arguments": json.dumps(tool_call.arguments),
+                    },
+                }],
+            }
+
+    def _format_tool_result(self, content: str, tool_call: ToolCall) -> dict:
+        """Format a tool result message for conversation history."""
+        if self.config.is_ollama:
+            return {
+                "role": "tool",
+                "content": content,
+            }
+        else:
+            return {
+                "role": "tool",
+                "tool_call_id": tool_call.call_id or "call_0",
+                "content": content,
+            }
 
     def call(self, prompt: str, num_ctx: int | None = None) -> str:
         """Call the LLM with streaming and return the assistant message text."""
@@ -348,6 +572,112 @@ class LLMClient:
                 Try again following this prompt exactly:
                 {prompt}
                 """)
+
+    def agentic_loop(self, system_prompt: str, initial_user_message: str,
+                     tool_registry: dict[str, Callable],
+                     terminal_tool: Callable, **kwargs) -> Any:
+        """Run a multi-turn agentic loop until the terminal tool is called.
+
+        Each turn: send messages → extract tool call → dispatch.
+        Investigation tool results are appended to history.
+        Validation errors for the terminal tool become tool-result messages.
+        On the last turn, only the terminal tool is offered.
+        """
+        messages: list[dict] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": initial_user_message},
+        ]
+
+        terminal_spec = terminal_tool._tool_spec
+        terminal_name: str = terminal_spec["function"]["name"]
+        terminal_model: type[BaseModel] = terminal_tool._tool_model
+        all_tool_specs = [fn._tool_spec for fn in list(tool_registry.values())] + [terminal_spec]
+
+        headers = {**self.config.auth_headers, "Content-Type": "application/json"}
+
+        for turn in range(1, MAX_AGENTIC_TURNS + 1):
+            is_last_turn = (turn == MAX_AGENTIC_TURNS)
+
+            if is_last_turn:
+                tools = [terminal_spec]
+                tool_choice: str | dict | None = (
+                    None if self.config.is_ollama
+                    else {"type": "function", "function": {"name": terminal_name}}
+                )
+            else:
+                tools = all_tool_specs
+                tool_choice = None if self.config.is_ollama else "auto"
+
+            payload = self._build_payload_messages(messages, tools=tools,
+                                                   tool_choice=tool_choice, stream=False)
+
+            with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
+                response = client.post(self.config.chat_url, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+
+            tool_call = self._extract_tool_call(data)
+
+            if tool_call is None:
+                text = self._extract_text_content(data) or ""
+                print(f"  [agentic turn {turn}/{MAX_AGENTIC_TURNS}] no tool call, nudging",
+                      file=sys.stderr)
+                messages.append({"role": "assistant", "content": text})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Please call a tool. Use the investigation tools to gather more "
+                        f"information, or call {terminal_name} if you are ready to propose commits."
+                    ),
+                })
+                continue
+
+            print(f"  [agentic turn {turn}/{MAX_AGENTIC_TURNS}] "
+                  f"{tool_call.name}({_summarize_args(tool_call.arguments)})",
+                  file=sys.stderr)
+            messages.append(self._format_assistant_tool_call(tool_call))
+
+            # Coerce stringified nested values (some models return JSON-as-string)
+            raw_args = dict(tool_call.arguments)
+            for key, val in raw_args.items():
+                if isinstance(val, str) and val.strip().startswith(("[", "{")):
+                    try:
+                        raw_args[key] = json.loads(val)
+                    except json.JSONDecodeError:
+                        try:
+                            raw_args[key] = ast.literal_eval(val)
+                        except (ValueError, SyntaxError):
+                            pass
+
+            if tool_call.name == terminal_name:
+                try:
+                    validated = terminal_model.model_validate(raw_args).post_process()
+                    return terminal_tool(validated, **kwargs)
+                except ValidationError as e:
+                    messages.append(self._format_tool_result(
+                        f"Validation error: {e}\nPlease fix the arguments and call "
+                        f"{terminal_name} again.",
+                        tool_call,
+                    ))
+                    continue
+
+            tool_fn = tool_registry.get(tool_call.name)
+            if tool_fn is None:
+                result_str = (f"Unknown tool: {tool_call.name!r}. "
+                              f"Available: {list(tool_registry.keys())}")
+            else:
+                try:
+                    validated_args = tool_fn._tool_model.model_validate(raw_args).post_process()
+                    result = tool_fn(validated_args, **kwargs)
+                    result_str = result if isinstance(result, str) else json.dumps(result)
+                except Exception as e:
+                    result_str = f"Error calling {tool_call.name}: {e}"
+
+            messages.append(self._format_tool_result(result_str, tool_call))
+
+        raise RuntimeError(
+            f"agentic_loop exceeded {MAX_AGENTIC_TURNS} turns without calling {terminal_name}"
+        )
 
 
 # ── Git helpers ────────────────────────────────────────────────────────────────
@@ -488,6 +818,151 @@ def merge_commits(result: MergeCommitsArgs, all_files: list[str], all_issues: li
     return commit
 
 
+MAX_READ_BYTES = 50_000   # 50 KB cap for read_file tool
+
+
+class ReadFileArgs(BaseModel):
+    path: str = Field(description="Repository-relative path of the file to read")
+
+    def post_process(self): return self
+
+
+@tool(ReadFileArgs)
+def read_file(result: ReadFileArgs, analyzer: "GitAnalyzer") -> str:
+    """Read the full current content of a file in the repository."""
+    try:
+        abs_path = (analyzer.repo / result.path).resolve()
+        abs_path.relative_to(analyzer.repo.resolve())  # guard against path traversal
+    except ValueError:
+        return f"Error: path traversal not allowed: {result.path}"
+
+    if not abs_path.exists():
+        return f"Error: file not found: {result.path}"
+
+    try:
+        raw = abs_path.read_bytes()
+        text = raw[:MAX_READ_BYTES].decode("utf-8", errors="replace")
+        suffix = f"\n\n... (truncated at {MAX_READ_BYTES} bytes)" if len(raw) > MAX_READ_BYTES else ""
+        return text + suffix
+    except Exception as e:
+        return f"Error reading {result.path}: {e}"
+
+
+class GetDiffArgs(BaseModel):
+    path: str = Field(description="Repository-relative path of the file")
+    staged: bool | None = Field(
+        default=None,
+        description="true=staged only, false=unstaged only, null/omit=both",
+    )
+
+    def post_process(self): return self
+
+
+@tool(GetDiffArgs)
+def get_diff(result: GetDiffArgs, analyzer: "GitAnalyzer") -> str:
+    """Get the raw unified diff for a specific file (staged, unstaged, or both)."""
+    parts = []
+
+    def _fetch(extra_args: list[str], label: str) -> None:
+        try:
+            diff = analyzer.git(["diff"] + extra_args + ["--no-color", "--no-ext-diff", "--", result.path])
+            if diff.strip():
+                parts.append(f"=== {label} ===\n{diff}" if result.staged is None else diff)
+        except RuntimeError as e:
+            parts.append(f"Error ({label}): {e}")
+
+    if result.staged is None:
+        _fetch(["--cached"], "staged")
+        _fetch([], "unstaged")
+    elif result.staged:
+        _fetch(["--cached"], "staged")
+    else:
+        _fetch([], "unstaged")
+
+    result_text = "\n".join(parts) if parts else f"No diff found for {result.path}"
+
+    if len(result_text) > DIFF_CHARS_PER_FILE:
+        result_text = result_text[:DIFF_CHARS_PER_FILE] + f"\n\n... (truncated at {DIFF_CHARS_PER_FILE} chars)"
+
+    return result_text
+
+
+class GetGitLogArgs(BaseModel):
+    n: int = Field(default=20, description="Number of recent commits to return (max 50)")
+
+    def post_process(self): return self
+
+
+@tool(GetGitLogArgs)
+def get_git_log(result: GetGitLogArgs, analyzer: "GitAnalyzer") -> str:
+    """Get recent commit history to understand this project's commit style conventions."""
+    n = min(result.n, 50)
+    try:
+        log = analyzer.git(["log", f"--max-count={n}", "--oneline", "--no-color"])
+        return log.strip() or "No commits found."
+    except RuntimeError as e:
+        return f"Error: {e}"
+
+
+class SearchDiffArgs(BaseModel):
+    pattern: str = Field(description="Python regex pattern to search for across all diffs")
+    context_lines: int = Field(default=2, description="Lines of context around each match")
+
+    def post_process(self): return self
+
+
+@tool(SearchDiffArgs)
+def search_diff(result: SearchDiffArgs, analyzer: "GitAnalyzer") -> str:
+    """Search for a regex pattern across all staged and unstaged diffs."""
+    try:
+        compiled = re.compile(result.pattern)
+    except re.error as e:
+        return f"Invalid regex: {e}"
+
+    matches: list[dict] = []
+    MAX_MATCHES = 50
+
+    for extra_args in (["--cached"], []):
+        if len(matches) >= MAX_MATCHES:
+            break
+        try:
+            changed = analyzer.git(
+                ["diff"] + extra_args + ["--name-only", "--no-ext-diff"]
+            ).splitlines()
+            for fname in changed:
+                if len(matches) >= MAX_MATCHES:
+                    break
+                diff = analyzer.git(
+                    ["diff"] + extra_args + ["--no-color", "--no-ext-diff", "--", fname]
+                )
+                lines = diff.splitlines()
+                for i, line in enumerate(lines):
+                    if compiled.search(line):
+                        start = max(0, i - result.context_lines)
+                        end = min(len(lines), i + result.context_lines + 1)
+                        matches.append({
+                            "file": fname,
+                            "line_number": i + 1,
+                            "match_context": "\n".join(lines[start:end]),
+                        })
+                        if len(matches) >= MAX_MATCHES:
+                            break
+        except RuntimeError:
+            pass
+
+    if not matches:
+        return f"No matches found for pattern: {result.pattern!r}"
+
+    result_lines = [
+        f"File: {m['file']} (line {m['line_number']})\n{m['match_context']}"
+        for m in matches
+    ]
+    text = "\n---\n".join(result_lines)
+    if len(matches) >= MAX_MATCHES:
+        text += f"\n... (limited to {MAX_MATCHES} matches)"
+    return text
+
+
 MERGE_PROMPT = textwrap.dedent("""\
     You are merging multiple proposed commits that all touch overlapping files
     and therefore cannot be committed separately (partial staging is not supported).
@@ -537,6 +1012,21 @@ class GitAnalyzer:
                 seen.add(f)
                 files.append(f)
         return files
+
+    def build_file_metadata(self) -> str:
+        """Return a compact stats-only summary: diff --stat for staged/unstaged + untracked list.
+
+        No full diffs — the LLM requests specific diffs lazily via get_diff.
+        """
+        parts: list[str] = []
+        for label, extra_args in [("Staged", ["--cached"]), ("Unstaged", [])]:
+            stat = self.git(["diff"] + extra_args + ["--stat", "--no-color"]).strip()
+            if stat:
+                parts.append(f"{label}:\n{stat}")
+        untracked = self.git(["ls-files", "--others", "--exclude-standard"]).splitlines()
+        if untracked:
+            parts.append("Untracked (new files):\n" + "\n".join(f"  {f}" for f in untracked))
+        return "\n\n".join(parts)
 
     def _summarize_file_diff(self, fname: str, diff_text: str) -> str:
         """Ask the model to summarize each hunk, passing the last N summaries as context."""
@@ -611,9 +1101,15 @@ class GitAnalyzer:
 
         return "\n".join(parts)
 
-    def classify_changes(self, files: list[str], diff_summary: str, critique: str = "") -> tuple[list[dict], list[str]]:
-        """Ask the model to group files into logical commits. Returns (commits, gitignore_patterns)."""
+    def classify_changes(self, files: list[str], diff_summary: str = "", critique: str = "") -> tuple[list[dict], list[str]]:
+        """Ask the model to group files into logical commits using an agentic investigation loop.
+
+        Returns (commits, gitignore_patterns).
+        diff_summary is accepted for backward compatibility but unused — the LLM
+        fetches diffs lazily via the get_diff investigation tool.
+        """
         file_list = "\n".join(f"  - {f}" for f in files)
+        metadata = self.build_file_metadata()
 
         critique_section = ""
         if critique:
@@ -623,15 +1119,26 @@ class GitAnalyzer:
                 f"Revise your commit groupings to address this feedback."
             )
 
-        prompt = (
-            f"{SYSTEM_PROMPT}\n\n"
-            f"Sample Output:\n{SAMPLE_OUTPUT.model_dump_json()}\n\n"
+        initial_message = (
             f"Changed files:\n{file_list}\n\n"
-            f"Diffs:\n{diff_summary}"
+            f"Stats:\n{metadata}"
             f"{critique_section}"
         )
 
-        return self.client.call_with_tool(prompt, propose_commits, analyzer=self)
+        tool_registry = {
+            "read_file": read_file,
+            "get_diff": get_diff,
+            "get_git_log": get_git_log,
+            "search_diff": search_diff,
+        }
+
+        return self.client.agentic_loop(
+            system_prompt=AGENTIC_SYSTEM_PROMPT,
+            initial_user_message=initial_message,
+            tool_registry=tool_registry,
+            terminal_tool=propose_commits,
+            analyzer=self,
+        )
 
     def merge_overlapping_commits(self, commits: list[dict]) -> list[dict]:
         """Merge commits whose file sets overlap, since partial staging isn't supported.
@@ -911,9 +1418,7 @@ def main() -> None:
 
     print(f"Found {len(files)} changed file(s). Analyzing...", file=sys.stderr)
 
-    # Build stat summary and classify
-    diff_summary = analyzer.build_diff_summary()
-    commits, gitignore = analyzer.classify_changes(files, diff_summary, critique=args.critique)
+    commits, gitignore = analyzer.classify_changes(files, critique=args.critique)
 
     # JSON mode: dump and optionally save plan to file
     if args.json_out:
