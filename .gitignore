@@ -5,3 +5,8 @@ outputs
 .DS_Store
 .Dockerfile.swp
 .claude
+
+# Added by git-smart-commit
+.beads/.metadata.json.swp
+.beads/dolt/beads/.dolt/noms/*
+.beads/dolt/beads/.dolt/stats/.dolt/noms/*
