@@ -145,6 +145,25 @@ READ_FILE_LIMIT    = 50_000   # max chars returned by the read_file tool
 
 
 @dataclass
+class ToolCall:
+    """Represents a single tool call returned by the LLM."""
+    name: str
+    arguments: dict
+    call_id: str | None = None
+
+
+def _summarize_args(args: dict) -> str:
+    """Compact one-line summary of tool arguments for logging/debugging."""
+    parts = []
+    for k, v in args.items():
+        s = repr(v)
+        if len(s) > 40:
+            s = s[:40] + "…"
+        parts.append(f"{k}={s}")
+    return ", ".join(parts)
+
+
+@dataclass
 class ApiConfig:
     """API connection and model configuration."""
     base_url: str = OLLAMA_BASE_URL
@@ -354,7 +373,7 @@ class LLMClient:
                 """)
 
 
-    def _build_messages_payload(self, messages: list[dict],
+    def _build_payload_messages(self, messages: list[dict],
                                 tools: list[dict] | None = None,
                                 stream: bool = False) -> dict:
         """Build a payload from a pre-built message list (used by the agentic loop)."""
@@ -382,40 +401,35 @@ class LLMClient:
                 payload["tools"] = tools
         return payload
 
-    def _extract_response(self, data: dict) -> tuple[list[dict], str]:
-        """Return (normalized_tool_calls, content_text) from an API response.
-
-        Each normalized tool call is {"name": str, "arguments": dict, "id": str|None}.
-        """
+    def _extract_tool_call(self, data: dict) -> ToolCall | None:
+        """Return the first ToolCall from an API response, or None if no tool was called."""
         if self.config.is_ollama:
-            msg = data.get("message", {})
-            raw_calls = msg.get("tool_calls", [])
-            content = msg.get("content", "") or ""
+            raw_calls = data.get("message", {}).get("tool_calls", [])
         else:
-            msg = data.get("choices", [{}])[0].get("message", {})
-            raw_calls = msg.get("tool_calls", [])
-            content = msg.get("content", "") or ""
+            raw_calls = data.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])
 
-        normalized = []
-        for tc in raw_calls:
-            fn = tc.get("function", {})
-            args = fn.get("arguments", {})
-            if isinstance(args, str):
-                args = json.loads(args)
-            normalized.append({
-                "name": fn.get("name", ""),
-                "arguments": args,
-                "id": tc.get("id"),
-            })
-        return normalized, content
+        if not raw_calls:
+            return None
+        tc = raw_calls[0]
+        fn = tc.get("function", {})
+        args = fn.get("arguments", {})
+        if isinstance(args, str):
+            args = json.loads(args)
+        return ToolCall(name=fn.get("name", ""), arguments=args, call_id=tc.get("id"))
 
-    def _make_assistant_msg(self, data: dict) -> dict:
-        """Extract the assistant message dict from an API response."""
+    def _extract_text_content(self, data: dict) -> str:
+        """Extract the plain-text content from an API response (when no tool was called)."""
+        if self.config.is_ollama:
+            return data.get("message", {}).get("content", "") or ""
+        return data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+
+    def _format_assistant_tool_call(self, data: dict) -> dict:
+        """Extract the assistant message dict from an API response for history."""
         if self.config.is_ollama:
             return data.get("message", {"role": "assistant", "content": ""})
         return data.get("choices", [{}])[0].get("message", {"role": "assistant", "content": ""})
 
-    def _make_tool_result_msg(self, call_id: str | None, content: str) -> dict:
+    def _format_tool_result(self, call_id: str | None, content: str) -> dict:
         """Build a tool-result message for appending to conversation history."""
         if call_id is not None and not self.config.is_ollama:
             return {"role": "tool", "tool_call_id": call_id, "content": content}
@@ -441,57 +455,55 @@ class LLMClient:
         failures: list[str] = []
 
         for _ in range(max_turns):
-            payload = self._build_messages_payload(messages, tools=all_specs, stream=False)
+            payload = self._build_payload_messages(messages, tools=all_specs, stream=False)
             headers = {**self.config.auth_headers, "Content-Type": "application/json"}
             with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
                 response = client.post(self.config.chat_url, json=payload, headers=headers)
                 response.raise_for_status()
                 data = response.json()
 
-            tool_calls, content = self._extract_response(data)
+            tc = self._extract_tool_call(data)
 
-            if not tool_calls:
+            if tc is None:
+                content = self._extract_text_content(data)
                 messages.append({"role": "assistant", "content": content})
                 messages.append({"role": "user", "content": "Please call one of the available tools to continue."})
                 continue
 
-            messages.append(self._make_assistant_msg(data))
+            messages.append(self._format_assistant_tool_call(data))
 
-            for tc in tool_calls:
-                name, raw_args, call_id = tc["name"], tc["arguments"], tc["id"]
-
-                if name == terminal_name:
-                    # Fix stringified nested values before validation
-                    for key, val in raw_args.items():
-                        if isinstance(val, str) and val.strip().startswith(("[", "{")):
-                            try:
-                                raw_args[key] = json.loads(val)
-                            except json.JSONDecodeError:
-                                try:
-                                    raw_args[key] = ast.literal_eval(val)
-                                except (ValueError, SyntaxError):
-                                    pass
-                    try:
-                        validated = args_model.model_validate(raw_args).post_process()
-                        return terminal_tool(validated, **tool_kwargs)
-                    except ValidationError as e:
-                        failures.append(str(e))
-                        failure_summary = "\n".join(set(failures))
-                        messages.append(self._make_tool_result_msg(
-                            call_id,
-                            f"ValidationError — fix and retry:\n{failure_summary}",
-                        ))
-                else:
-                    fn = next((t for t in intermediate_tools if t.__name__ == name), None)
-                    if fn is None:
-                        result = f"Error: unknown tool '{name}'"
-                    else:
+            if tc.name == terminal_name:
+                # Fix stringified nested values before validation
+                for key, val in tc.arguments.items():
+                    if isinstance(val, str) and val.strip().startswith(("[", "{")):
                         try:
-                            validated = fn._tool_model.model_validate(raw_args).post_process()
-                            result = str(fn(validated, **tool_kwargs))
-                        except Exception as e:
-                            result = f"Error executing {name}: {e}"
-                    messages.append(self._make_tool_result_msg(call_id, result))
+                            tc.arguments[key] = json.loads(val)
+                        except json.JSONDecodeError:
+                            try:
+                                tc.arguments[key] = ast.literal_eval(val)
+                            except (ValueError, SyntaxError):
+                                pass
+                try:
+                    validated = args_model.model_validate(tc.arguments).post_process()
+                    return terminal_tool(validated, **tool_kwargs)
+                except ValidationError as e:
+                    failures.append(str(e))
+                    failure_summary = "\n".join(set(failures))
+                    messages.append(self._format_tool_result(
+                        tc.call_id,
+                        f"ValidationError — fix and retry:\n{failure_summary}",
+                    ))
+            else:
+                fn = next((t for t in intermediate_tools if t.__name__ == tc.name), None)
+                if fn is None:
+                    result = f"Error: unknown tool '{tc.name}'"
+                else:
+                    try:
+                        validated = fn._tool_model.model_validate(tc.arguments).post_process()
+                        result = str(fn(validated, **tool_kwargs))
+                    except Exception as e:
+                        result = f"Error executing {tc.name}: {e}"
+                messages.append(self._format_tool_result(tc.call_id, result))
 
         raise RuntimeError(f"Agentic loop exceeded {max_turns} turns without a terminal tool call")
 
