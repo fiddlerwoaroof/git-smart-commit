@@ -254,7 +254,7 @@ def _extract_tool_args(data: dict) -> dict | None:
 
     # Fallback: parse content as JSON (both backends)
     if content:
-        content = content.lstrip("```json").lstrip("```").rstrip("```").strip()
+        content = content.removeprefix("```json").removeprefix("```").strip().removesuffix("```").strip()
         return json.loads(content)
     return None
 
@@ -785,6 +785,15 @@ def main() -> None:
         metavar="TEXT",
         help="Agent feedback on a previous proposal (triggers revised classification)",
     )
+    parser.add_argument(
+        "--plan", metavar="FILE",
+        help="Execute a previously saved commit plan (JSON from --json / --save-plan). "
+             "Skips classification entirely — the exact plan is replayed.",
+    )
+    parser.add_argument(
+        "--save-plan", metavar="FILE",
+        help="When used with --json, also write the plan to FILE for later use with --plan.",
+    )
 
     args = parser.parse_args()
     repo = Path(args.repo).resolve()
@@ -805,6 +814,30 @@ def main() -> None:
         print(f"Error: {repo} is not a git repository.", file=sys.stderr)
         sys.exit(3)
 
+    # Plan replay mode: load a previously saved plan, skip classification
+    if args.plan:
+        try:
+            with open(args.plan) as f:
+                plan = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Error: could not load plan from {args.plan}: {e}", file=sys.stderr)
+            sys.exit(1)
+        commits = plan["commits"]
+        gitignore = plan.get("gitignore", [])
+        print_proposed_commits(commits, gitignore)
+        if not args.dry_run:
+            if not args.yes:
+                try:
+                    answer = input("Proceed with these commits? [y/N] ").strip().lower()
+                except (KeyboardInterrupt, EOFError):
+                    return
+                if answer not in ("y", "yes"):
+                    print("Cancelled.")
+                    return
+            execute_commits(repo, commits)
+            print("\nDone.")
+        return
+
     # Collect changed files
     print("Scanning for changes...", file=sys.stderr)
     files = get_changed_files(repo)
@@ -817,9 +850,13 @@ def main() -> None:
     diff_summary = build_diff_summary(repo, args.model)
     commits, gitignore = classify_changes(args.model, files, diff_summary, critique=args.critique)
 
-    # JSON mode: just dump and exit
+    # JSON mode: dump and optionally save plan to file
     if args.json_out:
-        print(json.dumps({"commits": commits, "gitignore": gitignore}, indent=2))
+        plan_json = json.dumps({"commits": commits, "gitignore": gitignore}, indent=2)
+        print(plan_json)
+        if args.save_plan:
+            with open(args.save_plan, "w") as f:
+                f.write(plan_json)
         return
 
     # Display proposed commits
