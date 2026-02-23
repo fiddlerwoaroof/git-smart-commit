@@ -21,6 +21,11 @@ Use `git-smart-commit` to analyze the changes above and group them into logical 
 - **Control-flow flags** — handled by this workflow, NOT passed to `--json` commands:
   `--dry-run`, `--yes`
 
+**CRITICAL RULE: Always generate a JSON plan before committing.**
+Never invoke `git-smart-commit` without `--json` first. The commit step MUST
+replay a saved plan via `--plan`; re-running classification at commit time is
+forbidden (it could produce a different grouping than what the user approved).
+
 **Workflow:**
 
 1. If the status is empty, tell the user there is nothing to commit and stop.
