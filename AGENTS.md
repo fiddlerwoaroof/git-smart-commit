@@ -11,7 +11,7 @@
 3. **Update issue status** - Close finished work, update in-progress items
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
-   git pull --rebase
+   git merge $upstream_branch
    bd sync
    git push
    git status  # MUST show "up to date with origin"
@@ -25,3 +25,6 @@
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
+- Never rebase, always merge unless there's a really good reason not to
+- Always keep the documentation up to date and log interesting decisions into context/decisions.md
+- Always check for changes to AGENTS.md before beginning a new task.

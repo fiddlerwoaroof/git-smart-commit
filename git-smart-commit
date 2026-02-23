@@ -128,7 +128,10 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     - Watch specifically for arguments passed to constructors or functions that
       don't accept them (e.g. Exception() does not accept a file= keyword argument).
 
-    Call the propose_commits tool with your answer.
+    You have access to a read_file tool. Use it when the diff alone is not
+    enough context — for example, to see which class a changed function belongs
+    to, what imports already exist, or how unchanged surrounding code looks.
+    Call read_file as many times as needed, then call propose_commits when ready.
 """)
 
 
@@ -229,9 +232,10 @@ DEFAULT_MODEL = "qwen3-coder:30b-a3b-q8_0"
 DIFF_CHARS_PER_FILE = 6000    # files larger than this get hunk-summarized
 DIFF_TOTAL_CHARS   = 120000   # hard cap on total context sent to classifier
 HUNK_SUMMARIZE_CTX = 8192     # smaller context for summarization calls (faster)
-PRIOR_HUNK_WINDOW  = 4
+PRIOR_HUNK_WINDOW  = 4        # how many previous hunk summaries to include as context
 
-MAX_AGENTIC_TURNS = 20   # safeguard for the agentic investigation loop        # how many previous hunk summaries to include as context
+MAX_AGENTIC_TURNS  = 20       # safeguard for the agentic investigation loop
+READ_FILE_LIMIT    = 50_000   # max chars returned by the read_file tool
 
 
 @dataclass
@@ -442,46 +446,20 @@ class LLMClient:
             content = choices[0].get("message", {}).get("content", "").strip()
         return content or None
 
-    def _format_assistant_tool_call(self, tool_call: ToolCall) -> dict:
-        """Format an assistant tool-call message for conversation history."""
-        if self.config.is_ollama:
-            return {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{
-                    "function": {
-                        "name": tool_call.name,
-                        "arguments": json.dumps(tool_call.arguments),
-                    },
-                }],
-            }
-        else:
-            return {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": tool_call.call_id or "call_0",
-                    "type": "function",
-                    "function": {
-                        "name": tool_call.name,
-                        "arguments": json.dumps(tool_call.arguments),
-                    },
-                }],
-            }
+    def _format_assistant_tool_call(self, data: dict) -> dict:
+        """Extract the assistant message from a raw API response for conversation history.
 
-    def _format_tool_result(self, content: str, tool_call: ToolCall) -> dict:
-        """Format a tool result message for conversation history."""
+        Using the raw response message guarantees the format Ollama/OpenAI expects to see back.
+        """
         if self.config.is_ollama:
-            return {
-                "role": "tool",
-                "content": content,
-            }
-        else:
-            return {
-                "role": "tool",
-                "tool_call_id": tool_call.call_id or "call_0",
-                "content": content,
-            }
+            return data.get("message", {"role": "assistant", "content": ""})
+        return data.get("choices", [{}])[0].get("message", {"role": "assistant", "content": ""})
+
+    def _format_tool_result(self, call_id: str | None, content: str) -> dict:
+        """Build a tool-result message for appending to conversation history."""
+        if call_id is not None and not self.config.is_ollama:
+            return {"role": "tool", "tool_call_id": call_id, "content": content}
+        return {"role": "tool", "content": content}
 
     def call(self, prompt: str, num_ctx: int | None = None) -> str:
         """Call the LLM with streaming and return the assistant message text."""
@@ -635,7 +613,7 @@ class LLMClient:
             print(f"  [agentic turn {turn}/{MAX_AGENTIC_TURNS}] "
                   f"{tool_call.name}({_summarize_args(tool_call.arguments)})",
                   file=sys.stderr)
-            messages.append(self._format_assistant_tool_call(tool_call))
+            messages.append(self._format_assistant_tool_call(data))
 
             # Coerce stringified nested values (some models return JSON-as-string)
             raw_args = dict(tool_call.arguments)
@@ -655,9 +633,9 @@ class LLMClient:
                     return terminal_tool(validated, **kwargs)
                 except ValidationError as e:
                     messages.append(self._format_tool_result(
+                        tool_call.call_id,
                         f"Validation error: {e}\nPlease fix the arguments and call "
                         f"{terminal_name} again.",
-                        tool_call,
                     ))
                     continue
 
@@ -673,11 +651,12 @@ class LLMClient:
                 except Exception as e:
                     result_str = f"Error calling {tool_call.name}: {e}"
 
-            messages.append(self._format_tool_result(result_str, tool_call))
+            messages.append(self._format_tool_result(tool_call.call_id, result_str))
 
         raise RuntimeError(
             f"agentic_loop exceeded {MAX_AGENTIC_TURNS} turns without calling {terminal_name}"
         )
+
 
 
 # ── Git helpers ────────────────────────────────────────────────────────────────
@@ -818,34 +797,21 @@ def merge_commits(result: MergeCommitsArgs, all_files: list[str], all_issues: li
     return commit
 
 
-MAX_READ_BYTES = 50_000   # 50 KB cap for read_file tool
-
-
 class ReadFileArgs(BaseModel):
-    path: str = Field(description="Repository-relative path of the file to read")
+    path: str = Field(description="Repository-relative path to the file to read")
 
     def post_process(self): return self
 
 
 @tool(ReadFileArgs)
-def read_file(result: ReadFileArgs, analyzer: "GitAnalyzer") -> str:
-    """Read the full current content of a file in the repository."""
-    try:
-        abs_path = (analyzer.repo / result.path).resolve()
-        abs_path.relative_to(analyzer.repo.resolve())  # guard against path traversal
-    except ValueError:
-        return f"Error: path traversal not allowed: {result.path}"
+def read_file(args: ReadFileArgs, analyzer: "GitAnalyzer") -> str:
+    """Read the full current content of a file in the repository.
 
-    if not abs_path.exists():
-        return f"Error: file not found: {result.path}"
-
-    try:
-        raw = abs_path.read_bytes()
-        text = raw[:MAX_READ_BYTES].decode("utf-8", errors="replace")
-        suffix = f"\n\n... (truncated at {MAX_READ_BYTES} bytes)" if len(raw) > MAX_READ_BYTES else ""
-        return text + suffix
-    except Exception as e:
-        return f"Error reading {result.path}: {e}"
+    Use this when the diff alone lacks context — e.g. to see the surrounding
+    class structure, existing imports, or unchanged code near a changed line.
+    The result is truncated at 50,000 characters for very large files.
+    """
+    return analyzer._read_file(args.path)
 
 
 class GetDiffArgs(BaseModel):
@@ -1100,6 +1066,25 @@ class GitAnalyzer:
             parts.append("Untracked (new files):\n" + "\n".join(f"  {f}" for f in untracked))
 
         return "\n".join(parts)
+
+    def _read_file(self, path: str) -> str:
+        """Read a repo file, rejecting path traversal and truncating large files."""
+        target = (self.repo / path).resolve()
+        if not str(target).startswith(str(self.repo) + os.sep) and target != self.repo:
+            return f"[error: path traversal rejected for '{path}']"
+        if not target.exists():
+            return f"[file not found: {path}]"
+        try:
+            content = target.read_text(errors="replace")
+        except OSError as e:
+            return f"[error reading {path}: {e}]"
+        if len(content) > READ_FILE_LIMIT:
+            size = target.stat().st_size
+            return (
+                content[:READ_FILE_LIMIT]
+                + f"\n\n[truncated — file is {size:,} bytes; showing first {READ_FILE_LIMIT:,} chars]"
+            )
+        return content
 
     def classify_changes(self, files: list[str], diff_summary: str = "", critique: str = "") -> tuple[list[dict], list[str]]:
         """Ask the model to group files into logical commits using an agentic investigation loop.
