@@ -127,7 +127,10 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     - Watch specifically for arguments passed to constructors or functions that
       don't accept them (e.g. Exception() does not accept a file= keyword argument).
 
-    Call the propose_commits tool with your answer.
+    You have access to a read_file tool. Use it when the diff alone is not
+    enough context — for example, to see which class a changed function belongs
+    to, what imports already exist, or how unchanged surrounding code looks.
+    Call read_file as many times as needed, then call propose_commits when ready.
 """)
 
 
@@ -138,6 +141,7 @@ DIFF_CHARS_PER_FILE = 6000    # files larger than this get hunk-summarized
 DIFF_TOTAL_CHARS   = 120000   # hard cap on total context sent to classifier
 HUNK_SUMMARIZE_CTX = 8192     # smaller context for summarization calls (faster)
 PRIOR_HUNK_WINDOW  = 4        # how many previous hunk summaries to include as context
+READ_FILE_LIMIT    = 50_000   # max chars returned by the read_file tool
 
 
 @dataclass
@@ -350,6 +354,148 @@ class LLMClient:
                 """)
 
 
+    def _build_messages_payload(self, messages: list[dict],
+                                tools: list[dict] | None = None,
+                                stream: bool = False) -> dict:
+        """Build a payload from a pre-built message list (used by the agentic loop)."""
+        if self.config.is_ollama:
+            payload: dict[str, Any] = {
+                "model": self.config.model,
+                "messages": messages,
+                "stream": stream,
+                "keep_alive": "1h",
+                "options": {
+                    "temperature": 0.2,
+                    "num_ctx": self.config.num_ctx,
+                },
+            }
+            if tools:
+                payload["tools"] = tools
+        else:
+            payload = {
+                "model": self.config.model,
+                "messages": messages,
+                "stream": stream,
+                "temperature": 0.2,
+            }
+            if tools:
+                payload["tools"] = tools
+        return payload
+
+    def _extract_response(self, data: dict) -> tuple[list[dict], str]:
+        """Return (normalized_tool_calls, content_text) from an API response.
+
+        Each normalized tool call is {"name": str, "arguments": dict, "id": str|None}.
+        """
+        if self.config.is_ollama:
+            msg = data.get("message", {})
+            raw_calls = msg.get("tool_calls", [])
+            content = msg.get("content", "") or ""
+        else:
+            msg = data.get("choices", [{}])[0].get("message", {})
+            raw_calls = msg.get("tool_calls", [])
+            content = msg.get("content", "") or ""
+
+        normalized = []
+        for tc in raw_calls:
+            fn = tc.get("function", {})
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                args = json.loads(args)
+            normalized.append({
+                "name": fn.get("name", ""),
+                "arguments": args,
+                "id": tc.get("id"),
+            })
+        return normalized, content
+
+    def _make_assistant_msg(self, data: dict) -> dict:
+        """Extract the assistant message dict from an API response."""
+        if self.config.is_ollama:
+            return data.get("message", {"role": "assistant", "content": ""})
+        return data.get("choices", [{}])[0].get("message", {"role": "assistant", "content": ""})
+
+    def _make_tool_result_msg(self, call_id: str | None, content: str) -> dict:
+        """Build a tool-result message for appending to conversation history."""
+        if call_id is not None and not self.config.is_ollama:
+            return {"role": "tool", "tool_call_id": call_id, "content": content}
+        return {"role": "tool", "content": content}
+
+    def run_agentic_loop(
+        self,
+        messages: list[dict],
+        intermediate_tools: list[Callable],
+        terminal_tool: Callable,
+        max_turns: int = 20,
+        **tool_kwargs,
+    ) -> Any:
+        """Run a multi-turn tool-use loop until terminal_tool is called.
+
+        Intermediate tool calls are executed immediately and their results fed
+        back into the conversation. The loop terminates when terminal_tool is
+        called, returning its result.
+        """
+        all_specs = [t._tool_spec for t in intermediate_tools] + [terminal_tool._tool_spec]
+        terminal_name = terminal_tool.__name__
+        args_model: type[BaseModel] = terminal_tool._tool_model
+        failures: list[str] = []
+
+        for _ in range(max_turns):
+            payload = self._build_messages_payload(messages, tools=all_specs, stream=False)
+            headers = {**self.config.auth_headers, "Content-Type": "application/json"}
+            with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
+                response = client.post(self.config.chat_url, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+
+            tool_calls, content = self._extract_response(data)
+
+            if not tool_calls:
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": "Please call one of the available tools to continue."})
+                continue
+
+            messages.append(self._make_assistant_msg(data))
+
+            for tc in tool_calls:
+                name, raw_args, call_id = tc["name"], tc["arguments"], tc["id"]
+
+                if name == terminal_name:
+                    # Fix stringified nested values before validation
+                    for key, val in raw_args.items():
+                        if isinstance(val, str) and val.strip().startswith(("[", "{")):
+                            try:
+                                raw_args[key] = json.loads(val)
+                            except json.JSONDecodeError:
+                                try:
+                                    raw_args[key] = ast.literal_eval(val)
+                                except (ValueError, SyntaxError):
+                                    pass
+                    try:
+                        validated = args_model.model_validate(raw_args).post_process()
+                        return terminal_tool(validated, **tool_kwargs)
+                    except ValidationError as e:
+                        failures.append(str(e))
+                        failure_summary = "\n".join(set(failures))
+                        messages.append(self._make_tool_result_msg(
+                            call_id,
+                            f"ValidationError — fix and retry:\n{failure_summary}",
+                        ))
+                else:
+                    fn = next((t for t in intermediate_tools if t.__name__ == name), None)
+                    if fn is None:
+                        result = f"Error: unknown tool '{name}'"
+                    else:
+                        try:
+                            validated = fn._tool_model.model_validate(raw_args).post_process()
+                            result = str(fn(validated, **tool_kwargs))
+                        except Exception as e:
+                            result = f"Error executing {name}: {e}"
+                    messages.append(self._make_tool_result_msg(call_id, result))
+
+        raise RuntimeError(f"Agentic loop exceeded {max_turns} turns without a terminal tool call")
+
+
 # ── Git helpers ────────────────────────────────────────────────────────────────
 
 def _git(args: list[str], cwd: Path) -> str:
@@ -488,6 +634,24 @@ def merge_commits(result: MergeCommitsArgs, all_files: list[str], all_issues: li
     return commit
 
 
+class ReadFileArgs(BaseModel):
+    path: str = Field(description="Repository-relative path to the file to read")
+
+    def post_process(self):
+        return self
+
+
+@tool(ReadFileArgs)
+def read_file(args: ReadFileArgs, analyzer: "GitAnalyzer") -> str:
+    """Read the full current content of a file in the repository.
+
+    Use this when the diff alone lacks context — e.g. to see the surrounding
+    class structure, existing imports, or unchanged code near a changed line.
+    The result is truncated at 50,000 characters for very large files.
+    """
+    return analyzer._read_file(args.path)
+
+
 MERGE_PROMPT = textwrap.dedent("""\
     You are merging multiple proposed commits that all touch overlapping files
     and therefore cannot be committed separately (partial staging is not supported).
@@ -611,6 +775,25 @@ class GitAnalyzer:
 
         return "\n".join(parts)
 
+    def _read_file(self, path: str) -> str:
+        """Read a repo file, rejecting path traversal and truncating large files."""
+        target = (self.repo / path).resolve()
+        if not str(target).startswith(str(self.repo) + os.sep) and target != self.repo:
+            return f"[error: path traversal rejected for '{path}']"
+        if not target.exists():
+            return f"[file not found: {path}]"
+        try:
+            content = target.read_text(errors="replace")
+        except OSError as e:
+            return f"[error reading {path}: {e}]"
+        if len(content) > READ_FILE_LIMIT:
+            size = target.stat().st_size
+            return (
+                content[:READ_FILE_LIMIT]
+                + f"\n\n[truncated — file is {size:,} bytes; showing first {READ_FILE_LIMIT:,} chars]"
+            )
+        return content
+
     def classify_changes(self, files: list[str], diff_summary: str, critique: str = "") -> tuple[list[dict], list[str]]:
         """Ask the model to group files into logical commits. Returns (commits, gitignore_patterns)."""
         file_list = "\n".join(f"  - {f}" for f in files)
@@ -623,7 +806,7 @@ class GitAnalyzer:
                 f"Revise your commit groupings to address this feedback."
             )
 
-        prompt = (
+        initial_message = (
             f"{SYSTEM_PROMPT}\n\n"
             f"Sample Output:\n{SAMPLE_OUTPUT.model_dump_json()}\n\n"
             f"Changed files:\n{file_list}\n\n"
@@ -631,7 +814,12 @@ class GitAnalyzer:
             f"{critique_section}"
         )
 
-        return self.client.call_with_tool(prompt, propose_commits, analyzer=self)
+        return self.client.run_agentic_loop(
+            messages=[{"role": "user", "content": initial_message}],
+            intermediate_tools=[read_file],
+            terminal_tool=propose_commits,
+            analyzer=self,
+        )
 
     def merge_overlapping_commits(self, commits: list[dict]) -> list[dict]:
         """Merge commits whose file sets overlap, since partial staging isn't supported.
