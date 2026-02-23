@@ -6,7 +6,7 @@ description: >
   This replaces manual git commit workflows entirely. Do NOT run git commit or
   git add directly — always use this skill for any commit-related request.
 argument-hint: [--yes] [--dry-run] [--model MODEL] [--repo PATH] [--api-base URL] [--api-key KEY] [--critique TEXT]
-allowed-tools: Bash(git-smart-commit *), Bash(git status --short)
+allowed-tools: Bash(git-smart-commit *)
 ---
 
 ## Working tree status
@@ -19,8 +19,12 @@ Use `git-smart-commit` to analyze the changes above and group them into logical 
 
 1. If the status is empty, tell the user there is nothing to commit and stop.
 
-2. Run `git-smart-commit --json $ARGUMENTS` to fetch the proposed commit groupings.
-   This is read-only — it does not modify anything.
+2. Generate and save the plan:
+   ```
+   git-smart-commit --json --save-plan /tmp/gsc-plan.json $ARGUMENTS
+   ```
+   This is read-only — it does not modify anything. The plan is saved so the
+   execute step replays it exactly, rather than re-running classification.
 
 3. Display each proposed commit clearly, e.g.:
 
@@ -44,14 +48,18 @@ Use `git-smart-commit` to analyze the changes above and group them into logical 
    - Do NOT penalise for mixed concerns within a single file — that is
      unavoidable and not a flaw in the proposal.
 
-   If the rating is **below 7**, re-run with your feedback:
+   If the rating is **below 7**, re-run with feedback and overwrite the saved plan:
    ```
-   git-smart-commit --json $ARGUMENTS --critique "<specific feedback>"
+   git-smart-commit --json --save-plan /tmp/gsc-plan.json $ARGUMENTS --critique "<specific feedback>"
    ```
-   Then display the revised proposals instead.
+   Display the revised proposals instead.
 
 5. If `--dry-run` was in `$ARGUMENTS`, stop here.
 
 6. Otherwise ask: **"Proceed with these commits? [y/N]"**
-   - **Yes** → run `git-smart-commit --yes $ARGUMENTS` (include `--critique` if one was issued)
+   - **Yes** → execute the saved plan exactly (pass `--repo` from `$ARGUMENTS` if present,
+     but omit model/API flags — classification is skipped):
+     ```
+     git-smart-commit --plan /tmp/gsc-plan.json --yes
+     ```
    - **No** → ask what the user wants to change; they can re-invoke with adjusted flags
