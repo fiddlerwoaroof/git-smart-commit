@@ -5,7 +5,7 @@ description: >
   the user wants to commit changes, stage files, or asks what has changed.
   This replaces manual git commit workflows entirely. Do NOT run git commit or
   git add directly — always use this skill for any commit-related request.
-argument-hint: [--yes] [--dry-run] [--model MODEL] [--repo PATH] [--api-base URL] [--api-key KEY] [--critique TEXT]
+argument-hint: [--dry-run] [--model MODEL] [--repo PATH] [--api-base URL] [--api-key KEY] [--critique TEXT]
 allowed-tools: Bash(git-smart-commit *)
 ---
 
@@ -15,13 +15,19 @@ allowed-tools: Bash(git-smart-commit *)
 
 Use `git-smart-commit` to analyze the changes above and group them into logical commits.
 
+**Before starting:** Split `$ARGUMENTS` into two groups:
+- **Passthrough flags** — forwarded to `git-smart-commit` for classification:
+  `--model`, `--repo`, `--api-base`, `--api-key`, `--critique`
+- **Control-flow flags** — handled by this workflow, NOT passed to `--json` commands:
+  `--dry-run`, `--yes`
+
 **Workflow:**
 
 1. If the status is empty, tell the user there is nothing to commit and stop.
 
-2. Generate and save the plan:
+2. Generate and save the plan using only passthrough flags:
    ```
-   git-smart-commit --json --save-plan /tmp/gsc-plan.json $ARGUMENTS
+   git-smart-commit --json --save-plan /tmp/gsc-plan.json [passthrough flags]
    ```
    This is read-only — it does not modify anything. The plan is saved so the
    execute step replays it exactly, rather than re-running classification.
@@ -50,16 +56,16 @@ Use `git-smart-commit` to analyze the changes above and group them into logical 
 
    If the rating is **below 7**, re-run with feedback and overwrite the saved plan:
    ```
-   git-smart-commit --json --save-plan /tmp/gsc-plan.json $ARGUMENTS --critique "<specific feedback>"
+   git-smart-commit --json --save-plan /tmp/gsc-plan.json [passthrough flags] --critique "<specific feedback>"
    ```
    Display the revised proposals instead.
 
 5. If `--dry-run` was in `$ARGUMENTS`, stop here.
 
 6. Otherwise ask: **"Proceed with these commits? [y/N]"**
-   - **Yes** → execute the saved plan exactly (pass `--repo` from `$ARGUMENTS` if present,
-     but omit model/API flags — classification is skipped):
+   - **Yes** (or if `--yes` was in `$ARGUMENTS`) → execute the saved plan exactly
+     (pass `--repo` if it was in the passthrough flags):
      ```
-     git-smart-commit --plan /tmp/gsc-plan.json --yes
+     git-smart-commit --plan /tmp/gsc-plan.json --yes [--repo PATH if specified]
      ```
    - **No** → ask what the user wants to change; they can re-invoke with adjusted flags
