@@ -4,3 +4,4 @@ outputs
 outputs
 .DS_Store
 .Dockerfile.swp
+.claude
