@@ -42,13 +42,12 @@ from typing import Any, Callable
 import argparse
 import ast
 import httpx
-import inspect
 import json
 import os
 import subprocess
 import sys
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -134,16 +133,20 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_MODEL = "qwen3-coder:30b-a3b-q8_0"
-API_TIMEOUT = 300.0
-NUM_CTX = 128000
+
+DIFF_CHARS_PER_FILE = 6000    # files larger than this get hunk-summarized
+DIFF_TOTAL_CHARS   = 120000   # hard cap on total context sent to classifier
+HUNK_SUMMARIZE_CTX = 8192     # smaller context for summarization calls (faster)
+PRIOR_HUNK_WINDOW  = 4        # how many previous hunk summaries to include as context
 
 
 @dataclass
 class ApiConfig:
-    """API connection configuration."""
+    """API connection and model configuration."""
     base_url: str = OLLAMA_BASE_URL
     model: str = DEFAULT_MODEL
     api_key: str | None = None
+    num_ctx: int = 128000
 
     @property
     def is_ollama(self) -> bool:
@@ -164,10 +167,7 @@ class ApiConfig:
         return {}
 
 
-# Module-level config, set from main() before any API calls.
-_api_config = ApiConfig()
-
-# ── Tool registry ──────────────────────────────────────────────────────────────
+# ── Tool decorator ─────────────────────────────────────────────────────────────
 #
 # Defining a new tool:
 #   1. Define argument types as pydantic BaseModel subclasses
@@ -176,11 +176,8 @@ _api_config = ApiConfig()
 #
 # Schema generation, validation, and parsing are all handled automatically.
 
-_TOOL_REGISTRY: dict[str, dict] = {}
-
-
 def tool(args_model: type[BaseModel]):
-    """Decorator factory. @tool(MyArgsModel) registers a function as an LLM tool."""
+    """Decorator factory. @tool(MyArgsModel) attaches LLM tool metadata to a function."""
     def decorator(fn: Callable) -> Callable:
         spec = {
             "type": "function",
@@ -190,139 +187,172 @@ def tool(args_model: type[BaseModel]):
                 "parameters": args_model.model_json_schema(),
             },
         }
-        _TOOL_REGISTRY[fn.__name__] = {"spec": spec, "model": args_model, "fn": fn}
         fn._tool_spec = spec
         fn._tool_model = args_model
         return fn
     return decorator
 
 
-def _build_payload(prompt: str, tools: list[dict] | None = None,
-                   stream: bool = False) -> dict:
-    """Build an API request payload, adapting to Ollama or OpenAI format."""
-    cfg = _api_config
-    if cfg.is_ollama:
-        payload: dict[str, Any] = {
-            "model": cfg.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": stream,
-            "keep_alive": "1h",
-            "options": {
-                "temperature": 0.2,
-                "num_ctx": NUM_CTX,
-            },
-        }
-        if tools:
-            payload["tools"] = tools
-    else:
-        payload = {
-            "model": cfg.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": stream,
-            "temperature": 0.2,
-        }
-        if tools:
-            payload["tools"] = tools
-            # Force the model to call the specific tool
-            payload["tool_choice"] = {
-                "type": "function",
-                "function": {"name": tools[0]["function"]["name"]},
+# ── LLM client ────────────────────────────────────────────────────────────────
+
+class LLMClient:
+    """Encapsulates all communication with the LLM API (Ollama or OpenAI-compatible)."""
+
+    def __init__(self, config: ApiConfig):
+        self.config = config
+
+    def _build_payload(self, prompt: str, tools: list[dict] | None = None,
+                       stream: bool = False) -> dict:
+        """Build an API request payload, adapting to Ollama or OpenAI format."""
+        if self.config.is_ollama:
+            payload: dict[str, Any] = {
+                "model": self.config.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": stream,
+                "keep_alive": "1h",
+                "options": {
+                    "temperature": 0.2,
+                    "num_ctx": self.config.num_ctx,
+                },
             }
-    return payload
+            if tools:
+                payload["tools"] = tools
+        else:
+            payload = {
+                "model": self.config.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": stream,
+                "temperature": 0.2,
+            }
+            if tools:
+                payload["tools"] = tools
+                # Force the model to call the specific tool
+                payload["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": tools[0]["function"]["name"]},
+                }
+        return payload
 
+    def _extract_tool_args(self, data: dict) -> dict | None:
+        """Extract tool-call arguments from a response, handling both API formats."""
+        if self.config.is_ollama:
+            tool_calls = data.get("message", {}).get("tool_calls", [])
+            if tool_calls:
+                raw = tool_calls[0]["function"]["arguments"]
+                return json.loads(raw) if isinstance(raw, str) else raw
+            # Fallback: content as JSON
+            content = data.get("message", {}).get("content", "").strip()
+        else:
+            choices = data.get("choices", [])
+            if not choices:
+                return None
+            msg = choices[0].get("message", {})
+            tool_calls = msg.get("tool_calls", [])
+            if tool_calls:
+                raw = tool_calls[0]["function"]["arguments"]
+                return json.loads(raw) if isinstance(raw, str) else raw
+            content = msg.get("content", "").strip()
 
-def _extract_tool_args(data: dict) -> dict | None:
-    """Extract tool-call arguments from a response, handling both API formats."""
-    cfg = _api_config
-    if cfg.is_ollama:
-        tool_calls = data.get("message", {}).get("tool_calls", [])
-        if tool_calls:
-            raw = tool_calls[0]["function"]["arguments"]
-            return json.loads(raw) if isinstance(raw, str) else raw
-        # Fallback: content as JSON
-        content = data.get("message", {}).get("content", "").strip()
-    else:
-        choices = data.get("choices", [])
-        if not choices:
-            return None
-        msg = choices[0].get("message", {})
-        tool_calls = msg.get("tool_calls", [])
-        if tool_calls:
-            raw = tool_calls[0]["function"]["arguments"]
-            return json.loads(raw) if isinstance(raw, str) else raw
-        content = msg.get("content", "").strip()
+        # Fallback: parse content as JSON (both backends)
+        if content:
+            content = content.removeprefix("```json").removeprefix("```").strip().removesuffix("```").strip()
+            return json.loads(content)
+        return None
 
-    # Fallback: parse content as JSON (both backends)
-    if content:
-        content = content.removeprefix("```json").removeprefix("```").strip().removesuffix("```").strip()
-        return json.loads(content)
-    return None
-
-
-def call_ollama_with_tool(
-    ollama_model: str,
-    prompt: str,
-    tool_fn: Callable,
-    num_ctx: int = NUM_CTX,
-    **tool_kwargs,
-) -> Any:
-    """Call the LLM forcing tool_fn to be called.
-
-    Parses and validates the response into the tool's args model, then calls
-    tool_fn(validated_args, **tool_kwargs) and returns its result.
-    """
-    spec = tool_fn._tool_spec
-    args_model: type[BaseModel] = tool_fn._tool_model
-    actual_prompt = prompt
-    retries = 0
-    failures = []
-    while True:
-        retries += 1
-        payload = _build_payload(actual_prompt, tools=[spec], stream=False)
-        headers = {**_api_config.auth_headers, "Content-Type": "application/json"}
-        with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
-            response = client.post(_api_config.chat_url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-
-        raw_args = _extract_tool_args(data)
-        if raw_args is None:
-            raw_args = {}
-
-        # Fix stringified nested values: some models return e.g.
-        # {"commits": "[{'subject': ...}]"} instead of a proper nested structure.
-        # Detect strings that look like Python lists/dicts and try to parse them.
-        for key, val in raw_args.items():
-            if isinstance(val, str) and val.strip().startswith(("[", "{")):
-                try:
-                    raw_args[key] = json.loads(val)
-                except json.JSONDecodeError:
+    def call(self, prompt: str, num_ctx: int | None = None) -> str:
+        """Call the LLM with streaming and return the assistant message text."""
+        payload = self._build_payload(prompt, stream=True)
+        if num_ctx is not None and self.config.is_ollama:
+            payload["options"]["num_ctx"] = num_ctx
+        headers = {**self.config.auth_headers, "Content-Type": "application/json"}
+        with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=5.0)) as client:
+            with client.stream("POST", self.config.chat_url, json=payload, headers=headers) as response:
+                response.raise_for_status()
+                chunks = []
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    # OpenAI SSE format: lines prefixed with "data: "
+                    if line.startswith("data: "):
+                        line = line[6:]
+                    if line.strip() == "[DONE]":
+                        break
                     try:
-                        raw_args[key] = ast.literal_eval(val)
-                    except (ValueError, SyntaxError):
-                        pass  # leave as-is, let pydantic report the error
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if self.config.is_ollama:
+                        content = data.get("message", {}).get("content", "")
+                        done = data.get("done", False)
+                    else:
+                        delta = (data.get("choices", [{}])[0]
+                                 .get("delta", {}))
+                        content = delta.get("content", "")
+                        done = data.get("choices", [{}])[0].get("finish_reason") is not None
+                    if content:
+                        chunks.append(content)
+                    if done:
+                        break
+                return "".join(chunks)
 
-        try:
-            validated = args_model.model_validate(raw_args).post_process()
-            return tool_fn(validated, **tool_kwargs)
-        except ValidationError as e:
-            failures.append(str(e))
-            if retries > 5:
-                raise
+    def call_with_tool(self, prompt: str, tool_fn: Callable, **tool_kwargs) -> Any:
+        """Call the LLM forcing tool_fn to be called.
 
-            actual_prompt = textwrap.dedent(f"""
-            Your previous ({len(failures)}) attempts failed with a validation error:
-            {'\n'.join(set(failures))}
+        Parses and validates the response into the tool's args model, then calls
+        tool_fn(validated_args, **tool_kwargs) and returns its result.
+        """
+        spec = tool_fn._tool_spec
+        args_model: type[BaseModel] = tool_fn._tool_model
+        actual_prompt = prompt
+        retries = 0
+        failures = []
+        while True:
+            retries += 1
+            payload = self._build_payload(actual_prompt, tools=[spec], stream=False)
+            headers = {**self.config.auth_headers, "Content-Type": "application/json"}
+            with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
+                response = client.post(self.config.chat_url, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
 
-            Try again following this prompt exactly:
-            {prompt}
-            """)
+            raw_args = self._extract_tool_args(data)
+            if raw_args is None:
+                raw_args = {}
+
+            # Fix stringified nested values: some models return e.g.
+            # {"commits": "[{'subject': ...}]"} instead of a proper nested structure.
+            # Detect strings that look like Python lists/dicts and try to parse them.
+            for key, val in raw_args.items():
+                if isinstance(val, str) and val.strip().startswith(("[", "{")):
+                    try:
+                        raw_args[key] = json.loads(val)
+                    except json.JSONDecodeError:
+                        try:
+                            raw_args[key] = ast.literal_eval(val)
+                        except (ValueError, SyntaxError):
+                            pass  # leave as-is, let pydantic report the error
+
+            try:
+                validated = args_model.model_validate(raw_args).post_process()
+                return tool_fn(validated, **tool_kwargs)
+            except ValidationError as e:
+                failures.append(str(e))
+                if retries > 5:
+                    raise
+
+                failure_summary = "\n".join(set(failures))
+                actual_prompt = textwrap.dedent(f"""
+                Your previous ({len(failures)}) attempts failed with a validation error:
+                {failure_summary}
+
+                Try again following this prompt exactly:
+                {prompt}
+                """)
 
 
 # ── Git helpers ────────────────────────────────────────────────────────────────
 
-
-def git(args: list[str], cwd: Path) -> str:
+def _git(args: list[str], cwd: Path) -> str:
     """Run a git command and return stdout. Raises on non-zero exit."""
     result = subprocess.run(
         ["git"] + args,
@@ -353,26 +383,6 @@ def read_git_config(repo: Path) -> dict[str, str]:
         if result.returncode == 0 and result.stdout.strip():
             config[key] = result.stdout.strip()
     return config
-
-
-def get_changed_files(repo: Path) -> list[str]:
-    """Return list of files with unstaged or staged changes."""
-    # Both staged (cached) and unstaged, deduped
-    staged = git(["diff", "--cached", "--name-only"], repo).splitlines()
-    unstaged = git(["diff", "--name-only"], repo).splitlines()
-    untracked = git(["ls-files", "--others", "--exclude-standard"], repo).splitlines()
-    seen = set()
-    files = []
-    for f in staged + unstaged + untracked:
-        if f and f not in seen:
-            seen.add(f)
-            files.append(f)
-    return files
-
-
-DIFF_CHARS_PER_FILE = 6000    # files larger than this get hunk-summarized
-DIFF_TOTAL_CHARS   = 120000   # hard cap on total context sent to classifier
-HUNK_SUMMARIZE_CTX = 8192     # smaller context for summarization calls (faster)
 
 
 def split_hunks(diff_text: str) -> list[str]:
@@ -406,124 +416,6 @@ def split_hunks(diff_text: str) -> list[str]:
     return hunks or [diff_text]   # fallback: treat whole diff as one hunk
 
 
-PRIOR_HUNK_WINDOW = 4   # how many previous hunk summaries to include as context
-
-
-def summarize_file_diff(model: str, fname: str, diff_text: str, max_chars: int) -> str:
-    """Ask the model to summarize each hunk, passing the last 3 summaries as context."""
-    hunks = split_hunks(diff_text)
-    hunk_summaries: list[str] = []
-
-    for i, hunk in enumerate(hunks, 1):
-        prior_context = ""
-        if hunk_summaries:
-            window = hunk_summaries[-PRIOR_HUNK_WINDOW:]
-            start_idx = i - len(window)
-            prior_context = "Previous hunks in this file:\n" + "\n".join(
-                f"  Hunk {start_idx + j}: {s}" for j, s in enumerate(window)
-            ) + "\n\n"
-
-        prompt = textwrap.dedent(f"""\
-            Summarize hunk {i} of {len(hunks)} from '{fname}' in 1-3 plain English sentences.
-            Focus on WHAT changed. Preserve verbatim any code that looks buggy or suspicious
-            (wrong arguments, misused APIs, incorrect syntax). Output only the summary.
-
-            {prior_context}Hunk {i}:
-            {hunk}
-        """)
-        first_hunk = i
-
-        summary = call_ollama(model, prompt, num_ctx=HUNK_SUMMARIZE_CTX)
-
-        hunk_summaries.append(summary.strip())
-
-    print()
-    return f"[summarized — {len(hunks)} hunk(s)]\n" + "\n".join(
-        f"  Hunk {i}: {s}" for i, s in enumerate(hunk_summaries, 1)
-    )
-
-
-def build_diff_summary(repo: Path, model: str) -> str:
-    """Return diff context for the classifier.
-
-    Small files: include raw diff.
-    Large files: summarize each hunk via a fast model call, then include summaries.
-    """
-    parts: list[str] = []
-    total_chars = 0
-
-    for label, extra_args in [("Staged", ["--cached"]), ("Unstaged", [])]:
-        stat = git(["diff"] + extra_args + ["--stat", "--no-color"], repo).strip()
-        if not stat:
-            continue
-        parts.append(f"{label}:\n{stat}\n")
-
-        changed = git(["diff"] + extra_args + ["--name-only", "--no-ext-diff"], repo).splitlines()
-        for fname in changed:
-            file_diff = git(["diff"] + extra_args + ["--no-color", "--no-ext-diff", "--", fname], repo)
-
-            if len(file_diff) <= DIFF_CHARS_PER_FILE:
-                content = file_diff
-            else:
-                print(f"  Summarizing large diff: {fname} ({len(file_diff):,} chars)…",
-                      file=sys.stderr)
-                content = summarize_file_diff(model, fname, file_diff, DIFF_CHARS_PER_FILE)
-
-            parts.append(content)
-            total_chars += len(content)
-
-            if total_chars >= DIFF_TOTAL_CHARS:
-                parts.append("\n... (remaining diffs omitted — total size limit reached)")
-                break
-        else:
-            continue
-        break   # hit total limit inside inner loop
-
-    untracked = git(["ls-files", "--others", "--exclude-standard"], repo).splitlines()
-    if untracked:
-        parts.append("Untracked (new files):\n" + "\n".join(f"  {f}" for f in untracked))
-
-    return "\n".join(parts)
-
-
-# ── LLM client (streaming) ────────────────────────────────────────────────────
-
-def call_ollama(model: str, prompt: str, num_ctx: int = NUM_CTX) -> str:
-    """Call the LLM with streaming and return the assistant message text."""
-    cfg = _api_config
-    payload = _build_payload(prompt, stream=True)
-    headers = {**cfg.auth_headers, "Content-Type": "application/json"}
-    with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=5.0)) as client:
-        with client.stream("POST", cfg.chat_url, json=payload, headers=headers) as response:
-            response.raise_for_status()
-            chunks = []
-            for line in response.iter_lines():
-                if not line:
-                    continue
-                # OpenAI SSE format: lines prefixed with "data: "
-                if line.startswith("data: "):
-                    line = line[6:]
-                if line.strip() == "[DONE]":
-                    break
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if cfg.is_ollama:
-                    content = data.get("message", {}).get("content", "")
-                    done = data.get("done", False)
-                else:
-                    delta = (data.get("choices", [{}])[0]
-                             .get("delta", {}))
-                    content = delta.get("content", "")
-                    done = data.get("choices", [{}])[0].get("finish_reason") is not None
-                if content:
-                    chunks.append(content)
-                if done:
-                    break
-            return "".join(chunks)
-
-
 # ── Tool definitions ───────────────────────────────────────────────────────────
 
 class Issue(BaseModel):
@@ -535,7 +427,6 @@ class Commit(BaseModel):
     files: list[str] = Field(description="REQUIRED. Repository-relative paths to include in this commit")
     body: str = Field(default="", description="4-10 line plain-text commit body, no markdown")
     issues: list[Issue] = Field(default_factory=list, description="Issues noticed in the code being committed")
-
 
     def post_process(self):
         self.body = textwrap.fill(self.body, 80)
@@ -567,15 +458,14 @@ SAMPLE_OUTPUT = ProposeCommitsArgs(
 )
 
 
-
 @tool(ProposeCommitsArgs)
-def propose_commits(result: ProposeCommitsArgs, model: str) -> tuple[list[dict], list[str]]:
+def propose_commits(result: ProposeCommitsArgs, analyzer: "GitAnalyzer") -> tuple[list[dict], list[str]]:
     """Group working-tree changes into logical commits and suggest .gitignore patterns for junk files."""
     commits = [c.model_dump() for c in result.commits]
     if not commits:
-        raise Exception("Error: Model returned no valid commit groups.")
+        raise ValueError("Model returned no valid commit groups.")
 
-    commits = merge_overlapping_commits(model, commits)
+    commits = analyzer.merge_overlapping_commits(commits)
     return commits, result.gitignore
 
 
@@ -619,137 +509,233 @@ MERGE_PROMPT = textwrap.dedent("""\
 """)
 
 
-def merge_overlapping_commits(model: str, commits: list[dict]) -> list[dict]:
-    """Merge commits whose file sets overlap, since partial staging isn't supported.
+# ── GitAnalyzer ────────────────────────────────────────────────────────────────
 
-    Uses union-find to detect groups, then asks the model to write a single
-    coherent commit message for each merged group.
-    """
-    if len(commits) <= 1:
-        return commits
+class GitAnalyzer:
+    """Encapsulates git operations and commit analysis for a repository."""
 
-    # Build a mapping from each file to the indices of commits that touch it
-    file_to_indices: dict[str, list[int]] = {}
-    for i, c in enumerate(commits):
-        for f in c.get("files", []):
-            file_to_indices.setdefault(f, []).append(i)
+    def __init__(self, repo: Path, client: LLMClient):
+        self.repo = repo
+        self.client = client
 
-    # Union-find to group commits sharing files
-    parent = list(range(len(commits)))
+    @property
+    def config(self) -> ApiConfig:
+        return self.client.config
 
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
+    def git(self, args: list[str]) -> str:
+        return _git(args, self.repo)
 
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
+    def get_changed_files(self) -> list[str]:
+        """Return list of files with unstaged or staged changes."""
+        staged = self.git(["diff", "--cached", "--name-only"]).splitlines()
+        unstaged = self.git(["diff", "--name-only"]).splitlines()
+        untracked = self.git(["ls-files", "--others", "--exclude-standard"]).splitlines()
+        seen = set()
+        files = []
+        for f in staged + unstaged + untracked:
+            if f and f not in seen:
+                seen.add(f)
+                files.append(f)
+        return files
 
-    for indices in file_to_indices.values():
-        for idx in indices[1:]:
-            union(indices[0], idx)
+    def _summarize_file_diff(self, fname: str, diff_text: str) -> str:
+        """Ask the model to summarize each hunk, passing the last N summaries as context."""
+        hunks = split_hunks(diff_text)
+        hunk_summaries: list[str] = []
 
-    # Group commits by their root
-    groups: dict[int, list[int]] = {}
-    for i in range(len(commits)):
-        groups.setdefault(find(i), []).append(i)
+        for i, hunk in enumerate(hunks, 1):
+            prior_context = ""
+            if hunk_summaries:
+                window = hunk_summaries[-PRIOR_HUNK_WINDOW:]
+                start_idx = i - len(window)
+                prior_context = "Previous hunks in this file:\n" + "\n".join(
+                    f"  Hunk {start_idx + j}: {s}" for j, s in enumerate(window)
+                ) + "\n\n"
 
-    # Check if any merging is actually needed
-    if all(len(idxs) == 1 for idxs in groups.values()):
-        return commits
+            prompt = textwrap.dedent(f"""\
+                Summarize hunk {i} of {len(hunks)} from '{fname}' in 1-3 plain English sentences.
+                Focus on WHAT changed. Preserve verbatim any code that looks buggy or suspicious
+                (wrong arguments, misused APIs, incorrect syntax). Output only the summary.
 
-    merged = []
-    for indices in groups.values():
-        if len(indices) == 1:
-            merged.append(commits[indices[0]])
-            continue
+                {prior_context}Hunk {i}:
+                {hunk}
+            """)
 
-        group = [commits[i] for i in indices]
-        print(f"  Merging {len(group)} overlapping commits…", file=sys.stderr)
+            summary = self.client.call(prompt, num_ctx=HUNK_SUMMARIZE_CTX)
+            hunk_summaries.append(summary.strip())
 
-        # Collect all files and issues for the merged commit
-        all_files = list(dict.fromkeys(f for c in group for f in c.get("files", [])))
-        all_issues = []
-        seen_issues = set()
-        for c in group:
-            for issue in c.get("issues", []):
-                key = (issue.get("path", ""), issue.get("message", ""))
-                if key not in seen_issues:
-                    seen_issues.add(key)
-                    all_issues.append(issue)
-
-        # Format the commits for the merge prompt
-        commits_desc = json.dumps(group, indent=2)
-        prompt = MERGE_PROMPT + commits_desc
-
-        merged.append(call_ollama_with_tool(
-            model, prompt, merge_commits,
-            all_files=all_files, all_issues=all_issues,
-        ))
-
-    return merged
-
-
-def classify_changes(model: str, files: list[str], diff_summary: str, critique: str = "") -> tuple[list[dict], list[str]]:
-    """Ask the model to group files into logical commits. Returns (commits, gitignore_patterns)."""
-    file_list = "\n".join(f"  - {f}" for f in files)
-
-    critique_section = ""
-    if critique:
-        critique_section = (
-            f"\n\nA reviewer rated the previous proposal below 7/10. Their feedback:\n"
-            f"{critique}\n"
-            f"Revise your commit groupings to address this feedback."
+        print()
+        return f"[summarized — {len(hunks)} hunk(s)]\n" + "\n".join(
+            f"  Hunk {i}: {s}" for i, s in enumerate(hunk_summaries, 1)
         )
 
-    prompt = (
-        f"{SYSTEM_PROMPT}\n\n"
-        f"Sample Output:\n{SAMPLE_OUTPUT.model_dump_json()}\n\n"
-        f"Changed files:\n{file_list}\n\n"
-        f"Diffs:\n{diff_summary}"
-        f"{critique_section}"
-    )
+    def build_diff_summary(self) -> str:
+        """Return diff context for the classifier.
 
-    return call_ollama_with_tool(model, prompt, propose_commits, model=model)
+        Small files: include raw diff.
+        Large files: summarize each hunk via a fast model call, then include summaries.
+        """
+        parts: list[str] = []
+        total_chars = 0
 
+        for label, extra_args in [("Staged", ["--cached"]), ("Unstaged", [])]:
+            stat = self.git(["diff"] + extra_args + ["--stat", "--no-color"]).strip()
+            if not stat:
+                continue
+            parts.append(f"{label}:\n{stat}\n")
 
+            changed = self.git(["diff"] + extra_args + ["--name-only", "--no-ext-diff"]).splitlines()
+            for fname in changed:
+                file_diff = self.git(["diff"] + extra_args + ["--no-color", "--no-ext-diff", "--", fname])
 
+                if len(file_diff) <= DIFF_CHARS_PER_FILE:
+                    content = file_diff
+                else:
+                    print(f"  Summarizing large diff: {fname} ({len(file_diff):,} chars)…",
+                          file=sys.stderr)
+                    content = self._summarize_file_diff(fname, file_diff)
 
-# ── Commit execution ───────────────────────────────────────────────────────────
+                parts.append(content)
+                total_chars += len(content)
 
-def execute_commits(repo: Path, commits: list[dict]) -> None:
-    """Stage and commit each group in order."""
-    for i, commit in enumerate(commits, 1):
-        subject = commit["subject"]
-        body = commit.get("body", "").strip()
-        message = f"{subject}\n\n{body}" if body else subject
-        files = commit["files"]
+                if total_chars >= DIFF_TOTAL_CHARS:
+                    parts.append("\n... (remaining diffs omitted — total size limit reached)")
+                    break
+            else:
+                continue
+            break   # hit total limit inside inner loop
 
-        print(f"\n[{i}/{len(commits)}] {subject}")
+        untracked = self.git(["ls-files", "--others", "--exclude-standard"]).splitlines()
+        if untracked:
+            parts.append("Untracked (new files):\n" + "\n".join(f"  {f}" for f in untracked))
 
-        # Stage the files for this commit
-        for f in files:
+        return "\n".join(parts)
+
+    def classify_changes(self, files: list[str], diff_summary: str, critique: str = "") -> tuple[list[dict], list[str]]:
+        """Ask the model to group files into logical commits. Returns (commits, gitignore_patterns)."""
+        file_list = "\n".join(f"  - {f}" for f in files)
+
+        critique_section = ""
+        if critique:
+            critique_section = (
+                f"\n\nA reviewer rated the previous proposal below 7/10. Their feedback:\n"
+                f"{critique}\n"
+                f"Revise your commit groupings to address this feedback."
+            )
+
+        prompt = (
+            f"{SYSTEM_PROMPT}\n\n"
+            f"Sample Output:\n{SAMPLE_OUTPUT.model_dump_json()}\n\n"
+            f"Changed files:\n{file_list}\n\n"
+            f"Diffs:\n{diff_summary}"
+            f"{critique_section}"
+        )
+
+        return self.client.call_with_tool(prompt, propose_commits, analyzer=self)
+
+    def merge_overlapping_commits(self, commits: list[dict]) -> list[dict]:
+        """Merge commits whose file sets overlap, since partial staging isn't supported.
+
+        Uses union-find to detect groups, then asks the model to write a single
+        coherent commit message for each merged group.
+        """
+        if len(commits) <= 1:
+            return commits
+
+        # Build a mapping from each file to the indices of commits that touch it
+        file_to_indices: dict[str, list[int]] = {}
+        for i, c in enumerate(commits):
+            for f in c.get("files", []):
+                file_to_indices.setdefault(f, []).append(i)
+
+        # Union-find to group commits sharing files
+        parent = list(range(len(commits)))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for indices in file_to_indices.values():
+            for idx in indices[1:]:
+                union(indices[0], idx)
+
+        # Group commits by their root
+        groups: dict[int, list[int]] = {}
+        for i in range(len(commits)):
+            groups.setdefault(find(i), []).append(i)
+
+        # Check if any merging is actually needed
+        if all(len(idxs) == 1 for idxs in groups.values()):
+            return commits
+
+        merged = []
+        for indices in groups.values():
+            if len(indices) == 1:
+                merged.append(commits[indices[0]])
+                continue
+
+            group = [commits[i] for i in indices]
+            print(f"  Merging {len(group)} overlapping commits…", file=sys.stderr)
+
+            # Collect all files and issues for the merged commit
+            all_files = list(dict.fromkeys(f for c in group for f in c.get("files", [])))
+            all_issues = []
+            seen_issues = set()
+            for c in group:
+                for issue in c.get("issues", []):
+                    key = (issue.get("path", ""), issue.get("message", ""))
+                    if key not in seen_issues:
+                        seen_issues.add(key)
+                        all_issues.append(issue)
+
+            # Format the commits for the merge prompt
+            commits_desc = json.dumps(group, indent=2)
+            prompt = MERGE_PROMPT + commits_desc
+
+            merged.append(self.client.call_with_tool(
+                prompt, merge_commits,
+                all_files=all_files, all_issues=all_issues,
+            ))
+
+        return merged
+
+    def execute_commits(self, commits: list[dict]) -> None:
+        """Stage and commit each group in order."""
+        for i, commit in enumerate(commits, 1):
+            subject = commit["subject"]
+            body = commit.get("body", "").strip()
+            message = f"{subject}\n\n{body}" if body else subject
+            files = commit["files"]
+
+            print(f"\n[{i}/{len(commits)}] {subject}")
+
+            # Stage the files for this commit
+            for f in files:
+                try:
+                    self.git(["add", "--", f])
+                    print(f"  + {f}")
+                except RuntimeError as e:
+                    print(f"  ! Could not stage {f}: {e}", file=sys.stderr)
+
+            # Check something is actually staged
+            staged = self.git(["diff", "--cached", "--name-only"]).strip()
+            if not staged:
+                print("  (nothing staged, skipping)")
+                continue
+
             try:
-                git(["add", "--", f], repo)
-                print(f"  + {f}")
+                self.git(["commit", "-m", message])
+                print(f"  ✓ Committed")
             except RuntimeError as e:
-                print(f"  ! Could not stage {f}: {e}", file=sys.stderr)
-
-        # Check something is actually staged
-        staged = git(["diff", "--cached", "--name-only"], repo).strip()
-        if not staged:
-            print("  (nothing staged, skipping)")
-            continue
-
-        try:
-            git(["commit", "-m", message], repo)
-            print(f"  ✓ Committed")
-        except RuntimeError as e:
-            print(f"   Error committing: {e}", file=sys.stderr)
-            raise
+                print(f"   Error committing: {e}", file=sys.stderr)
+                raise
 
 
 # ── Display helpers ────────────────────────────────────────────────────────────
@@ -766,10 +752,10 @@ def print_proposed_commits(commits: list[dict], gitignore: list[str]) -> None:
                 print(f"      {line}")
         for f in commit.get("files", []):
             print(f"       + {f}")
-        if (issues:= commit.get("issues")) != []:
+        if (issues := commit.get("issues")) != []:
             print("  Issues in this commit:")
             for issue in issues:
-                print(f"    - {issue["path"]}: {issue["message"]}")
+                print(f"    - {issue['path']}: {issue['message']}")
     if gitignore:
         print("\n  Suggested .gitignore patterns:")
         for pattern in gitignore:
@@ -818,9 +804,9 @@ def main() -> None:
     args = parser.parse_args()
     repo = Path(args.repo).resolve()
 
-    # Verify it's a git repo
+    # Verify it's a git repo early so we can read git config
     try:
-        git(["rev-parse", "--git-dir"], repo)
+        _git(["rev-parse", "--git-dir"], repo)
     except RuntimeError:
         print(f"Error: {repo} is not a git repository.", file=sys.stderr)
         sys.exit(3)
@@ -828,8 +814,7 @@ def main() -> None:
     # Configure API backend.
     # Priority: CLI arg > env var > git config (smart-commit.*) > built-in default.
     gc = read_git_config(repo)
-    global _api_config
-    _api_config = ApiConfig(
+    api_config = ApiConfig(
         base_url=(
             args.api_base
             or os.environ.get("LLM_API_BASE")
@@ -848,6 +833,8 @@ def main() -> None:
             or gc.get("smart-commit.api-key")
         ),
     )
+    client = LLMClient(api_config)
+    analyzer = GitAnalyzer(repo, client)
 
     # Plan replay mode: load a previously saved plan, skip classification
     if args.plan:
@@ -869,21 +856,22 @@ def main() -> None:
                 if answer not in ("y", "yes"):
                     print("Cancelled.")
                     return
-            execute_commits(repo, commits)
+            analyzer.execute_commits(commits)
             print("\nDone.")
         return
 
     # Collect changed files
     print("Scanning for changes...", file=sys.stderr)
-    files = get_changed_files(repo)
+    files = analyzer.get_changed_files()
     if not files:
-        raise Exception("No changes found.")
+        print("No changes found.", file=sys.stderr)
+        sys.exit(1)
 
     print(f"Found {len(files)} changed file(s). Analyzing...", file=sys.stderr)
 
     # Build stat summary and classify
-    diff_summary = build_diff_summary(repo, args.model)
-    commits, gitignore = classify_changes(args.model, files, diff_summary, critique=args.critique)
+    diff_summary = analyzer.build_diff_summary()
+    commits, gitignore = analyzer.classify_changes(files, diff_summary, critique=args.critique)
 
     # JSON mode: dump and optionally save plan to file
     if args.json_out:
@@ -902,7 +890,6 @@ def main() -> None:
 
     # Confirm unless --yes
     if not args.yes:
-        success = False
         try:
             answer = input("Proceed with these commits? [y/N] ").strip().lower()
         except (KeyboardInterrupt, EOFError):
@@ -911,7 +898,7 @@ def main() -> None:
             print("Cancelled.")
             return
 
-    execute_commits(repo, commits)
+    analyzer.execute_commits(commits)
     print("\nDone.")
 
 
