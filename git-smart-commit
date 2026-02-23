@@ -673,14 +673,24 @@ def merge_overlapping_commits(model: str, commits: list[dict]) -> list[dict]:
     return merged
 
 
-def classify_changes(model: str, files: list[str], diff_summary: str) -> tuple[list[dict], list[str]]:
+def classify_changes(model: str, files: list[str], diff_summary: str, critique: str = "") -> tuple[list[dict], list[str]]:
     """Ask the model to group files into logical commits. Returns (commits, gitignore_patterns)."""
     file_list = "\n".join(f"  - {f}" for f in files)
+
+    critique_section = ""
+    if critique:
+        critique_section = (
+            f"\n\nA reviewer rated the previous proposal below 7/10. Their feedback:\n"
+            f"{critique}\n"
+            f"Revise your commit groupings to address this feedback."
+        )
+
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
         f"Sample Output:\n{SAMPLE_OUTPUT.model_dump_json()}\n\n"
         f"Changed files:\n{file_list}\n\n"
         f"Diffs:\n{diff_summary}"
+        f"{critique_section}"
     )
 
     return call_ollama_with_tool(model, prompt, propose_commits, model=model)
@@ -770,6 +780,11 @@ def main() -> None:
         "--api-key", default=None,
         help="API key for authenticated endpoints (or set LLM_API_KEY env var)",
     )
+    parser.add_argument(
+        "--critique", default="",
+        metavar="TEXT",
+        help="Agent feedback on a previous proposal (triggers revised classification)",
+    )
 
     args = parser.parse_args()
     repo = Path(args.repo).resolve()
@@ -800,7 +815,7 @@ def main() -> None:
 
     # Build stat summary and classify
     diff_summary = build_diff_summary(repo, args.model)
-    commits, gitignore = classify_changes(args.model, files, diff_summary)
+    commits, gitignore = classify_changes(args.model, files, diff_summary, critique=args.critique)
 
     # JSON mode: just dump and exit
     if args.json_out:
