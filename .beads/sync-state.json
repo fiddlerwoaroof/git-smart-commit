@@ -1,0 +1,7 @@
+{
+  "last_failure": "2026-02-22T23:44:58.839291-08:00",
+  "failure_count": 12,
+  "backoff_until": "2026-02-23T00:14:58.839292-08:00",
+  "needs_manual_sync": true,
+  "failure_reason": "git pull failed in worktree: exit status 1\nFrom git.fiddlerwoaroof.com:u/edwlan/git-smart-commit\n * branch            beads-sync -\u003e FETCH_HEAD\nThere are no candidates for merging among the refs that you just fetched.\nGenerally this means that you provided a wildcard refspec which had no\nmatches on the remote end.\n"
+}
