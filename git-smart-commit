@@ -335,6 +335,26 @@ def git(args: list[str], cwd: Path) -> str:
     return result.stdout
 
 
+def read_git_config(repo: Path) -> dict[str, str]:
+    """Read smart-commit.* keys from git config (local → global → system).
+
+    Returns a dict of whichever keys are set; missing keys are absent.
+    Keys: smart-commit.model, smart-commit.api-base, smart-commit.api-key
+    """
+    keys = ["smart-commit.model", "smart-commit.api-base", "smart-commit.api-key"]
+    config: dict[str, str] = {}
+    for key in keys:
+        result = subprocess.run(
+            ["git", "config", "--get", key],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            config[key] = result.stdout.strip()
+    return config
+
+
 def get_changed_files(repo: Path) -> list[str]:
     """Return list of files with unstaged or staged changes."""
     # Both staged (cached) and unstaged, deduped
@@ -767,7 +787,7 @@ def main() -> None:
     )
     parser.add_argument("--repo", default=".", help="Path to git repository")
     parser.add_argument("--dry-run", action="store_true", help="Show proposed commits without executing")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model name (default: {DEFAULT_MODEL})")
+    parser.add_argument("--model", default=None, help=f"Model name (default: {DEFAULT_MODEL}, or smart-commit.model in git config)")
     parser.add_argument("--yes", "-y", action="store_true", help="Commit without confirmation")
     parser.add_argument("--json", dest="json_out", action="store_true", help="Output JSON and exit")
     parser.add_argument(
@@ -798,21 +818,36 @@ def main() -> None:
     args = parser.parse_args()
     repo = Path(args.repo).resolve()
 
-    # Configure API backend
-    global _api_config
-    _api_config = ApiConfig(
-        base_url=(args.api_base
-                  or os.environ.get("LLM_API_BASE", OLLAMA_BASE_URL)).rstrip("/"),
-        model=args.model,
-        api_key=args.api_key or os.environ.get("LLM_API_KEY"),
-    )
-
     # Verify it's a git repo
     try:
         git(["rev-parse", "--git-dir"], repo)
     except RuntimeError:
         print(f"Error: {repo} is not a git repository.", file=sys.stderr)
         sys.exit(3)
+
+    # Configure API backend.
+    # Priority: CLI arg > env var > git config (smart-commit.*) > built-in default.
+    gc = read_git_config(repo)
+    global _api_config
+    _api_config = ApiConfig(
+        base_url=(
+            args.api_base
+            or os.environ.get("LLM_API_BASE")
+            or gc.get("smart-commit.api-base")
+            or OLLAMA_BASE_URL
+        ).rstrip("/"),
+        model=(
+            args.model
+            or os.environ.get("LLM_MODEL")
+            or gc.get("smart-commit.model")
+            or DEFAULT_MODEL
+        ),
+        api_key=(
+            args.api_key
+            or os.environ.get("LLM_API_KEY")
+            or gc.get("smart-commit.api-key")
+        ),
+    )
 
     # Plan replay mode: load a previously saved plan, skip classification
     if args.plan:
