@@ -6,3 +6,5 @@ outputs
 .Dockerfile.swp
 .claude
 *.sw?
+.beads/dolt/beads/.dolt/noms/*
+.beads/dolt/beads/.dolt/stats/.dolt/noms/*
