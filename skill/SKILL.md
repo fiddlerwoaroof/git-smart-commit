@@ -37,37 +37,56 @@ forbidden (it could produce a different grouping than what the user approved).
    This is read-only — it does not modify anything. The plan is saved so the
    execute step replays it exactly, rather than re-running classification.
 
-3. Display each proposed commit clearly, e.g.:
+3. Display each proposed commit clearly, including any flagged issues, e.g.:
 
    ```
    [1] feat(auth): add JWT refresh token support
        Adds /refresh endpoint and rotation logic.
        + src/auth/refresh.py
        + tests/test_refresh.py
+       ⚠ src/auth/refresh.py: Exception() called with file= kwarg (line 42) — not a valid argument
 
    [2] chore(deps): bump httpx to 0.27
        + requirements.txt
    ```
 
-   Also list any flagged code issues and suggested .gitignore patterns.
+   Also list any suggested .gitignore patterns at the end.
 
-4. **Rate the proposed commits 1–10.** Consider:
+4. **Evaluate every flagged issue.** For each entry in the `issues` list, assess:
+   - **Is it a real problem?** Distinguish genuine bugs (wrong API usage, incorrect
+     syntax, unreachable code, obvious logic errors) from noise (style nits,
+     opinionated patterns that aren't actually wrong).
+   - **Severity:** classify each real issue as one of:
+     - 🔴 **Blocking** — the code is likely broken or will crash; the user should
+       fix this before committing.
+     - 🟡 **Advisory** — worth noting but doesn't prevent the commit from being
+       correct (e.g. a code smell, a missing edge-case check).
+   - **Suggest a concrete fix** for blocking issues where possible.
+
+   If any **blocking** issues exist, tell the user explicitly and ask whether they
+   want to fix them before proceeding. Do not silently skip over them.
+
+   If all issues are advisory or the list is empty, note it briefly and continue.
+
+5. **Rate the proposed commits 1–10.** Consider:
    - `git-smart-commit` can only stage **whole files** — a file cannot be split
      across commits, so penalise groupings only for things that are actually
      fixable given that constraint (e.g. unrelated files lumped together when
      they could be separated, wrong commit type, vague subject line).
    - Do NOT penalise for mixed concerns within a single file — that is
      unavoidable and not a flaw in the proposal.
+   - Do NOT factor lint issues into the commit grouping score — those are
+     evaluated separately in step 4.
 
    If the rating is **below 7**, re-run with feedback and overwrite the saved plan:
    ```
    git-smart-commit --json --save-plan /tmp/gsc-plan.json [passthrough flags] --critique "<specific feedback>"
    ```
-   Display the revised proposals instead.
+   Display the revised proposals instead (repeat steps 3–5).
 
-5. If `--dry-run` was in `$ARGUMENTS`, stop here.
+6. If `--dry-run` was in `$ARGUMENTS`, stop here.
 
-6. Otherwise ask: **"Proceed with these commits? [y/N]"**
+7. Otherwise ask: **"Proceed with these commits? [y/N]"**
    - **Yes** (or if `--yes` was in `$ARGUMENTS`) → execute the saved plan exactly
      (pass `--repo` if it was in the passthrough flags):
      ```
