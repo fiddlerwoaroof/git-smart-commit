@@ -14,3 +14,6 @@ outputs
 __pycache__/
 .pytest_cache/
 .git/
+
+# Added by git-smart-commit
+.beads/export-state/*
