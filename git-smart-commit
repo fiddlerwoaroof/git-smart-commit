@@ -133,6 +133,12 @@ SYSTEM_PROMPT = textwrap.dedent("""\
       Leave issues empty only if you find nothing suspicious.
     - Watch specifically for arguments passed to constructors or functions that
       don't accept them (e.g. Exception() does not accept a file= keyword argument).
+    - BREAKING CHANGE detection: if a commit removes or renames a public function,
+      class, or module; deletes an exported symbol; or changes a function/method
+      signature incompatibly (added required param, removed param, changed type),
+      set breaking_change to a concise description of what broke and how callers
+      must update. Also add '!' after the type in the subject (e.g. 'feat!(api):').
+      Leave breaking_change empty for purely additive or internal changes.
 
     You have access to a read_file tool. Use it when the diff alone is not
     enough context — for example, to see which class a changed function belongs
@@ -228,6 +234,12 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
       Leave issues empty only if you find nothing suspicious.
     - Watch specifically for arguments passed to constructors or functions that
       don't accept them (e.g. Exception() does not accept a file= keyword argument).
+    - BREAKING CHANGE detection: if a commit removes or renames a public function,
+      class, or module; deletes an exported symbol; or changes a function/method
+      signature incompatibly (added required param, removed param, changed type),
+      set breaking_change to a concise description of what broke and how callers
+      must update. Also add '!' after the type in the subject (e.g. 'feat!(api):').
+      Leave breaking_change empty for purely additive or internal changes.
 
     When you have investigated enough to be confident in your groupings, call the
     propose_commits tool with your answer.
@@ -928,13 +940,15 @@ class Issue(BaseModel):
     path: str = Field(description="REQUIRED. The path affected by the issue")
 
 class Commit(BaseModel):
-    subject: str = Field(description="REQUIRED. Conventional commit subject line (type(scope): desc), under 72 chars")
+    subject: str = Field(description="REQUIRED. Conventional commit subject line (type(scope): desc), under 72 chars. Add '!' after the type when a breaking change is present (e.g. 'feat!(api): rename endpoint').")
     hunks: list[str] = Field(description="REQUIRED. Hunk IDs to include in this commit, e.g. ['src/main.py#1', 'src/main.py#3']. New untracked files use 'filepath#0'.")
     body: str = Field(default="", description="4-10 line plain-text commit body, no markdown")
+    breaking_change: str = Field(default="", description="If this commit removes or renames a public API, changes a function signature incompatibly, or deletes an exported symbol, describe what broke and how callers must migrate. Leave empty if there is no breaking change.")
     issues: list[Issue] = Field(default_factory=list, description="Issues noticed in the code being committed")
 
     def post_process(self):
         self.body = textwrap.fill(self.body, 80)
+        self.breaking_change = textwrap.fill(self.breaking_change, 80)
         return self
 
 class ProposeCommitsArgs(BaseModel):
@@ -1136,6 +1150,7 @@ MERGE_PROMPT = textwrap.dedent("""\
     - Collects ALL issues (deduped)
     - If any commit is a feat type, it must take priority over the others (although the others should be mentioned in the commit body)
     - chore should only be used if no other category applies.
+    - If any input commit has a non-empty breaking_change, set breaking_change on the merged commit to a combined description and add '!' to the type.
 
     Do NOT just concatenate the subjects. Write a new, coherent subject and body
     that covers the full set of changes as a single logical unit.
@@ -1508,7 +1523,13 @@ class GitAnalyzer:
         for i, commit in enumerate(commits, 1):
             subject = commit["subject"]
             body = commit.get("body", "").strip()
-            message = f"{subject}\n\n{body}" if body else subject
+            breaking = commit.get("breaking_change", "").strip()
+            parts = [subject]
+            if body:
+                parts.append(body)
+            if breaking:
+                parts.append(f"BREAKING CHANGE: {breaking}")
+            message = "\n\n".join(parts)
             hunk_ids: list[str] = commit.get("hunks", [])
 
             print(f"\n[{i}/{len(commits)}] {subject}")
@@ -1632,6 +1653,9 @@ def print_proposed_commits(commits: list[dict], gitignore: list[str],
             for fpath, hids in by_file.items():
                 tags = ", ".join(hids)
                 print(f"       + {fpath}  [{tags}]")
+        breaking = commit.get("breaking_change", "").strip()
+        if breaking:
+            print(f"  ⚠ BREAKING CHANGE: {breaking}")
         if (issues := commit.get("issues")) != []:
             print("  Issues in this commit:")
             for issue in issues:
