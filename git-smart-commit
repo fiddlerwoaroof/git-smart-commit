@@ -235,7 +235,7 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
 
 
 OLLAMA_BASE_URL = "http://localhost:11434"
-DEFAULT_MODEL = "qwen3-coder:30b-a3b-q8_0"
+DEFAULT_MODEL = "gpt-oss:20b"
 
 DIFF_CHARS_PER_FILE = 6000    # files larger than this get hunk-summarized
 DIFF_TOTAL_CHARS   = 120000   # hard cap on total context sent to classifier
