@@ -47,6 +47,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import textwrap
 from dataclasses import dataclass, field
 
@@ -100,10 +101,12 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     particular commit.
 
     Rules:
-    - CRITICAL: You can only commit WHOLE FILES. Partial staging is NOT supported. If a single file contains multiple unrelated changes, you MUST group them together into one single commit. Do not split a file across multiple commits.
     - CRITICAL: Tool calls must use JSON for arguments. Other formats will result in failure. In particular, strings must be surrounded by double-quotes (") and if one occurs literally, escape with backslashes.
-    - Keep related changes together (same feature, same module, same concern).
-    - Separate unrelated concerns into different commits, provided they do not violate the whole-file rule above.
+    - Changes are represented as individual diff hunks, each identified by an ID
+      like "src/main.py#1". Untracked (new) files use "filepath#0".
+    - You CAN split a file across multiple commits by assigning different hunks
+      from that file to different commits. Prefer splitting when hunks are unrelated.
+    - Keep related hunks together (same feature, same module, same concern).
     - Dependency/lockfile changes belong with the commit that caused them.
     - Test files belong with the code they test.
     - Use strict conventional commit format:
@@ -193,10 +196,12 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     particular commit.
 
     Rules:
-    - CRITICAL: You can only commit WHOLE FILES. Partial staging is NOT supported. If a single file contains multiple unrelated changes, you MUST group them together into one single commit. Do not split a file across multiple commits.
     - CRITICAL: Tool calls must use JSON for arguments. Other formats will result in failure. In particular, strings must be surrounded by double-quotes (") and if one occurs literally, escape with backslashes.
-    - Keep related changes together (same feature, same module, same concern).
-    - Separate unrelated concerns into different commits, provided they do not violate the whole-file rule above.
+    - Changes are represented as individual diff hunks, each identified by an ID
+      like "src/main.py#1". Untracked (new) files use "filepath#0".
+    - You CAN split a file across multiple commits by assigning different hunks
+      from that file to different commits. Prefer splitting when hunks are unrelated.
+    - Keep related hunks together (same feature, same module, same concern).
     - Dependency/lockfile changes belong with the commit that caused them.
     - Test files belong with the code they test.
     - Use strict conventional commit format:
@@ -263,6 +268,15 @@ class ApiConfig:
         if self.api_key:
             return {"Authorization": f"Bearer {self.api_key}"}
         return {}
+
+
+@dataclass
+class DiffHunk:
+    """A single diff hunk that can be independently staged via git apply --cached."""
+    hunk_id: str        # e.g. "src/main.py#1" or "src/main.py#0" for untracked new files
+    file_path: str      # repository-relative path
+    patch: str          # complete patch text for git apply --cached; empty for untracked
+    is_untracked: bool = False
 
 
 @dataclass
@@ -733,7 +747,7 @@ class Issue(BaseModel):
 
 class Commit(BaseModel):
     subject: str = Field(description="REQUIRED. Conventional commit subject line (type(scope): desc), under 72 chars")
-    files: list[str] = Field(description="REQUIRED. Repository-relative paths to include in this commit")
+    hunks: list[str] = Field(description="REQUIRED. Hunk IDs to include in this commit, e.g. ['src/main.py#1', 'src/main.py#3']. New untracked files use 'filepath#0'.")
     body: str = Field(default="", description="4-10 line plain-text commit body, no markdown")
     issues: list[Issue] = Field(default_factory=list, description="Issues noticed in the code being committed")
 
@@ -756,7 +770,7 @@ sample_issue = Issue(
 
 sample_commit = Commit(
     subject="refactor(main): cleanup imports",
-    files=["main.py"],
+    hunks=["main.py#1"],
     body="Removed unnecessary imports to improve load time and code cleanliness.",
     issues=[sample_issue]
 )
@@ -788,11 +802,11 @@ class MergeCommitsArgs(BaseModel):
 
 
 @tool(MergeCommitsArgs)
-def merge_commits(result: MergeCommitsArgs, all_files: list[str], all_issues: list[dict]) -> dict:
+def merge_commits(result: MergeCommitsArgs, all_hunks: list[str], all_issues: list[dict]) -> dict:
     """Merge multiple overlapping commits into a single coherent commit."""
     commit = result.commit.model_dump()
-    # Ensure all files and issues are preserved regardless of what the model returns
-    commit["files"] = all_files
+    # Ensure all hunks and issues are preserved regardless of what the model returns
+    commit["hunks"] = all_hunks
     commit["issues"] = all_issues
     return commit
 
@@ -930,13 +944,13 @@ def search_diff(result: SearchDiffArgs, analyzer: "GitAnalyzer") -> str:
 
 
 MERGE_PROMPT = textwrap.dedent("""\
-    You are merging multiple proposed commits that all touch overlapping files
-    and therefore cannot be committed separately (partial staging is not supported).
+    You are merging multiple proposed commits that share the same diff hunks
+    and therefore cannot be committed separately.
 
     Combine them into a SINGLE commit that:
     - Has one conventional commit subject line (type(scope): desc), under 72 chars
     - Has a body (4-10 lines) summarizing ALL the changes coherently
-    - Lists ALL affected files (deduped)
+    - Lists ALL affected hunks (deduped)
     - Collects ALL issues (deduped)
     - If any commit is a feat type, it must take priority over the others (although the others should be mentioned in the commit body)
     - chore should only be used if no other category applies.
@@ -978,6 +992,94 @@ class GitAnalyzer:
                 seen.add(f)
                 files.append(f)
         return files
+
+    def collect_hunks(self) -> dict[str, DiffHunk]:
+        """Collect all diff hunks from the working tree, indexed by hunk ID.
+
+        Any currently staged changes are first unstaged (git reset HEAD) so that
+        everything is treated uniformly as unstaged working-tree changes.  This is
+        safe: working-tree content is never modified.
+
+        Returns a dict mapping hunk_id → DiffHunk.  Hunk IDs for unstaged changes
+        look like "path/file.py#1"; untracked new files use "path/file.py#0".
+        """
+        hunk_map: dict[str, DiffHunk] = {}
+
+        # Unstage any staged files so we work uniformly with unstaged diffs
+        staged_files = self.git(["diff", "--cached", "--name-only"]).splitlines()
+        if staged_files:
+            self.git(["reset", "HEAD", "--"] + staged_files)
+
+        # Split each unstaged file's diff into individual hunks
+        changed = self.git(["diff", "--name-only", "--no-ext-diff"]).splitlines()
+        for fpath in changed:
+            diff = self.git(["diff", "--no-color", "--no-ext-diff", "--", fpath])
+            if not diff.strip():
+                continue
+            file_hunks = split_hunks(diff)
+            for i, patch in enumerate(file_hunks, 1):
+                hunk_id = f"{fpath}#{i}"
+                hunk_map[hunk_id] = DiffHunk(
+                    hunk_id=hunk_id,
+                    file_path=fpath,
+                    patch=patch,
+                )
+
+        # Untracked (new) files are staged whole via git add — use #0 suffix
+        untracked = self.git(["ls-files", "--others", "--exclude-standard"]).splitlines()
+        for fpath in untracked:
+            hunk_id = f"{fpath}#0"
+            hunk_map[hunk_id] = DiffHunk(
+                hunk_id=hunk_id,
+                file_path=fpath,
+                patch="",
+                is_untracked=True,
+            )
+
+        return hunk_map
+
+    def build_hunk_context(self, hunk_map: dict[str, DiffHunk]) -> str:
+        """Build the initial LLM message: hunk list with inline diff content.
+
+        Small hunks are included verbatim; very large ones are summarized.
+        Total output is capped at DIFF_TOTAL_CHARS.
+        """
+        parts: list[str] = []
+        total_chars = 0
+
+        # Header: compact hunk list
+        hunk_list_lines = []
+        for hunk_id, dh in hunk_map.items():
+            if dh.is_untracked:
+                hunk_list_lines.append(f"  {hunk_id}  (new untracked file)")
+            else:
+                adds = dh.patch.count("\n+") - dh.patch.count("\n+++")
+                dels = dh.patch.count("\n-") - dh.patch.count("\n---")
+                hunk_list_lines.append(f"  {hunk_id}  (+{adds}/-{dels})")
+        parts.append("Available hunks:\n" + "\n".join(hunk_list_lines))
+
+        # Inline diff content for each hunk
+        diff_parts: list[str] = []
+        for hunk_id, dh in hunk_map.items():
+            if dh.is_untracked:
+                diff_parts.append(f"--- {hunk_id} ---\n(new untracked file — no diff)")
+                total_chars += 50
+            elif len(dh.patch) <= DIFF_CHARS_PER_FILE:
+                diff_parts.append(f"--- {hunk_id} ---\n{dh.patch}")
+                total_chars += len(dh.patch)
+            else:
+                print(f"  Summarizing large hunk: {hunk_id} ({len(dh.patch):,} chars)…",
+                      file=sys.stderr)
+                summary = self._summarize_file_diff(dh.file_path, dh.patch)
+                diff_parts.append(f"--- {hunk_id} ---\n{summary}")
+                total_chars += len(summary)
+
+            if total_chars >= DIFF_TOTAL_CHARS:
+                diff_parts.append("\n... (remaining hunks omitted — total size limit reached)")
+                break
+
+        parts.append("\nDiff content:\n" + "\n\n".join(diff_parts))
+        return "\n\n".join(parts)
 
     def build_file_metadata(self) -> str:
         """Return a compact stats-only summary: diff --stat for staged/unstaged + untracked list.
@@ -1086,15 +1188,12 @@ class GitAnalyzer:
             )
         return content
 
-    def classify_changes(self, files: list[str], diff_summary: str = "", critique: str = "") -> tuple[list[dict], list[str]]:
-        """Ask the model to group files into logical commits using an agentic investigation loop.
+    def classify_changes(self, hunk_map: dict[str, DiffHunk], critique: str = "") -> tuple[list[dict], list[str]]:
+        """Ask the model to group diff hunks into logical commits via an agentic loop.
 
         Returns (commits, gitignore_patterns).
-        diff_summary is accepted for backward compatibility but unused — the LLM
-        fetches diffs lazily via the get_diff investigation tool.
         """
-        file_list = "\n".join(f"  - {f}" for f in files)
-        metadata = self.build_file_metadata()
+        hunk_context = self.build_hunk_context(hunk_map)
 
         critique_section = ""
         if critique:
@@ -1104,11 +1203,7 @@ class GitAnalyzer:
                 f"Revise your commit groupings to address this feedback."
             )
 
-        initial_message = (
-            f"Changed files:\n{file_list}\n\n"
-            f"Stats:\n{metadata}"
-            f"{critique_section}"
-        )
+        initial_message = hunk_context + critique_section
 
         tool_registry = {
             "read_file": read_file,
@@ -1126,21 +1221,23 @@ class GitAnalyzer:
         )
 
     def merge_overlapping_commits(self, commits: list[dict]) -> list[dict]:
-        """Merge commits whose file sets overlap, since partial staging isn't supported.
+        """Merge commits that share hunk IDs (duplicate assignment is a model error).
 
-        Uses union-find to detect groups, then asks the model to write a single
-        coherent commit message for each merged group.
+        Different commits CAN touch different hunks of the same file — that is the
+        whole point of hunk-level staging.  We only need to merge when the same
+        hunk_id appears in more than one commit, since applying the same patch twice
+        would fail.
         """
         if len(commits) <= 1:
             return commits
 
-        # Build a mapping from each file to the indices of commits that touch it
-        file_to_indices: dict[str, list[int]] = {}
+        # Build a mapping from each hunk_id to the commit indices that claim it
+        hunk_to_indices: dict[str, list[int]] = {}
         for i, c in enumerate(commits):
-            for f in c.get("files", []):
-                file_to_indices.setdefault(f, []).append(i)
+            for h in c.get("hunks", []):
+                hunk_to_indices.setdefault(h, []).append(i)
 
-        # Union-find to group commits sharing files
+        # Union-find to group commits sharing a hunk
         parent = list(range(len(commits)))
 
         def find(x):
@@ -1154,7 +1251,7 @@ class GitAnalyzer:
             if ra != rb:
                 parent[rb] = ra
 
-        for indices in file_to_indices.values():
+        for indices in hunk_to_indices.values():
             for idx in indices[1:]:
                 union(indices[0], idx)
 
@@ -1163,7 +1260,7 @@ class GitAnalyzer:
         for i in range(len(commits)):
             groups.setdefault(find(i), []).append(i)
 
-        # Check if any merging is actually needed
+        # If no merging needed, return as-is
         if all(len(idxs) == 1 for idxs in groups.values()):
             return commits
 
@@ -1174,12 +1271,11 @@ class GitAnalyzer:
                 continue
 
             group = [commits[i] for i in indices]
-            print(f"  Merging {len(group)} overlapping commits…", file=sys.stderr)
+            print(f"  Merging {len(group)} commits with duplicate hunks…", file=sys.stderr)
 
-            # Collect all files and issues for the merged commit
-            all_files = list(dict.fromkeys(f for c in group for f in c.get("files", [])))
+            all_hunks = list(dict.fromkeys(h for c in group for h in c.get("hunks", [])))
             all_issues = []
-            seen_issues = set()
+            seen_issues: set[tuple] = set()
             for c in group:
                 for issue in c.get("issues", []):
                     key = (issue.get("path", ""), issue.get("message", ""))
@@ -1187,34 +1283,91 @@ class GitAnalyzer:
                         seen_issues.add(key)
                         all_issues.append(issue)
 
-            # Format the commits for the merge prompt
             commits_desc = json.dumps(group, indent=2)
             prompt = MERGE_PROMPT + commits_desc
 
             merged.append(self.client.call_with_tool(
                 prompt, merge_commits,
-                all_files=all_files, all_issues=all_issues,
+                all_hunks=all_hunks, all_issues=all_issues,
             ))
 
         return merged
 
-    def execute_commits(self, commits: list[dict]) -> None:
-        """Stage and commit each group in order."""
+    def _build_combined_patch(self, hunks: list[str]) -> str:
+        """Combine multiple hunks for the same file into a single valid patch.
+
+        The first hunk's file header is kept; subsequent hunks contribute only
+        their @@ sections onward, so git apply sees one coherent multi-hunk patch.
+        """
+        if len(hunks) == 1:
+            return hunks[0]
+
+        result: list[str] = []
+        # Keep the full first hunk (file header + @@ lines)
+        result.append(hunks[0])
+        if not result[-1].endswith("\n"):
+            result.append("\n")
+
+        for hunk in hunks[1:]:
+            # Skip file-header lines; start from the first @@ line
+            in_hunk = False
+            for line in hunk.splitlines(keepends=True):
+                if line.startswith("@@"):
+                    in_hunk = True
+                if in_hunk:
+                    result.append(line)
+            if result and not result[-1].endswith("\n"):
+                result.append("\n")
+
+        return "".join(result)
+
+    def execute_commits(self, commits: list[dict], hunk_map: dict[str, DiffHunk]) -> None:
+        """Stage and commit each group using git apply --cached for individual hunks."""
         for i, commit in enumerate(commits, 1):
             subject = commit["subject"]
             body = commit.get("body", "").strip()
             message = f"{subject}\n\n{body}" if body else subject
-            files = commit["files"]
+            hunk_ids: list[str] = commit.get("hunks", [])
 
             print(f"\n[{i}/{len(commits)}] {subject}")
 
-            # Stage the files for this commit
-            for f in files:
+            # Group hunk IDs by file path (preserving order)
+            by_file: dict[str, list[DiffHunk]] = {}
+            untracked_paths: list[str] = []
+            for hid in hunk_ids:
+                dh = hunk_map.get(hid)
+                if dh is None:
+                    print(f"  ! Unknown hunk {hid!r}, skipping", file=sys.stderr)
+                    continue
+                if dh.is_untracked:
+                    untracked_paths.append(dh.file_path)
+                else:
+                    by_file.setdefault(dh.file_path, []).append(dh)
+
+            # Apply hunks per file via git apply --cached
+            for fpath, file_hunks in by_file.items():
+                patch_text = self._build_combined_patch([dh.patch for dh in file_hunks])
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".patch", delete=False, encoding="utf-8"
+                ) as f:
+                    f.write(patch_text)
+                    patch_file = f.name
                 try:
-                    self.git(["add", "--", f])
-                    print(f"  + {f}")
+                    self.git(["apply", "--cached", patch_file])
+                    n = len(file_hunks)
+                    print(f"  + {fpath} ({n} hunk{'s' if n != 1 else ''})")
                 except RuntimeError as e:
-                    print(f"  ! Could not stage {f}: {e}", file=sys.stderr)
+                    print(f"  ! Could not apply patch for {fpath}: {e}", file=sys.stderr)
+                finally:
+                    os.unlink(patch_file)
+
+            # Add untracked (new) files whole
+            for fpath in untracked_paths:
+                try:
+                    self.git(["add", "--", fpath])
+                    print(f"  + {fpath} (new file)")
+                except RuntimeError as e:
+                    print(f"  ! Could not add {fpath}: {e}", file=sys.stderr)
 
             # Check something is actually staged
             staged = self.git(["diff", "--cached", "--name-only"]).strip()
@@ -1226,7 +1379,7 @@ class GitAnalyzer:
                 self.git(["commit", "-m", message])
                 print(f"  ✓ Committed")
             except RuntimeError as e:
-                print(f"   Error committing: {e}", file=sys.stderr)
+                print(f"  ! Error committing: {e}", file=sys.stderr)
                 raise
 
     def update_gitignore(self, patterns: list[str], yes: bool = False) -> None:
@@ -1273,7 +1426,8 @@ class GitAnalyzer:
 
 # ── Display helpers ────────────────────────────────────────────────────────────
 
-def print_proposed_commits(commits: list[dict], gitignore: list[str]) -> None:
+def print_proposed_commits(commits: list[dict], gitignore: list[str],
+                           hunk_map: dict[str, "DiffHunk"] | None = None) -> None:
     print("\nProposed commits:")
     print("─" * 60)
     for i, commit in enumerate(commits, 1):
@@ -1283,8 +1437,19 @@ def print_proposed_commits(commits: list[dict], gitignore: list[str]) -> None:
         if body:
             for line in body.splitlines():
                 print(f"      {line}")
-        for f in commit.get("files", []):
-            print(f"       + {f}")
+        hunk_ids = commit.get("hunks", [])
+        if hunk_ids:
+            # Group by file for a cleaner display
+            by_file: dict[str, list[str]] = {}
+            for hid in hunk_ids:
+                if hunk_map and hid in hunk_map:
+                    fpath = hunk_map[hid].file_path
+                else:
+                    fpath = hid.rsplit("#", 1)[0] if "#" in hid else hid
+                by_file.setdefault(fpath, []).append(hid)
+            for fpath, hids in by_file.items():
+                tags = ", ".join(hids)
+                print(f"       + {fpath}  [{tags}]")
         if (issues := commit.get("issues")) != []:
             print("  Issues in this commit:")
             for issue in issues:
@@ -1369,6 +1534,13 @@ def main() -> None:
     client = LLMClient(api_config)
     analyzer = GitAnalyzer(repo, client)
 
+    # Collect hunks (unstages staged files first so everything is uniform)
+    print("Scanning for changes...", file=sys.stderr)
+    hunk_map = analyzer.collect_hunks()
+    if not hunk_map:
+        print("No changes found.", file=sys.stderr)
+        sys.exit(1)
+
     # Plan replay mode: load a previously saved plan, skip classification
     if args.plan:
         try:
@@ -1379,7 +1551,15 @@ def main() -> None:
             sys.exit(1)
         commits = plan["commits"]
         gitignore = plan.get("gitignore", [])
-        print_proposed_commits(commits, gitignore)
+        # Restore saved patches into hunk_map if present (makes plan self-contained)
+        for hunk_id, patch in plan.get("hunk_patches", {}).items():
+            if hunk_id not in hunk_map:
+                # Best-effort: reconstruct a DiffHunk from the saved patch
+                fpath = hunk_id.rsplit("#", 1)[0] if "#" in hunk_id else hunk_id
+                hunk_map[hunk_id] = DiffHunk(
+                    hunk_id=hunk_id, file_path=fpath, patch=patch
+                )
+        print_proposed_commits(commits, gitignore, hunk_map)
         if not args.dry_run:
             if not args.yes:
                 try:
@@ -1389,25 +1569,24 @@ def main() -> None:
                 if answer not in ("y", "yes"):
                     print("Cancelled.")
                     return
-            analyzer.execute_commits(commits)
+            analyzer.execute_commits(commits, hunk_map)
             analyzer.update_gitignore(gitignore, yes=args.yes)
             print("\nDone.")
         return
 
-    # Collect changed files
-    print("Scanning for changes...", file=sys.stderr)
-    files = analyzer.get_changed_files()
-    if not files:
-        print("No changes found.", file=sys.stderr)
-        sys.exit(1)
+    n_files = len({dh.file_path for dh in hunk_map.values()})
+    n_hunks = len(hunk_map)
+    print(f"Found {n_hunks} hunk(s) across {n_files} file(s). Analyzing...", file=sys.stderr)
 
-    print(f"Found {len(files)} changed file(s). Analyzing...", file=sys.stderr)
+    commits, gitignore = analyzer.classify_changes(hunk_map, critique=args.critique)
 
-    commits, gitignore = analyzer.classify_changes(files, critique=args.critique)
-
-    # JSON mode: dump and optionally save plan to file
+    # JSON mode: dump plan (including patches for self-contained replay) and exit
     if args.json_out:
-        plan_json = json.dumps({"commits": commits, "gitignore": gitignore}, indent=2)
+        hunk_patches = {hid: dh.patch for hid, dh in hunk_map.items() if not dh.is_untracked}
+        plan_json = json.dumps(
+            {"commits": commits, "hunk_patches": hunk_patches, "gitignore": gitignore},
+            indent=2,
+        )
         print(plan_json)
         if args.save_plan:
             with open(args.save_plan, "w") as f:
@@ -1415,7 +1594,7 @@ def main() -> None:
         return
 
     # Display proposed commits
-    print_proposed_commits(commits, gitignore)
+    print_proposed_commits(commits, gitignore, hunk_map)
 
     if args.dry_run:
         return
@@ -1430,7 +1609,7 @@ def main() -> None:
             print("Cancelled.")
             return
 
-    analyzer.execute_commits(commits)
+    analyzer.execute_commits(commits, hunk_map)
     analyzer.update_gitignore(gitignore, yes=args.yes)
     print("\nDone.")
 
