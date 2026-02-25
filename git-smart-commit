@@ -15,6 +15,7 @@ API (OpenRouter, Anthropic, Together, etc.) via --api-base.
 Usage:
     git-smart-commit [--repo PATH] [--dry-run] [--model MODEL] [--yes]
                      [--api-base URL] [--api-key KEY]
+    git-smart-commit --setup
 
 Options:
     --repo PATH     Path to git repository (default: current directory)
@@ -25,6 +26,7 @@ Options:
     --api-base URL  API base URL (default: http://localhost:11434 for Ollama)
                     Use https://openrouter.ai/api/v1 for OpenRouter, etc.
     --api-key KEY   API key for authenticated endpoints (or set LLM_API_KEY env var)
+    --setup         Run interactive configuration wizard and exit
     --help          Show this message
 
 Exit codes:
@@ -41,6 +43,7 @@ from typing import Any, Callable
 
 import argparse
 import ast
+import getpass
 import httpx
 import json
 import os
@@ -241,6 +244,38 @@ PRIOR_HUNK_WINDOW  = 4        # how many previous hunk summaries to include as c
 
 MAX_AGENTIC_TURNS  = 20       # safeguard for the agentic investigation loop
 READ_FILE_LIMIT    = 50_000   # max chars returned by the read_file tool
+
+# Preset backends for the setup wizard
+SETUP_BACKENDS = [
+    {
+        "key": "ollama",
+        "label": "Ollama  (local, no API key needed)",
+        "api_base": OLLAMA_BASE_URL,
+        "default_model": DEFAULT_MODEL,
+        "needs_key": False,
+    },
+    {
+        "key": "openrouter",
+        "label": "OpenRouter  (cloud, API key required)",
+        "api_base": "https://openrouter.ai/api/v1",
+        "default_model": "anthropic/claude-3.5-sonnet",
+        "needs_key": True,
+    },
+    {
+        "key": "anthropic",
+        "label": "Anthropic  (cloud, API key required)",
+        "api_base": "https://api.anthropic.com/v1",
+        "default_model": "claude-sonnet-4-6",
+        "needs_key": True,
+    },
+    {
+        "key": "custom",
+        "label": "Custom endpoint",
+        "api_base": None,
+        "default_model": None,
+        "needs_key": None,
+    },
+]
 
 
 @dataclass
@@ -706,6 +741,153 @@ def read_git_config(repo: Path) -> dict[str, str]:
         if result.returncode == 0 and result.stdout.strip():
             config[key] = result.stdout.strip()
     return config
+
+
+def _prompt(message: str, default: str | None = None) -> str | None:
+    """Prompt the user for input, returning the default on empty entry.
+
+    Returns None if the user presses Ctrl-C or Ctrl-D.
+    """
+    try:
+        raw = input(message).strip()
+    except (KeyboardInterrupt, EOFError):
+        return None
+    return raw if raw else default
+
+
+def run_setup_wizard(repo: Path | None) -> None:
+    """Interactive wizard to configure git-smart-commit via git config.
+
+    Prompts for API backend, model, API key, and config scope (global / local).
+    Writes settings with ``git config``.
+
+    Args:
+        repo: Path to a git repository (required for local scope).
+              May be None when only global scope is needed.
+    """
+    print()
+    print("git-smart-commit setup wizard")
+    print("=" * 40)
+    print()
+
+    # ── Step 1: choose backend ────────────────────────────────────────────────
+    print("Select API backend:")
+    for i, b in enumerate(SETUP_BACKENDS, 1):
+        marker = "  ← default" if i == 1 else ""
+        print(f"  [{i}] {b['label']}{marker}")
+    print()
+
+    backend_choice = _prompt("Choice [1]: ", default="1")
+    if backend_choice is None:
+        print("\nSetup cancelled.")
+        return
+    try:
+        backend_idx = int(backend_choice) - 1
+        if not 0 <= backend_idx < len(SETUP_BACKENDS):
+            raise ValueError
+    except ValueError:
+        print("Invalid choice. Setup cancelled.")
+        return
+
+    backend = SETUP_BACKENDS[backend_idx]
+    print()
+
+    # ── Step 2: API base URL (custom only) ───────────────────────────────────
+    api_base: str
+    if backend["api_base"] is None:
+        val = _prompt("API base URL: ")
+        if not val:
+            print("URL required. Setup cancelled.")
+            return
+        api_base = val.rstrip("/")
+    else:
+        api_base = backend["api_base"]
+
+    # ── Step 3: model ─────────────────────────────────────────────────────────
+    default_model: str = backend["default_model"] or ""
+    model_prompt = f"Model [{default_model}]: " if default_model else "Model: "
+    model_val = _prompt(model_prompt, default=default_model)
+    if model_val is None:
+        print("\nSetup cancelled.")
+        return
+    if not model_val:
+        print("Model name required. Setup cancelled.")
+        return
+    model = model_val
+
+    # ── Step 4: API key ───────────────────────────────────────────────────────
+    api_key: str | None = None
+    needs_key: bool | None = backend["needs_key"]
+    if needs_key is True:
+        try:
+            api_key = getpass.getpass("API key (input hidden): ").strip() or None
+        except (KeyboardInterrupt, EOFError):
+            print("\nSetup cancelled.")
+            return
+        if not api_key:
+            print("API key required for this backend. Setup cancelled.")
+            return
+    elif needs_key is None:
+        # custom endpoint — key is optional
+        try:
+            raw_key = getpass.getpass("API key (leave empty if not needed, input hidden): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nSetup cancelled.")
+            return
+        api_key = raw_key or None
+
+    print()
+
+    # ── Step 5: config scope ──────────────────────────────────────────────────
+    print("Save configuration to:")
+    print("  [1] Global  (~/.gitconfig)  ← affects all repos  [default]")
+    if repo is not None:
+        print("  [2] Local   (.git/config)   ← this repo only")
+    print()
+
+    scope_choice = _prompt("Choice [1]: ", default="1")
+    if scope_choice is None:
+        print("\nSetup cancelled.")
+        return
+
+    scope_flag: str
+    if scope_choice == "2" and repo is not None:
+        scope_flag = "--local"
+        scope_label = f"local ({repo})"
+    else:
+        scope_flag = "--global"
+        scope_label = "global (~/.gitconfig)"
+
+    print()
+
+    # ── Step 6: write config ──────────────────────────────────────────────────
+    cwd = repo if repo is not None else Path.cwd()
+
+    settings: list[tuple[str, str]] = [
+        ("smart-commit.api-base", api_base),
+        ("smart-commit.model", model),
+    ]
+    if api_key:
+        settings.append(("smart-commit.api-key", api_key))
+
+    print(f"Writing {scope_label} config...")
+    for key, value in settings:
+        cmd = ["git", "config", scope_flag, key, value]
+        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"  Error setting {key}: {result.stderr.strip()}", file=sys.stderr)
+            sys.exit(1)
+        # Redact the API key in output
+        display_value = "***" if "api-key" in key else value
+        print(f"  git config {scope_flag} {key} {display_value}")
+
+    print()
+    print("Done! Run git-smart-commit to use your new settings.")
+    if api_key:
+        print()
+        print("Tip: your API key is stored in plaintext in git config.")
+        print("     Consider using the LLM_API_KEY environment variable instead.")
+    print()
 
 
 def split_hunks(diff_text: str) -> list[str]:
@@ -1498,9 +1680,30 @@ def main() -> None:
         "--save-plan", metavar="FILE",
         help="When used with --json, also write the plan to FILE for later use with --plan.",
     )
+    parser.add_argument(
+        "--setup", action="store_true",
+        help="Run the interactive configuration wizard and exit.",
+    )
 
     args = parser.parse_args()
     repo = Path(args.repo).resolve()
+
+    # Setup wizard: run before git-repo validation so --setup --global works
+    # from any directory (not just inside a git repo).
+    if args.setup:
+        # Try to resolve a repo for "local" scope option; silently ignore if
+        # the current directory is not a git repo.
+        setup_repo: Path | None = None
+        check = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        if check.returncode == 0:
+            setup_repo = repo
+        run_setup_wizard(setup_repo)
+        return
 
     # Verify it's a git repo early so we can read git config
     try:
