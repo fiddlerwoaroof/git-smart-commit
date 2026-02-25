@@ -8,3 +8,9 @@ outputs
 *.sw?
 .beads/dolt/beads/.dolt/noms/*
 .beads/dolt/beads/.dolt/stats/.dolt/noms/*
+
+# Added by git-smart-commit
+*.pyc
+__pycache__/
+.pytest_cache/
+.git/
