@@ -50,6 +50,118 @@ import tempfile
 import textwrap
 from dataclasses import dataclass, field
 
+
+def wrap_markdown(text: str, width: int = 80) -> str:
+    """Wrap text at width, preserving markdown structure.
+
+    - Code blocks (```) are not wrapped
+    - Inline code (`...`) within a line is preserved
+    - Lists maintain their indentation
+    - Blockquotes are preserved
+    """
+    if not text:
+        return text
+
+    lines = text.split('\n')
+    result = []
+    in_code_block = False
+    code_block_indent = 0
+    list_item_match = None
+
+    for line in lines:
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+
+        # Check for code block fences
+        if stripped.startswith('```'):
+            in_code_block = not in_code_block
+            result.append(line)
+            continue
+
+        if in_code_block:
+            result.append(line)
+            continue
+
+        # Check for list items
+        list_match = re.match(r'^(\s*)([-*+]|\d+\.)\s+', line)
+        if list_match:
+            list_item_match = list_match
+            # Calculate effective width for content after list marker
+            marker_end = list_match.end()
+            content = line[marker_end:]
+            wrapped_content = _wrap_line_preserving_inline(content, width - marker_end)
+            # Reconstruct with list marker and proper indentation
+            wrapped_lines = wrapped_content.split('\n')
+            result.append(line[:marker_end] + wrapped_lines[0])
+            for wrapped_line in wrapped_lines[1:]:
+                result.append(' ' * marker_end + wrapped_line)
+            continue
+
+        # Check for blockquotes
+        if stripped.startswith('>'):
+            quote_match = re.match(r'^(\s*>)\s?', line)
+            if quote_match:
+                prefix_len = len(quote_match.group(0))
+                content = line[prefix_len:]
+                wrapped_content = _wrap_line_preserving_inline(content, width - prefix_len)
+                wrapped_lines = wrapped_content.split('\n')
+                result.append(quote_match.group(0) + wrapped_lines[0])
+                for wrapped_line in wrapped_lines[1:]:
+                    result.append(' ' * (prefix_len - 1) + '>' + ' ' + wrapped_line)
+                continue
+
+        # Regular paragraph
+        if stripped:
+            wrapped = _wrap_line_preserving_inline(line, width)
+            result.append(wrapped)
+        else:
+            result.append(line)
+
+    return '\n'.join(result)
+
+
+def _wrap_line_preserving_inline(text: str, width: int) -> str:
+    """Wrap a line while preserving inline code spans."""
+    if len(text) <= width:
+        return text
+
+    # Split on inline code to preserve it
+    parts = re.split(r'(`[^`]+`)', text)
+    lines = []
+    current_line = ''
+
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith('`') and part.endswith('`'):
+            # Inline code - add to current line if it fits, else start new line
+            if current_line and len(current_line) + 1 + len(part) > width:
+                lines.append(current_line.rstrip())
+                current_line = part
+            else:
+                if current_line:
+                    current_line += ' '
+                current_line += part
+        else:
+            # Regular text - wrap it
+            words = part.split(' ')
+            for word in words:
+                if not word:
+                    continue
+                if current_line and len(current_line) + 1 + len(word) > width:
+                    lines.append(current_line.rstrip())
+                    current_line = word
+                else:
+                    if current_line:
+                        current_line += ' '
+                    current_line += word
+
+    if current_line:
+        lines.append(current_line.rstrip())
+
+    return '\n'.join(lines)
+
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = textwrap.dedent("""\
@@ -1116,8 +1228,8 @@ class Commit(BaseModel):
     issues: list[Issue] = Field(default_factory=list, description="Issues noticed in the code being committed")
 
     def post_process(self):
-        self.body = textwrap.fill(self.body, 80)
-        self.breaking_change = textwrap.fill(self.breaking_change, 80)
+        self.body = wrap_markdown(self.body, 80)
+        self.breaking_change = wrap_markdown(self.breaking_change, 80)
         return self
 
 class ProposeCommitsArgs(BaseModel):
