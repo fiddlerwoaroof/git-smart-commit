@@ -2,5 +2,6 @@
   "database": "dolt",
   "jsonl_export": "issues.jsonl",
   "backend": "dolt",
-  "dolt_database": "beads_gsc"
+  "dolt_mode": "server",
+  "dolt_database": "gsc"
 }
