@@ -56,8 +56,10 @@ def wrap_markdown(text: str, width: int = 80) -> str:
 
     - Code blocks (```) are not wrapped
     - Inline code (`...`) within a line is preserved
-    - Lists maintain their indentation
-    - Blockquotes are preserved
+    - List items wrap with a hanging indent; continuation lines (indented to
+      at least the marker end) are wrapped with the same indent
+    - Blockquotes are preserved with the correct continuation prefix
+    - Regular paragraphs preserve their leading indent on continuation lines
     """
     if not text:
         return text
@@ -65,16 +67,18 @@ def wrap_markdown(text: str, width: int = 80) -> str:
     lines = text.split('\n')
     result = []
     in_code_block = False
-    code_block_indent = 0
-    list_item_match = None
+    # Number of leading spaces that mark a list continuation line; None when
+    # we are not inside a list item.
+    list_continuation_indent: int | None = None
 
     for line in lines:
         stripped = line.lstrip()
         indent = len(line) - len(stripped)
 
-        # Check for code block fences
+        # Code block fence toggles verbatim mode
         if stripped.startswith('```'):
             in_code_block = not in_code_block
+            list_continuation_indent = None
             result.append(line)
             continue
 
@@ -82,40 +86,58 @@ def wrap_markdown(text: str, width: int = 80) -> str:
             result.append(line)
             continue
 
-        # Check for list items
+        # Blank line resets list state
+        if not stripped:
+            list_continuation_indent = None
+            result.append(line)
+            continue
+
+        # New list item
         list_match = re.match(r'^(\s*)([-*+]|\d+\.)\s+', line)
         if list_match:
-            list_item_match = list_match
-            # Calculate effective width for content after list marker
             marker_end = list_match.end()
+            list_continuation_indent = marker_end
             content = line[marker_end:]
             wrapped_content = _wrap_line_preserving_inline(content, width - marker_end)
-            # Reconstruct with list marker and proper indentation
             wrapped_lines = wrapped_content.split('\n')
             result.append(line[:marker_end] + wrapped_lines[0])
             for wrapped_line in wrapped_lines[1:]:
                 result.append(' ' * marker_end + wrapped_line)
             continue
 
-        # Check for blockquotes
+        # List continuation line: indented to at least the marker position
+        if list_continuation_indent is not None and indent >= list_continuation_indent:
+            cont_prefix = ' ' * indent
+            wrapped_content = _wrap_line_preserving_inline(stripped, width - indent)
+            wrapped_lines = wrapped_content.split('\n')
+            result.append(cont_prefix + wrapped_lines[0])
+            for wrapped_line in wrapped_lines[1:]:
+                result.append(cont_prefix + wrapped_line)
+            continue
+
+        # Not a list continuation — reset list state
+        list_continuation_indent = None
+
+        # Blockquote
         if stripped.startswith('>'):
-            quote_match = re.match(r'^(\s*>)\s?', line)
+            quote_match = re.match(r'^(\s*)(>+\s?)', line)
             if quote_match:
-                prefix_len = len(quote_match.group(0))
-                content = line[prefix_len:]
-                wrapped_content = _wrap_line_preserving_inline(content, width - prefix_len)
+                full_prefix = quote_match.group(1) + quote_match.group(2)
+                content = line[len(full_prefix):]
+                wrapped_content = _wrap_line_preserving_inline(content, width - len(full_prefix))
                 wrapped_lines = wrapped_content.split('\n')
-                result.append(quote_match.group(0) + wrapped_lines[0])
+                result.append(full_prefix + wrapped_lines[0])
                 for wrapped_line in wrapped_lines[1:]:
-                    result.append(' ' * (prefix_len - 1) + '>' + ' ' + wrapped_line)
+                    result.append(full_prefix + wrapped_line)
                 continue
 
-        # Regular paragraph
-        if stripped:
-            wrapped = _wrap_line_preserving_inline(line, width)
-            result.append(wrapped)
-        else:
-            result.append(line)
+        # Regular paragraph — preserve leading indent on all continuation lines
+        cont_prefix = ' ' * indent
+        wrapped_content = _wrap_line_preserving_inline(stripped, width - indent)
+        wrapped_lines = wrapped_content.split('\n')
+        result.append(cont_prefix + wrapped_lines[0])
+        for wrapped_line in wrapped_lines[1:]:
+            result.append(cont_prefix + wrapped_line)
 
     return '\n'.join(result)
 
