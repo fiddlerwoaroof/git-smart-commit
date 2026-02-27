@@ -22,3 +22,6 @@ __pycache__/
 .dolt/
 *.db
 .sqlhistory
+dolt-monitor.pid
+dolt-server.port
+.beads/dolt-server.activity
