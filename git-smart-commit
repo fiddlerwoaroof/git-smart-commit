@@ -150,6 +150,10 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
       (staged=true for staged only, staged=false for unstaged only, omit for both)
     - get_git_log(n): Get the last n commit subjects to learn this project's conventions
     - search_diff(pattern, context_lines): Search all diffs for a regex pattern
+    - query_tool_result(result_id, question): When a previous tool result was summarized
+      to save context, use this to ask a targeted question about the original full output.
+      The result_id is shown in the summary (e.g. "r5"). Use this instead of re-fetching
+      a diff or file you already retrieved but whose details were compressed away.
 
     Investigation strategy:
     - Start with the file list and stats you receive
@@ -157,6 +161,7 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     - Use get_diff on files whose grouping is unclear from stats alone
     - Use read_file when you need full file context (imports, class structure, etc.)
     - Use search_diff to find patterns across all changes (debug prints, TODOs, etc.)
+    - If a prior result was summarized, use query_tool_result before re-fetching it
     - Investigate as many files as needed, then call propose_commits when confident
 
     You do not need to commit every file. Skip junk files (editor backups,
@@ -247,8 +252,14 @@ DIFF_TOTAL_CHARS   = 120000   # hard cap on total context sent to classifier
 HUNK_SUMMARIZE_CTX = 8192     # smaller context for summarization calls (faster)
 PRIOR_HUNK_WINDOW  = 4        # how many previous hunk summaries to include as context
 
-MAX_AGENTIC_TURNS  = 20       # safeguard for the agentic investigation loop
+MAX_AGENTIC_TURNS     = 20    # base safeguard for the agentic investigation loop
+MAX_AGENTIC_TURNS_CAP = 50    # absolute ceiling when scaling with hunk count
 READ_FILE_LIMIT    = 50_000   # max chars returned by the read_file tool
+
+CONTEXT_TRIM_THRESHOLD       = 300_000  # total message chars before summarizing old results
+TOOL_RESULT_SUMMARIZE_SKIP   = 500      # results shorter than this are never summarized
+TOOL_RESULT_SUMMARIZE_INPUT  = 20_000   # max chars fed to the summarizer model
+TURNS_WARN_AT                = 4        # remaining turns at which to inject a commit warning
 
 # Preset backends for the setup wizard
 SETUP_BACKENDS = [
@@ -359,6 +370,11 @@ def _summarize_args(arguments: dict, max_len: int = 80) -> str:
     if len(raw) <= max_len:
         return raw
     return raw[:max_len - 3] + "..."
+
+
+def _total_message_chars(messages: list[dict]) -> int:
+    """Count total characters across all message content fields."""
+    return sum(len(str(m.get("content", "") or "")) for m in messages)
 
 
 # ── LLM client ────────────────────────────────────────────────────────────────
@@ -644,14 +660,90 @@ class LLMClient:
 
     def agentic_loop(self, system_prompt: str, initial_user_message: str,
                      tool_registry: dict[str, Callable],
-                     terminal_tool: Callable, **kwargs) -> Any:
+                     terminal_tool: Callable, max_turns: int = MAX_AGENTIC_TURNS,
+                     **kwargs) -> Any:
         """Run a multi-turn agentic loop until the terminal tool is called.
 
         Each turn: send messages → extract tool call → dispatch.
         Investigation tool results are appended to history.
         Validation errors for the terminal tool become tool-result messages.
         On the last turn, only the terminal tool is offered.
+
+        Context management: when total message size exceeds CONTEXT_TRIM_THRESHOLD,
+        old tool-result messages are replaced with LLM-generated summaries. The
+        original full content is stored and accessible via the query_tool_result
+        tool so the model can ask targeted questions without re-fetching.
+        A countdown warning is injected when TURNS_WARN_AT turns remain.
         """
+        # ── result storage for compressed tool results ─────────────────────────
+        result_store: dict[str, str] = {}  # result_id → original full content
+
+        def _summarize_and_store(msg_idx: int, content: str) -> str:
+            """Summarize a tool result via LLM, store the original, return summary."""
+            result_id = f"r{msg_idx}"
+            result_store[result_id] = content
+            prompt = textwrap.dedent(f"""\
+                Summarize this tool output in 2-4 sentences. Focus on filenames,
+                key changes, and any suspicious code. Preserve suspicious code verbatim.
+
+                {content[:TOOL_RESULT_SUMMARIZE_INPUT]}
+            """)
+            summary = self.call(prompt, num_ctx=HUNK_SUMMARIZE_CTX)
+            return (
+                f"[Summarized — id: '{result_id}'. "
+                f"Use query_tool_result to ask specific questions about the full output.]\n"
+                f"{summary.strip()}"
+            )
+
+        def _trim_with_summaries(messages: list[dict]) -> None:
+            """Summarize oldest large tool results until total context is under threshold."""
+            for i, msg in enumerate(messages):
+                if _total_message_chars(messages) <= CONTEXT_TRIM_THRESHOLD:
+                    break
+                if msg.get("role") != "tool":
+                    continue
+                content = msg.get("content", "")
+                if not isinstance(content, str):
+                    continue
+                if content.startswith("[Summarized"):  # already summarized
+                    continue
+                if len(content) <= TOOL_RESULT_SUMMARIZE_SKIP:
+                    continue
+                print(f"  [summarizing old result msg{i} ({len(content):,} chars)]",
+                      file=sys.stderr)
+                messages[i] = {**msg, "content": _summarize_and_store(i, content)}
+
+        # ── query_tool_result: closure over result_store and self ───────────────
+        @tool(QueryResultArgs)
+        def query_tool_result(args: QueryResultArgs, **_: Any) -> str:
+            """Access the full (unsummarized) content of a previously summarized tool result.
+
+            When a tool result was compressed to save context, use this to ask a
+            targeted question. The answer is generated from the original full content
+            so no information is lost.
+            """
+            full = result_store.get(args.result_id)
+            if full is None:
+                available = list(result_store.keys()) or ["none"]
+                return (
+                    f"No stored result with id '{args.result_id}'. "
+                    f"Available ids: {available}"
+                )
+            prompt = textwrap.dedent(f"""\
+                The following is the full content of stored tool result '{args.result_id}':
+
+                {full[:50_000]}
+
+                Question: {args.question}
+
+                Answer concisely and directly based only on the content above.
+            """)
+            return self.call(prompt, num_ctx=HUNK_SUMMARIZE_CTX)
+
+        # ── build extended registry that includes query_tool_result ─────────────
+        extended_registry = dict(tool_registry)
+        extended_registry["query_tool_result"] = query_tool_result
+
         messages: list[dict] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": initial_user_message},
@@ -660,12 +752,13 @@ class LLMClient:
         terminal_spec = terminal_tool._tool_spec
         terminal_name: str = terminal_spec["function"]["name"]
         terminal_model: type[BaseModel] = terminal_tool._tool_model
-        all_tool_specs = [fn._tool_spec for fn in list(tool_registry.values())] + [terminal_spec]
+        all_tool_specs = [fn._tool_spec for fn in extended_registry.values()] + [terminal_spec]
 
         headers = {**self.config.auth_headers, "Content-Type": "application/json"}
 
-        for turn in range(1, MAX_AGENTIC_TURNS + 1):
-            is_last_turn = (turn == MAX_AGENTIC_TURNS)
+        for turn in range(1, max_turns + 1):
+            is_last_turn = (turn == max_turns)
+            turns_remaining = max_turns - turn
 
             if is_last_turn:
                 tools = [terminal_spec]
@@ -690,7 +783,7 @@ class LLMClient:
 
             if tool_call is None:
                 text = self._extract_text_content(data) or ""
-                print(f"  [agentic turn {turn}/{MAX_AGENTIC_TURNS}] no tool call, nudging",
+                print(f"  [agentic turn {turn}/{max_turns}] no tool call, nudging",
                       file=sys.stderr)
                 messages.append({"role": "assistant", "content": text})
                 messages.append({
@@ -702,7 +795,7 @@ class LLMClient:
                 })
                 continue
 
-            print(f"  [agentic turn {turn}/{MAX_AGENTIC_TURNS}] "
+            print(f"  [agentic turn {turn}/{max_turns}] "
                   f"{tool_call.name}({_summarize_args(tool_call.arguments)})",
                   file=sys.stderr)
             messages.append(self._format_assistant_tool_call(data))
@@ -731,10 +824,10 @@ class LLMClient:
                     ))
                     continue
 
-            tool_fn = tool_registry.get(tool_call.name)
+            tool_fn = extended_registry.get(tool_call.name)
             if tool_fn is None:
                 result_str = (f"Unknown tool: {tool_call.name!r}. "
-                              f"Available: {list(tool_registry.keys())}")
+                              f"Available: {list(extended_registry.keys())}")
             else:
                 try:
                     validated_args = tool_fn._tool_model.model_validate(raw_args).post_process()
@@ -745,8 +838,28 @@ class LLMClient:
 
             messages.append(self._format_tool_result(tool_call.call_id, result_str))
 
+            # Context management: when messages are large, summarize old tool results
+            # with the LLM and store originals for query_tool_result access.
+            total_chars = _total_message_chars(messages)
+            if total_chars > CONTEXT_TRIM_THRESHOLD:
+                print(f"  [context {total_chars:,} chars > {CONTEXT_TRIM_THRESHOLD:,}, summarizing old results]",
+                      file=sys.stderr)
+                _trim_with_summaries(messages)
+
+            # Inject a countdown warning when few turns remain so the model
+            # knows it must call the terminal tool soon.
+            if 0 < turns_remaining <= TURNS_WARN_AT:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"WARNING: Only {turns_remaining} turn(s) remaining. "
+                        f"Stop gathering context and call {terminal_name} NOW with "
+                        f"your best grouping based on what you already know."
+                    ),
+                })
+
         raise RuntimeError(
-            f"agentic_loop exceeded {MAX_AGENTIC_TURNS} turns without calling {terminal_name}"
+            f"agentic_loop exceeded {max_turns} turns without calling {terminal_name}"
         )
 
 
@@ -1170,6 +1283,15 @@ def search_diff(result: SearchDiffArgs, analyzer: "GitAnalyzer") -> str:
     return text
 
 
+class QueryResultArgs(BaseModel):
+    result_id: str = Field(
+        description="The result_id shown in the summarized tool output (e.g. 'r5')")
+    question: str = Field(
+        description="Specific question to answer from the full stored result")
+
+    def post_process(self): return self
+
+
 MERGE_PROMPT = textwrap.dedent("""\
     You are merging multiple proposed commits that share the same diff hunks
     and therefore cannot be committed separately.
@@ -1440,11 +1562,20 @@ class GitAnalyzer:
             "search_diff": search_diff,
         }
 
+        # Scale turn limit with changeset size: allow ~2 extra turns per 5 hunks,
+        # capped at MAX_AGENTIC_TURNS_CAP to avoid runaway loops.
+        n_hunks = len(hunk_map)
+        max_turns = min(MAX_AGENTIC_TURNS + (n_hunks // 5) * 2, MAX_AGENTIC_TURNS_CAP)
+        if max_turns > MAX_AGENTIC_TURNS:
+            print(f"  [{n_hunks} hunks — allowing up to {max_turns} agentic turns]",
+                  file=sys.stderr)
+
         return self.client.agentic_loop(
             system_prompt=AGENTIC_SYSTEM_PROMPT,
             initial_user_message=initial_message,
             tool_registry=tool_registry,
             terminal_tool=propose_commits,
+            max_turns=max_turns,
             analyzer=self,
         )
 
