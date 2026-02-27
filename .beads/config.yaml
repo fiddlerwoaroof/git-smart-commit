@@ -51,3 +51,5 @@
 # - linear.api-key
 # - github.org
 # - github.repo
+
+sync.mode: "dolt-native"
