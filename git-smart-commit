@@ -28,13 +28,6 @@ Options:
     --api-key KEY   API key for authenticated endpoints (or set LLM_API_KEY env var)
     --setup         Run interactive configuration wizard and exit
     --help          Show this message
-
-Exit codes:
-    0   Success
-    1   No changes found
-    2   Model/Ollama error
-    3   Git error
-    4   User cancelled
 """
 
 from pathlib import Path

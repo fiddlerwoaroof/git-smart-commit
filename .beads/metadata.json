@@ -1,5 +1,6 @@
 {
   "database": "dolt",
+  "dolt_database": "gsc",
   "jsonl_export": "issues.jsonl",
   "backend": "dolt"
 }

@@ -17,3 +17,7 @@ __pycache__/
 
 # Added by git-smart-commit
 .beads/export-state/*
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
