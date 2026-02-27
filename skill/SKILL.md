@@ -69,12 +69,10 @@ forbidden (it could produce a different grouping than what the user approved).
    If all issues are advisory or the list is empty, note it briefly and continue.
 
 5. **Rate the proposed commits 1–10.** Consider:
-   - `git-smart-commit` can only stage **whole files** — a file cannot be split
-     across commits, so penalise groupings only for things that are actually
-     fixable given that constraint (e.g. unrelated files lumped together when
-     they could be separated, wrong commit type, vague subject line).
-   - Do NOT penalise for mixed concerns within a single file — that is
-     unavoidable and not a flaw in the proposal.
+   - `git-smart-commit` stages changes at individual **hunk** level — a file
+     CAN be split across commits when its hunks are unrelated. Penalise groupings
+     where unrelated hunks are lumped together (even from the same file), wrong
+     commit type, or vague subject lines.
    - Do NOT factor lint issues into the commit grouping score — those are
      evaluated separately in step 4.
 
@@ -86,10 +84,16 @@ forbidden (it could produce a different grouping than what the user approved).
 
 6. If `--dry-run` was in `$ARGUMENTS`, stop here.
 
-7. Otherwise ask: **"Proceed with these commits? [y/N]"**
-   - **Yes** (or if `--yes` was in `$ARGUMENTS`) → execute the saved plan exactly
-     (pass `--repo` if it was in the passthrough flags):
+7. Otherwise ask: **"Proceed with these commits? [y/N/t]"**
+   - **Yes** (or if `--yes` was in `$ARGUMENTS`) → execute the saved plan, bypassing
+     the TUI (pass `--repo` if it was in the passthrough flags):
      ```
      git-smart-commit --plan /tmp/gsc-plan.json --yes [--repo PATH if specified]
+     ```
+   - **t (TUI)** → tell the user to run this command directly in their terminal to
+     get the interactive two-panel review UI (navigate with ↑↓/jk, edit subjects
+     with `e`, confirm with `y`, cancel with `n`/`q`):
+     ```
+     git-smart-commit --plan /tmp/gsc-plan.json [--repo PATH if specified]
      ```
    - **No** → ask what the user wants to change; they can re-invoke with adjusted flags
