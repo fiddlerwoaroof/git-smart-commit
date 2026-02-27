@@ -4,6 +4,7 @@
 # dependencies = [
 #   "httpx",
 #   "pydantic",
+#   "textual>=0.50.0",
 # ]
 # ///
 """
@@ -1912,6 +1913,263 @@ def print_proposed_commits(commits: list[dict], gitignore: list[str],
         print()
 
 
+# ── Textual TUI ────────────────────────────────────────────────────────────────
+
+def _build_commit_markup(commit: dict, hunk_map: dict | None, index: int, total: int) -> str:
+    """Build a Rich markup string for the commit detail panel."""
+    from rich.markup import escape as esc
+
+    subject = esc(commit["subject"])
+    lines = [
+        f"[dim bold][{index}/{total}][/dim bold]  [bold]{subject}[/bold]",
+        "",
+    ]
+
+    body = commit.get("body", "").strip()
+    if body:
+        for line in body.splitlines():
+            lines.append(f"  {esc(line)}")
+        lines.append("")
+
+    hunk_ids = commit.get("hunks", [])
+    if hunk_ids:
+        by_file: dict[str, list] = {}
+        for hid in hunk_ids:
+            if hunk_map and hid in hunk_map:
+                dh = hunk_map[hid]
+                by_file.setdefault(dh.file_path, []).append(dh)
+            else:
+                fpath = hid.rsplit("#", 1)[0] if "#" in hid else hid
+                by_file.setdefault(fpath, [])
+
+        max_path = max((len(fp) for fp in by_file), default=0)
+        for fpath, hunks in by_file.items():
+            total_added = total_removed = 0
+            is_new = any(getattr(dh, "is_untracked", False) for dh in hunks)
+            for dh in hunks:
+                if dh is not None and dh.patch:
+                    a, r = _diff_stats(dh.patch)
+                    total_added += a
+                    total_removed += r
+
+            padding  = " " * (max_path - len(fpath))
+            stats    = f"+{total_added} -{total_removed}"
+            fp_esc   = esc(fpath)
+
+            if not hunks:
+                lines.append(f"  [yellow]~ {fp_esc}[/yellow]")
+            elif is_new:
+                lines.append(f"  [green]+ {fp_esc}[/green]{padding}  [dim]{stats}[/dim]")
+            elif total_added == 0 and total_removed > 0:
+                lines.append(f"  [red]× {fp_esc}[/red]{padding}  [dim]{stats}[/dim]")
+            else:
+                lines.append(f"  [yellow]~ {fp_esc}[/yellow]{padding}  [dim]{stats}[/dim]")
+        lines.append("")
+
+    breaking = commit.get("breaking_change", "").strip()
+    if breaking:
+        lines.append(f"  [bold red]⚠ BREAKING CHANGE:[/bold red] {esc(breaking)}")
+        lines.append("")
+
+    issues = commit.get("issues") or []
+    if issues:
+        lines.append(f"  [yellow]Issues found:[/yellow]")
+        for issue in issues:
+            path = esc(issue.get("path", ""))
+            msg  = esc(issue.get("message", ""))
+            lines.append(f"    [dim]·[/dim] [dim]{path}:[/dim] {msg}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _run_confirm_tui(
+    commits: list[dict], gitignore: list[str], hunk_map: dict | None
+) -> list[dict] | None:
+    """Launch the interactive Textual TUI.
+
+    Returns the (possibly edited) commit list if the user confirmed, or
+    None if the user cancelled.
+    """
+    # Textual imports are lazy: no startup cost when TUI is not used.
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.containers import Horizontal, Vertical
+    from textual.screen import ModalScreen
+    from textual.widgets import Footer, Header, Input, Label, ListItem, ListView, Static
+
+    class _EditModal(ModalScreen[str | None]):
+        """Modal dialog for editing a commit's subject line."""
+
+        # Use ModalScreen selector so the CSS works regardless of class name
+        # mangling that can occur with functions-scoped class definitions.
+        DEFAULT_CSS = """
+        _EditModal { align: center middle; }
+        _EditModal > Vertical {
+            width: 70; height: auto;
+            border: double $accent; padding: 1 2; background: $surface;
+        }
+        """
+
+        BINDINGS = [Binding("escape", "dismiss_none", "Cancel", priority=True)]
+
+        def __init__(self, current: str) -> None:
+            super().__init__()
+            self._current = current
+
+        def compose(self) -> ComposeResult:
+            with Vertical():
+                yield Label("Edit commit subject:")
+                yield Input(value=self._current, id="subj-input")
+                yield Label("[dim]Enter to save · Esc to cancel[/dim]", markup=True)
+
+        def on_mount(self) -> None:
+            self.query_one(Input).focus()
+
+        def on_input_submitted(self, event: Input.Submitted) -> None:
+            self.dismiss(event.value.strip() or None)
+
+        def action_dismiss_none(self) -> None:
+            self.dismiss(None)
+
+    class _App(App[list[dict] | None]):
+        """Two-panel TUI: commit list on the left, details on the right."""
+
+        TITLE = "git-smart-commit — review proposed commits"
+
+        CSS = """
+        Screen   { layout: vertical; }
+        #panels  { layout: horizontal; height: 1fr; }
+        #sidebar { width: 34; border-right: solid $primary-darken-3; }
+        ListView { height: 1fr; }
+        ListView > ListItem { padding: 0 1; }
+        #detail  { width: 1fr; padding: 1 2; overflow-y: auto; }
+        """
+
+        BINDINGS = [
+            Binding("y", "confirm",      "Proceed",      priority=True),
+            Binding("n", "cancel",       "Cancel",       priority=True),
+            Binding("q", "cancel",       "Quit",         priority=True),
+            Binding("e", "edit_subject", "Edit subject"),
+            Binding("k", "cursor_up",    "",             show=False),
+            Binding("j", "cursor_down",  "",             show=False),
+        ]
+
+        def __init__(
+            self,
+            commits: list[dict],
+            gitignore_patterns: list[str],
+            hunk_map: dict | None,
+        ) -> None:
+            super().__init__()
+            self._commits   = [dict(c) for c in commits]
+            self._gitignore = gitignore_patterns
+            self._hunk_map  = hunk_map
+            self._sel       = 0          # plain int — no reactive watcher needed
+
+        # ── layout ───────────────────────────────────────────────────────────
+
+        def compose(self) -> ComposeResult:
+            yield Header(show_clock=False)
+            with Horizontal(id="panels"):
+                with Vertical(id="sidebar"):
+                    with ListView(id="list"):
+                        for i in range(len(self._commits)):
+                            yield ListItem(Label(self._label(i)), id=f"ci-{i}")
+                # Initialise detail with the first commit so no on_mount needed.
+                init = (
+                    _build_commit_markup(
+                        self._commits[0], self._hunk_map, 1, len(self._commits)
+                    )
+                    if self._commits else ""
+                )
+                yield Static(init, id="detail", markup=True)
+            yield Footer()
+
+        # ── helpers ──────────────────────────────────────────────────────────
+
+        def _label(self, i: int) -> str:
+            subj = self._commits[i]["subject"]
+            if len(subj) > 27:
+                subj = subj[:26] + "…"
+            return f"{'▶' if i == self._sel else ' '} {i + 1}. {subj}"
+
+        def _set_sel(self, idx: int) -> None:
+            """Change selection: refresh both sidebar labels and the detail pane."""
+            old, self._sel = self._sel, idx
+            for i in (old, idx):
+                try:
+                    self.query_one(f"#ci-{i}", ListItem).query_one(Label).update(
+                        self._label(i)
+                    )
+                except Exception:
+                    pass
+            try:
+                self.query_one("#detail", Static).update(
+                    _build_commit_markup(
+                        self._commits[idx], self._hunk_map, idx + 1, len(self._commits)
+                    )
+                )
+            except Exception:
+                pass
+
+        # ── events ───────────────────────────────────────────────────────────
+
+        def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+            if event.item is None:
+                return
+            try:
+                idx = int(event.item.id.split("-", 1)[1])
+            except Exception:
+                return
+            if idx != self._sel:
+                self._set_sel(idx)
+
+        # ── actions ──────────────────────────────────────────────────────────
+
+        def action_cursor_up(self) -> None:
+            try:
+                self.query_one("#list", ListView).action_cursor_up()
+            except Exception:
+                pass
+
+        def action_cursor_down(self) -> None:
+            try:
+                self.query_one("#list", ListView).action_cursor_down()
+            except Exception:
+                pass
+
+        def action_confirm(self) -> None:
+            self.exit(self._commits)
+
+        def action_cancel(self) -> None:
+            self.exit(None)
+
+        def action_edit_subject(self) -> None:
+            idx = self._sel
+
+            def _apply(new_subject: str | None) -> None:
+                if not new_subject:
+                    return
+                self._commits[idx]["subject"] = new_subject
+                try:
+                    self.query_one(f"#ci-{idx}", ListItem).query_one(Label).update(
+                        self._label(idx)
+                    )
+                    self.query_one("#detail", Static).update(
+                        _build_commit_markup(
+                            self._commits[idx], self._hunk_map,
+                            idx + 1, len(self._commits),
+                        )
+                    )
+                except Exception:
+                    pass
+
+            self.push_screen(_EditModal(self._commits[idx]["subject"]), _apply)
+
+    return _App(commits, gitignore, hunk_map).run()
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -2031,19 +2289,29 @@ def main() -> None:
                 hunk_map[hunk_id] = DiffHunk(
                     hunk_id=hunk_id, file_path=fpath, patch=patch
                 )
-        print_proposed_commits(commits, gitignore, hunk_map)
-        if not args.dry_run:
-            if not args.yes:
-                try:
-                    answer = input("Proceed with these commits? [y/N] ").strip().lower()
-                except (KeyboardInterrupt, EOFError):
-                    return
-                if answer not in ("y", "yes"):
-                    print("Cancelled.")
-                    return
-            analyzer.execute_commits(commits, hunk_map)
-            analyzer.update_gitignore(gitignore, yes=args.yes)
-            print("\nDone.")
+        if args.dry_run:
+            print_proposed_commits(commits, gitignore, hunk_map)
+            return
+        if args.yes:
+            print_proposed_commits(commits, gitignore, hunk_map)
+        elif sys.stdout.isatty():
+            result = _run_confirm_tui(commits, gitignore, hunk_map)
+            if result is None:
+                print("Cancelled.")
+                return
+            commits = result
+        else:
+            print_proposed_commits(commits, gitignore, hunk_map)
+            try:
+                answer = input("Proceed with these commits? [y/N] ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                return
+            if answer not in ("y", "yes"):
+                print("Cancelled.")
+                return
+        analyzer.execute_commits(commits, hunk_map)
+        analyzer.update_gitignore(gitignore, yes=args.yes)
+        print("\nDone.")
         return
 
     n_files = len({dh.file_path for dh in hunk_map.values()})
@@ -2069,14 +2337,21 @@ def main() -> None:
                 f.write(plan_json)
         return
 
-    # Display proposed commits
-    print_proposed_commits(commits, gitignore, hunk_map)
-
     if args.dry_run:
+        print_proposed_commits(commits, gitignore, hunk_map)
         return
 
-    # Confirm unless --yes
-    if not args.yes:
+    # Interactive TUI when stdout is a terminal; plain-text fallback otherwise.
+    if args.yes:
+        print_proposed_commits(commits, gitignore, hunk_map)
+    elif sys.stdout.isatty():
+        result = _run_confirm_tui(commits, gitignore, hunk_map)
+        if result is None:
+            print("Cancelled.")
+            return
+        commits = result
+    else:
+        print_proposed_commits(commits, gitignore, hunk_map)
         try:
             answer = input("Proceed with these commits? [y/N] ").strip().lower()
         except (KeyboardInterrupt, EOFError):
