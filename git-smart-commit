@@ -41,6 +41,7 @@ import httpx
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1789,44 +1790,126 @@ class GitAnalyzer:
         print(f"  Updated .gitignore ({len(new_patterns)} new pattern(s)).")
 
 
+# ── Terminal color helpers ──────────────────────────────────────────────────────
+
+_ANSI_RESET  = "\033[0m"
+_ANSI_BOLD   = "\033[1m"
+_ANSI_DIM    = "\033[2m"
+_ANSI_RED    = "\033[31m"
+_ANSI_GREEN  = "\033[32m"
+_ANSI_YELLOW = "\033[33m"
+
+
+def _ansi(text: str, *codes: str) -> str:
+    """Wrap text in ANSI escape codes when stdout is a TTY (no-op otherwise)."""
+    if not sys.stdout.isatty():
+        return text
+    return "".join(codes) + text + _ANSI_RESET
+
+
+def _diff_stats(patch: str) -> tuple[int, int]:
+    """Count (added_lines, removed_lines) from a unified diff patch string."""
+    added = removed = 0
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removed += 1
+    return added, removed
+
+
 # ── Display helpers ────────────────────────────────────────────────────────────
 
 def print_proposed_commits(commits: list[dict], gitignore: list[str],
                            hunk_map: dict[str, "DiffHunk"] | None = None) -> None:
-    print("\nProposed commits:")
-    print("─" * 60)
+    width = shutil.get_terminal_size((80, 24)).columns
+    n = len(commits)
+    print()
     for i, commit in enumerate(commits, 1):
-        print(f"\n  [{i}] {commit['subject']}")
-        body = commit.get("body", "").strip()
-        print()
-        if body:
-            for line in body.splitlines():
-                print(f"      {line}")
+        subject  = commit["subject"]
+        body     = commit.get("body", "").strip()
         hunk_ids = commit.get("hunks", [])
+        breaking = commit.get("breaking_change", "").strip()
+        issues   = commit.get("issues") or []
+
+        # ── box top ──────────────────────────────────────────────────────────
+        label       = f"[{i}/{n}] "
+        header_len  = len("┌─") + len(label) + len(subject) + 1
+        fill        = max(1, width - header_len)
+        print(
+            "┌─"
+            + _ansi(label, _ANSI_DIM)
+            + _ansi(subject, _ANSI_BOLD)
+            + " " + "─" * fill
+        )
+
+        # ── body ─────────────────────────────────────────────────────────────
+        if body:
+            print("│")
+            for line in body.splitlines():
+                print(f"│    {line}")
+
+        # ── files ─────────────────────────────────────────────────────────────
         if hunk_ids:
-            # Group by file for a cleaner display
-            by_file: dict[str, list[str]] = {}
+            print("│")
+            # Aggregate hunks per file (preserving order)
+            by_file: dict[str, list] = {}
             for hid in hunk_ids:
                 if hunk_map and hid in hunk_map:
-                    fpath = hunk_map[hid].file_path
+                    dh = hunk_map[hid]
+                    by_file.setdefault(dh.file_path, []).append(dh)
                 else:
                     fpath = hid.rsplit("#", 1)[0] if "#" in hid else hid
-                by_file.setdefault(fpath, []).append(hid)
-            for fpath, hids in by_file.items():
-                tags = ", ".join(hids)
-                print(f"       + {fpath}  [{tags}]")
-        breaking = commit.get("breaking_change", "").strip()
+                    by_file.setdefault(fpath, [])
+
+            max_path = max((len(fp) for fp in by_file), default=0)
+            for fpath, hunks in by_file.items():
+                total_added = total_removed = 0
+                is_new = any(getattr(dh, "is_untracked", False) for dh in hunks)
+                for dh in hunks:
+                    if dh is not None and dh.patch:
+                        a, r = _diff_stats(dh.patch)
+                        total_added   += a
+                        total_removed += r
+
+                if not hunks:
+                    # No hunk data available — neutral display
+                    print(f"│    {_ansi('~', _ANSI_YELLOW)} {fpath}")
+                    continue
+
+                if is_new:
+                    marker, color = "+", _ANSI_GREEN
+                elif total_added == 0 and total_removed > 0:
+                    marker, color = "×", _ANSI_RED
+                else:
+                    marker, color = "~", _ANSI_YELLOW
+
+                padding   = " " * (max_path - len(fpath))
+                stats_str = _ansi(f"+{total_added} -{total_removed}", _ANSI_DIM)
+                print(f"│    {_ansi(marker, color)} {_ansi(fpath, color)}{padding}  {stats_str}")
+
+        # ── breaking change ───────────────────────────────────────────────────
         if breaking:
-            print(f"  ⚠ BREAKING CHANGE: {breaking}")
-        if (issues := commit.get("issues")) != []:
-            print("  Issues in this commit:")
+            print("│")
+            print(f"│  {_ansi('⚠ BREAKING CHANGE:', _ANSI_RED + _ANSI_BOLD)} {breaking}")
+
+        # ── issues ────────────────────────────────────────────────────────────
+        if issues:
+            print("│")
+            print(f"│  {_ansi('Issues:', _ANSI_YELLOW)}")
             for issue in issues:
-                print(f"    - {issue['path']}: {issue['message']}")
+                print(f"│    - {issue['path']}: {issue['message']}")
+
+        # ── box bottom ────────────────────────────────────────────────────────
+        print("│")
+        print("└" + "─" * (width - 1))
+        print()
+
     if gitignore:
-        print("\n  Suggested .gitignore patterns:")
+        print("  Suggested .gitignore patterns:")
         for pattern in gitignore:
-            print(f"       {pattern}")
-    print()
+            print(f"    {_ansi(pattern, _ANSI_DIM)}")
+        print()
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
