@@ -541,6 +541,22 @@ class LLMClient:
             content = choices[0].get("message", {}).get("content", "").strip()
         return content or None
 
+    def _extract_reasoning(self, data: dict) -> str | None:
+        """Extract reasoning/thinking tokens from an API response if present.
+
+        Handles the two common OpenRouter formats:
+        - message.reasoning        (most thinking models)
+        - message.reasoning_content (DeepSeek-R1 style)
+        """
+        if self.config.is_ollama:
+            return None
+        choices = data.get("choices", [])
+        if not choices:
+            return None
+        msg = choices[0].get("message", {})
+        reasoning = msg.get("reasoning") or msg.get("reasoning_content")
+        return reasoning.strip() if reasoning else None
+
     def _format_assistant_tool_call(self, data: dict) -> dict:
         """Extract the assistant message from a raw API response for conversation history.
 
@@ -780,6 +796,10 @@ class LLMClient:
                 response.raise_for_status()
                 data = response.json()
             self.usage = self.usage + self._extract_usage(data)
+
+            reasoning = self._extract_reasoning(data)
+            if reasoning:
+                _log_reasoning(reasoning)
 
             tool_call = self._extract_tool_call(data)
 
@@ -1833,6 +1853,15 @@ def _log(msg: str) -> None:
     """Print a progress line to stdout unless quiet mode is active."""
     if not _QUIET:
         print(msg)
+
+
+def _log_reasoning(text: str) -> None:
+    """Print reasoning/thinking tokens dimmed and indented, unless quiet."""
+    if _QUIET:
+        return
+    prefix = _ansi("  │ ", _ANSI_DIM)
+    for line in text.splitlines():
+        print(prefix + _ansi(line, _ANSI_DIM))
 
 
 # ── Display helpers ────────────────────────────────────────────────────────────
