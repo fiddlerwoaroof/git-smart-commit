@@ -1845,8 +1845,11 @@ class GitAnalyzer:
             parts = [subject]
             if body:
                 parts.append(body)
+            trailers = []
             if breaking:
-                parts.append(f"BREAKING CHANGE: {breaking}")
+                trailers.append(f"BREAKING CHANGE: {breaking}")
+            trailers.append(f"Co-Authored-By: fiddlerwoaroof/git-smart-commit ({self.config.model})")
+            parts.append("\n".join(trailers))
             message = "\n\n".join(parts)
             hunk_ids: list[str] = commit.get("hunks", [])
 
