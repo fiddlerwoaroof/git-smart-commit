@@ -30,6 +30,16 @@ Options:
     --api-key KEY   API key for authenticated endpoints (or set LLM_API_KEY env var)
     --setup         Run interactive configuration wizard and exit
     --help          Show this message
+
+Git config keys (set with `git config [--global] <key> <value>`):
+    smart-commit.model        Default model name
+    smart-commit.api-base     Default API base URL
+    smart-commit.api-key      Default API key
+    smart-commit.issue-pattern  Extra pattern for the model to flag (repeatable:
+                                  git config --add smart-commit.issue-pattern "...")
+
+Config file: .smart-commit.toml in the repo root
+    issue_patterns = ["warn about os.system()", "flag TODO comments"]
 """
 
 from pathlib import Path
@@ -1038,15 +1048,16 @@ def _git(args: list[str], cwd: Path) -> str:
     return result.stdout
 
 
-def read_git_config(repo: Path) -> dict[str, str]:
+def read_git_config(repo: Path) -> dict[str, str | list[str]]:
     """Read smart-commit.* keys from git config (local → global → system).
 
     Returns a dict of whichever keys are set; missing keys are absent.
-    Keys: smart-commit.model, smart-commit.api-base, smart-commit.api-key
+    Scalar keys: smart-commit.model, smart-commit.api-base, smart-commit.api-key
+    Multi-value key: smart-commit.issue-pattern  (list[str])
     """
-    keys = ["smart-commit.model", "smart-commit.api-base", "smart-commit.api-key"]
-    config: dict[str, str] = {}
-    for key in keys:
+    scalar_keys = ["smart-commit.model", "smart-commit.api-base", "smart-commit.api-key"]
+    config: dict[str, str | list[str]] = {}
+    for key in scalar_keys:
         result = subprocess.run(
             ["git", "config", "--get", key],
             cwd=repo,
@@ -1055,7 +1066,53 @@ def read_git_config(repo: Path) -> dict[str, str]:
         )
         if result.returncode == 0 and result.stdout.strip():
             config[key] = result.stdout.strip()
+    # Multi-value key: each `git config --add` call appends another value
+    result = subprocess.run(
+        ["git", "config", "--get-all", "smart-commit.issue-pattern"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        patterns = [p for p in result.stdout.splitlines() if p.strip()]
+        if patterns:
+            config["smart-commit.issue-pattern"] = patterns
     return config
+
+
+def read_issue_patterns(repo: Path, gc: dict) -> list[str]:
+    """Return project-specific issue patterns from git config and .smart-commit.toml.
+
+    Sources, merged in this order (duplicates removed, order preserved):
+    1. smart-commit.issue-pattern values from git config (local overrides global)
+    2. issue_patterns list from <repo>/.smart-commit.toml
+
+    Each pattern is a plain-text description of something the model should
+    flag as an issue, e.g. "warn about os.system() — prefer subprocess".
+    """
+    import tomllib
+
+    patterns: list[str] = list(gc.get("smart-commit.issue-pattern", []))  # type: ignore[arg-type]
+
+    toml_path = repo / ".smart-commit.toml"
+    if toml_path.exists():
+        try:
+            with open(toml_path, "rb") as f:
+                data = tomllib.load(f)
+            for entry in data.get("issue_patterns", []):
+                if isinstance(entry, str) and entry.strip():
+                    patterns.append(entry.strip())
+        except Exception as exc:
+            print(f"Warning: could not read {toml_path}: {exc}", file=sys.stderr)
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    result: list[str] = []
+    for p in patterns:
+        if p not in seen:
+            seen.add(p)
+            result.append(p)
+    return result
 
 
 def _prompt(message: str, default: str | None = None) -> str | None:
@@ -1695,7 +1752,12 @@ class GitAnalyzer:
             )
         return content
 
-    def classify_changes(self, hunk_map: dict[str, DiffHunk], critique: str = "") -> tuple[list[dict], list[str]]:
+    def classify_changes(
+        self,
+        hunk_map: dict[str, DiffHunk],
+        critique: str = "",
+        issue_patterns: list[str] | None = None,
+    ) -> tuple[list[dict], list[str]]:
         """Ask the model to group diff hunks into logical commits via an agentic loop.
 
         Returns (commits, gitignore_patterns).
@@ -1719,6 +1781,16 @@ class GitAnalyzer:
             "search_diff": search_diff,
         }
 
+        # Build system prompt, appending any project-specific issue patterns
+        system_prompt = AGENTIC_SYSTEM_PROMPT
+        if issue_patterns:
+            bullet_list = "\n".join(f"    - {p}" for p in issue_patterns)
+            system_prompt = (
+                system_prompt
+                + f"\n\n    Project-specific patterns to watch for (flag as issues if found):\n"
+                + bullet_list
+            )
+
         # Scale turn limit with changeset size: allow ~2 extra turns per 5 hunks,
         # capped at MAX_AGENTIC_TURNS_CAP to avoid runaway loops.
         n_hunks = len(hunk_map)
@@ -1727,7 +1799,7 @@ class GitAnalyzer:
             _log(f"  {_ansi(f'[{n_hunks} hunks — up to {max_turns} turns]', _ANSI_DIM)}")
 
         return self.client.agentic_loop(
-            system_prompt=AGENTIC_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             initial_user_message=initial_message,
             tool_registry=tool_registry,
             terminal_tool=propose_commits,
@@ -2427,6 +2499,7 @@ def main() -> None:
     # Configure API backend.
     # Priority: CLI arg > env var > git config (smart-commit.*) > built-in default.
     gc = read_git_config(repo)
+    issue_patterns = read_issue_patterns(repo, gc)
     api_config = ApiConfig(
         base_url=(
             args.api_base
@@ -2503,7 +2576,9 @@ def main() -> None:
     n_hunks = len(hunk_map)
     _log(f"Found {n_hunks} hunk(s) across {n_files} file(s). Analyzing…")
 
-    commits, gitignore = analyzer.classify_changes(hunk_map, critique=args.critique)
+    commits, gitignore = analyzer.classify_changes(
+        hunk_map, critique=args.critique, issue_patterns=issue_patterns or None
+    )
 
     usage = analyzer.client.usage
     if usage.total_tokens > 0:
