@@ -758,42 +758,76 @@ class LLMClient:
         """Extract token usage from an API response (Ollama or OpenAI format)."""
         return self.parser.extract_usage(data)
 
+    def _retry_request(self, fn: Callable, max_retries: int = 3, initial_delay: float = 1.0) -> Any:
+        """Execute fn with exponential backoff on transient errors."""
+        for attempt in range(max_retries + 1):
+            try:
+                return fn()
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout,
+                    httpx.PoolTimeout, httpx.ConnectTimeout) as e:
+                if attempt == max_retries:
+                    raise
+                delay = initial_delay * (2 ** attempt)
+                _log(f"  {_ansi('↻', _ANSI_DIM)} retry {attempt + 1}/{max_retries} after {delay:.1f}s: {type(e).__name__}")
+                import time
+                time.sleep(delay)
+            except httpx.HTTPStatusError as e:
+                # Retry on 429 (rate limit) and 5xx (server errors)
+                if e.response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                    delay = initial_delay * (2 ** attempt)
+                    # Honor Retry-After header if present
+                    retry_after = e.response.headers.get("retry-after")
+                    if retry_after:
+                        try:
+                            delay = max(delay, float(retry_after))
+                        except ValueError:
+                            pass
+                    _log(f"  {_ansi('↻', _ANSI_DIM)} retry {attempt + 1}/{max_retries} after {delay:.1f}s: HTTP {e.response.status_code}")
+                    import time
+                    time.sleep(delay)
+                else:
+                    raise
+
     def call(self, prompt: str, num_ctx: int | None = None) -> str:
         """Call the LLM with streaming and return the assistant message text."""
         payload = self._build_payload(prompt, stream=True)
         if num_ctx is not None and self.config.is_ollama:
             payload["options"]["num_ctx"] = num_ctx
         headers = {**self.config.auth_headers, "Content-Type": "application/json"}
-        with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=5.0)) as client:
-            with client.stream("POST", self.config.chat_url, json=payload, headers=headers) as response:
-                response.raise_for_status()
-                chunks = []
-                for line in response.iter_lines():
-                    if not line:
-                        continue
-                    # OpenAI SSE format: lines prefixed with "data: "
-                    if line.startswith("data: "):
-                        line = line[6:]
-                    if line.strip() == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if self.config.is_ollama:
-                        content = data.get("message", {}).get("content", "")
-                        done = data.get("done", False)
-                    else:
-                        delta = (data.get("choices", [{}])[0]
-                                 .get("delta", {}))
-                        content = delta.get("content", "")
-                        done = data.get("choices", [{}])[0].get("finish_reason") is not None
-                    if content:
-                        chunks.append(content)
-                    if done:
-                        self.usage = self.usage + self._extract_usage(data)
-                        break
-                return "".join(chunks)
+
+        def _do_stream() -> str:
+            with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=5.0)) as client:
+                with client.stream("POST", self.config.chat_url, json=payload, headers=headers) as response:
+                    response.raise_for_status()
+                    chunks: list[str] = []
+                    for line in response.iter_lines():
+                        if not line:
+                            continue
+                        # OpenAI SSE format: lines prefixed with "data: "
+                        if line.startswith("data: "):
+                            line = line[6:]
+                        if line.strip() == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if self.config.is_ollama:
+                            content = data.get("message", {}).get("content", "")
+                            done = data.get("done", False)
+                        else:
+                            delta = (data.get("choices", [{}])[0]
+                                     .get("delta", {}))
+                            content = delta.get("content", "")
+                            done = data.get("choices", [{}])[0].get("finish_reason") is not None
+                        if content:
+                            chunks.append(content)
+                        if done:
+                            self.usage = self.usage + self._extract_usage(data)
+                            break
+                    return "".join(chunks)
+
+        return self._retry_request(_do_stream)
 
     def call_with_tool(self, prompt: str, tool_fn: Callable, **tool_kwargs) -> Any:
         """Call the LLM forcing tool_fn to be called.
@@ -810,10 +844,14 @@ class LLMClient:
             retries += 1
             payload = self._build_payload(actual_prompt, tools=[spec], stream=False)
             headers = {**self.config.auth_headers, "Content-Type": "application/json"}
-            with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
-                response = client.post(self.config.chat_url, json=payload, headers=headers)
-                response.raise_for_status()
-                data = response.json()
+
+            def _do_tool_post() -> dict:
+                with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
+                    response = client.post(self.config.chat_url, json=payload, headers=headers)
+                    response.raise_for_status()
+                    return response.json()
+
+            data = self._retry_request(_do_tool_post)
             self.usage = self.usage + self._extract_usage(data)
 
             raw_args = self._extract_tool_args(data)
@@ -1020,10 +1058,13 @@ class LLMClient:
             payload = self._build_payload_messages(messages, tools=tools,
                                                    tool_choice=tool_choice, stream=False)
 
-            with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
-                response = client.post(self.config.chat_url, json=payload, headers=headers)
-                response.raise_for_status()
-                data = response.json()
+            def _do_agentic_post() -> dict:
+                with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
+                    response = client.post(self.config.chat_url, json=payload, headers=headers)
+                    response.raise_for_status()
+                    return response.json()
+
+            data = self._retry_request(_do_agentic_post)
             self.usage = self.usage + self._extract_usage(data)
 
             reasoning = self._extract_reasoning(data)
