@@ -3204,11 +3204,28 @@ def _main_body(client: LLMClient, repo: Path, args, issue_patterns) -> None:
 
     # Collect hunks (unstages staged files first so everything is uniform)
     _log("Scanning for changes…")
-    hunk_map = analyzer.collect_hunks()
+    hunk_map, originally_staged = analyzer.collect_hunks()
     if not hunk_map:
+        if originally_staged:
+            _git(["add", "--"] + originally_staged, repo)
         print("No changes found.", file=sys.stderr)
         sys.exit(1)
 
+    committed = False
+    try:
+        committed = _main_body_inner(analyzer, args, issue_patterns, hunk_map,
+                                     repo)
+    finally:
+        if not committed and originally_staged:
+            try:
+                _git(["add", "--"] + originally_staged, repo)
+            except Exception:
+                print("Warning: could not re-stage originally staged files.",
+                      file=sys.stderr)
+
+
+def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
+    """Returns True if commits were executed, False otherwise."""
     # Plan replay mode: load a previously saved plan, skip classification
     if args.plan:
         try:
