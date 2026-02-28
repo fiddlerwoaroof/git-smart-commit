@@ -2381,7 +2381,9 @@ class GitAnalyzer:
 
             try:
                 self.git(["commit", "-m", message])
-                print(f"  ✓ Committed")
+                short_hash = self.git(["rev-parse", "--short", "HEAD"]).strip()
+                print(f"  \u2192 {short_hash} {subject}", file=sys.stderr)
+                print(f"  \u2713 Committed")
             except RuntimeError as e:
                 print(f"  ! Error committing: {e}", file=sys.stderr)
                 raise
