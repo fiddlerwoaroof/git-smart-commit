@@ -508,7 +508,7 @@ class ApiConfig:
 @dataclass
 class DiffHunk:
     """A single diff hunk that can be independently staged via git apply --cached."""
-    hunk_id: str        # e.g. "src/main.py#1" (same scheme for tracked and untracked files)
+    hunk_id: str        # e.g. "src/main.py::1" (same scheme for tracked and untracked files)
     file_path: str      # repository-relative path
     patch: str          # complete patch text for git apply --cached; empty for untracked
     is_untracked: bool = False
@@ -1496,7 +1496,7 @@ class Issue(BaseModel):
 
 class Commit(BaseModel):
     subject: str = Field(description="REQUIRED. Conventional commit subject line (type(scope): desc), under 72 chars. Add '!' after the type when a breaking change is present (e.g. 'feat!(api): rename endpoint').")
-    hunks: list[str] = Field(description="REQUIRED. Hunk IDs to include in this commit, e.g. ['src/main.py#1', 'src/main.py#3']. Use ONLY the exact hunk IDs from the Available hunks list.")
+    hunks: list[str] = Field(description="REQUIRED. Hunk IDs to include in this commit, e.g. ['src/main.py::1', 'src/main.py::3']. Use ONLY the exact hunk IDs from the Available hunks list.")
     body: str = Field(default="", description="4-10 line plain-text commit body, no markdown")
     breaking_change: str = Field(default="", description="If this commit removes or renames a public API, changes a function signature incompatibly, or deletes an exported symbol, describe what broke and how callers must migrate. Leave empty if there is no breaking change.")
     issues: list[Issue] = Field(default_factory=list, description="Issues noticed in the code being committed")
@@ -1534,7 +1534,7 @@ sample_issue = Issue(
 
 sample_commit = Commit(
     subject="refactor(main): cleanup imports",
-    hunks=["main.py#1"],
+    hunks=["main.py::1"],
     body="Removed unnecessary imports to improve load time and code cleanliness.",
     issues=[sample_issue]
 )
