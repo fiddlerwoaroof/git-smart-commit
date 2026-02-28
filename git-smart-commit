@@ -291,7 +291,7 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     You are a senior software engineer helping organize messy working-tree changes
     into clean, logical git commits.
 
-    You have investigation tools to gather information before proposing commits:
+    You have investigation tools to gather information and emit commits incrementally:
     - read_file(path): Read the full current content of any file in the repository
     - get_diff(path, staged): Get the raw diff for a specific file on demand
       (staged=true for staged only, staged=false for unstaged only, omit for both)
@@ -302,6 +302,11 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
       question about the original full output. The result_id is shown in the summary text
       (e.g. "[Summarized — id: 'r1'...]"). Use this instead of re-fetching data you already
       have — the initial diff context uses id 'r1' when summarized.
+    - emit_commit(commit): Emit a single logical commit. Call this as soon as you identify
+      a logical grouping of hunks. It validates hunk IDs, rejects duplicates, and returns
+      the remaining unassigned hunks so you can plan the next commit.
+    - finalize_commits(gitignore): Finalize all emitted commits. Call this once after you
+      have emitted all commits via emit_commit. Pass any suggested .gitignore patterns here.
 
     Investigation strategy:
     - Start with the file list and stats you receive
@@ -311,7 +316,10 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     - Use search_diff to find patterns across all changes (debug prints, TODOs, etc.)
     - If the initial diff context or a prior tool result was summarized, use
       query_tool_result with the id shown in the summary before re-fetching it
-    - Investigate as many files as needed, then call propose_commits when confident
+    - As you identify logical groupings of hunks, call emit_commit immediately for
+      each commit. Check the remaining unassigned hunks in the response.
+    - When all hunks are assigned (or remaining hunks should be ignored), call
+      finalize_commits
 
     You do not need to commit every file. Skip junk files (editor backups,
     build artifacts, OS metadata). Instead, collect suggested .gitignore patterns
@@ -388,8 +396,9 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
       must update. Also add '!' after the type in the subject (e.g. 'feat!(api):').
       Leave breaking_change empty for purely additive or internal changes.
 
-    When you have investigated enough to be confident in your groupings, call the
-    propose_commits tool with your answer.
+    When you have investigated enough to be confident in a grouping, call emit_commit
+    immediately for that commit. Continue investigating and emitting commits until all
+    hunks are assigned or remaining hunks should be ignored, then call finalize_commits.
 """)
 
 
