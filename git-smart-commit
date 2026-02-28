@@ -407,7 +407,7 @@ READ_FILE_LIMIT    = 50_000   # max chars returned by the read_file tool
 CONTEXT_TRIM_THRESHOLD        = 300_000  # total message chars before summarizing old results
 TOOL_RESULT_SUMMARIZE_SKIP    = 500      # results shorter than this are never summarized
 TOOL_RESULT_SUMMARIZE_INPUT   = 20_000   # max chars fed to the summarizer model
-TURNS_WARN_AT                 = 4        # remaining turns at which to inject a commit warning
+TURNS_WARN_AT                 = 6        # remaining turns at which to inject a commit warning
 
 # When compressing old context, the *most recent* tool result is kept verbatim unless it
 # exceeds this size — the model is likely still working with it and losing detail hurts quality.
@@ -1498,6 +1498,7 @@ SAMPLE_OUTPUT = ProposeCommitsArgs(
 
 
 @tool(ProposeCommitsArgs)
+# DEPRECATED: replaced by emit_commit + finalize_commits. Kept for Commit model and SAMPLE_OUTPUT references.
 def propose_commits(result: ProposeCommitsArgs, analyzer: "GitAnalyzer") -> tuple[list[dict], list[str]]:
     """Group working-tree changes into logical commits and suggest .gitignore patterns for junk files."""
     commits = [c.model_dump() for c in result.commits]
