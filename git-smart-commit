@@ -3292,11 +3292,11 @@ def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
         if args.save_plan:
             with open(args.save_plan, "w") as f:
                 f.write(plan_json)
-        return
+        return False
 
     if args.dry_run:
         print_proposed_commits(commits, gitignore, hunk_map)
-        return
+        return False
 
     # Interactive TUI when stdout is a terminal; plain-text fallback otherwise.
     if args.yes:
