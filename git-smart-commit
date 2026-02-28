@@ -1894,7 +1894,7 @@ class GitAnalyzer:
                 is_untracked=True,
             )
 
-        return hunk_map
+        return hunk_map, staged_files
 
     def build_hunk_context(self, hunk_map: dict[str, DiffHunk]) -> str:
         """Build the initial LLM message: hunk list with inline diff content.
