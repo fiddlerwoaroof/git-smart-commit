@@ -157,12 +157,27 @@ JUNK_TEMPLATES: list[tuple[str, str, str | None, str]] = [
     (".idea/workspace.xml", "text", '<project version="4"/>\n', ".idea/"),
     (".vscode/settings.json", "text", '{"editor.formatOnSave": true}\n', ".vscode/"),
     ("dist/bundle.js.map", "binary", None, "*.map"),
-    (".env.local", "text", "NEXT_PUBLIC_API_URL=http://localhost:3000\nDEBUG=true\n", ".env.local"),
+    (
+        ".env.local",
+        "text",
+        "NEXT_PUBLIC_API_URL=http://localhost:3000\nDEBUG=true\n",
+        ".env.local",
+    ),
     ("secrets.env", "text", "API_KEY=dev_only_do_not_commit\n", "*.env"),
     ("npm-debug.log", "text", "0 verbose cli /usr/local/bin/npm\n", "npm-debug.log"),
-    ("yarn-error.log", "text", "error An unexpected error occurred.\n", "yarn-error.log"),
+    (
+        "yarn-error.log",
+        "text",
+        "error An unexpected error occurred.\n",
+        "yarn-error.log",
+    ),
     ("Thumbs.db", "binary", None, "Thumbs.db"),
-    ("desktop.ini", "text", "[.ShellClassInfo]\nIconResource=folder.ico\n", "desktop.ini"),
+    (
+        "desktop.ini",
+        "text",
+        "[.ShellClassInfo]\nIconResource=folder.ico\n",
+        "desktop.ini",
+    ),
 ]
 
 
@@ -231,12 +246,16 @@ def make_augmented(example: dict, rng: random.Random) -> dict | None:
 
 # ── SFT message construction ──────────────────────────────────────────────────
 
+
 def build_user_message(example: dict, max_diff_chars: int) -> str:
     file_list = "\n".join(f"  - {f}" for f in example["changed_files"])
     sample_json = json.dumps(SAMPLE_OUTPUT, indent=2)
     diff = example["diff"]
     if len(diff) > max_diff_chars:
-        diff = diff[:max_diff_chars] + f"\n\n... (diff truncated at {max_diff_chars} chars)"
+        diff = (
+            diff[:max_diff_chars]
+            + f"\n\n... (diff truncated at {max_diff_chars} chars)"
+        )
     return (
         f"Sample Output:\n{sample_json}\n\n"
         f"Changed files:\n{file_list}\n\n"
@@ -263,14 +282,17 @@ def example_to_sft(example: dict, max_diff_chars: int) -> dict | None:
         separators=(",", ":"),
     )
 
-    return {"messages": [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-        {"role": "assistant", "content": assistant},
-    ]}
+    return {
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": assistant},
+        ]
+    }
 
 
 # ── Stratified train/val split ────────────────────────────────────────────────
+
 
 def stratified_split(
     examples: list[dict],
@@ -316,6 +338,7 @@ def stratified_split(
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert labeled JSONL to ChatML SFT format with train/val split.",
@@ -323,35 +346,47 @@ def main() -> None:
         epilog=__doc__,
     )
     parser.add_argument(
-        "--input", default="labeled-training-data.jsonl",
+        "--input",
+        default="labeled-training-data.jsonl",
         help="Labeled JSONL from label-training-data (default: labeled-training-data.jsonl)",
     )
     parser.add_argument(
-        "--train", default="train.jsonl",
+        "--train",
+        default="train.jsonl",
         help="Output training JSONL (default: train.jsonl)",
     )
     parser.add_argument(
-        "--val", default="val.jsonl",
+        "--val",
+        default="val.jsonl",
         help="Output validation JSONL (default: val.jsonl)",
     )
     parser.add_argument(
-        "--val-fraction", type=float, default=0.1,
+        "--val-fraction",
+        type=float,
+        default=0.1,
         help="Fraction of base examples to use for validation (default: 0.1)",
     )
     parser.add_argument(
-        "--n-augment", type=int, default=1,
+        "--n-augment",
+        type=int,
+        default=1,
         help="Augmented noisy variants per clean example (default: 1, 0 to disable)",
     )
     parser.add_argument(
-        "--max-diff-chars", type=int, default=30000,
+        "--max-diff-chars",
+        type=int,
+        default=30000,
         help="Truncate diffs longer than this (default: 30000)",
     )
     parser.add_argument(
-        "--seed", type=int, default=42,
+        "--seed",
+        type=int,
+        default=42,
         help="Random seed (default: 42)",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Print stats without writing output files",
     )
     args = parser.parse_args()
@@ -371,7 +406,9 @@ def main() -> None:
             try:
                 raw.append(json.loads(line))
             except json.JSONDecodeError as e:
-                print(f"  Warning: skipping malformed line {lineno}: {e}", file=sys.stderr)
+                print(
+                    f"  Warning: skipping malformed line {lineno}: {e}", file=sys.stderr
+                )
 
     print(f"Loaded {len(raw)} labeled examples.", file=sys.stderr)
 
@@ -397,7 +434,9 @@ def main() -> None:
         # Generate augmented variants for clean (non-noisy) examples
         if args.n_augment > 0 and not ex.get("noise_injected"):
             for aug_idx in range(args.n_augment):
-                aug_ex = make_augmented(ex, random.Random(args.seed ^ (idx * 31 + aug_idx)))
+                aug_ex = make_augmented(
+                    ex, random.Random(args.seed ^ (idx * 31 + aug_idx))
+                )
                 if aug_ex is None:
                     continue
                 aug_sft = example_to_sft(aug_ex, args.max_diff_chars)
@@ -410,12 +449,17 @@ def main() -> None:
                 n_augmented += 1
 
     if n_skipped_bad_label:
-        print(f"Skipped {n_skipped_bad_label} examples with missing/malformed labels.", file=sys.stderr)
+        print(
+            f"Skipped {n_skipped_bad_label} examples with missing/malformed labels.",
+            file=sys.stderr,
+        )
     print(f"Generated {n_augmented} augmented variants.", file=sys.stderr)
     print(f"Total SFT examples: {len(sft_examples)}", file=sys.stderr)
 
     # Stratified split
-    train, val = stratified_split(sft_examples, val_fraction=args.val_fraction, seed=args.seed)
+    train, val = stratified_split(
+        sft_examples, val_fraction=args.val_fraction, seed=args.seed
+    )
 
     # Strip metadata fields before writing
     meta_keys = {"languages", "repo_url", "is_augmented"}
