@@ -564,12 +564,104 @@ class TokenUsage:
                 f"({self.prompt_tokens:,} in / {self.completion_tokens:,} out)")
 
 
+class ResponseParser:
+    """Backend-specific API response parsing.
+
+    Subclass and override get_message() for new backends.  Override
+    REASONING_FIELDS to control which response fields are checked for
+    thinking/reasoning tokens (checked in order, first non-empty wins).
+    """
+
+    REASONING_FIELDS: tuple[str, ...] = ("thinking", "reasoning", "reasoning_content")
+
+    def get_message(self, data: dict) -> dict:
+        """Extract the assistant message dict from a raw API response."""
+        raise NotImplementedError
+
+    def extract_reasoning(self, data: dict) -> str | None:
+        msg = self.get_message(data)
+        for field in self.REASONING_FIELDS:
+            value = msg.get(field)
+            if value and isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def extract_tool_call(self, data: dict) -> "ToolCall | None":
+        msg = self.get_message(data)
+        tool_calls = msg.get("tool_calls", [])
+        if tool_calls:
+            tc = tool_calls[0]
+            raw = tc["function"]["arguments"]
+            args = json.loads(raw) if isinstance(raw, str) else raw
+            return ToolCall(name=tc["function"]["name"], arguments=args,
+                            call_id=tc.get("id"))
+        return None
+
+    def extract_tool_args(self, data: dict) -> dict | None:
+        """Extract tool-call arguments, falling back to content-as-JSON."""
+        tc = self.extract_tool_call(data)
+        if tc is not None:
+            return tc.arguments
+        content = self.get_message(data).get("content", "").strip()
+        if content:
+            content = content.removeprefix("```json").removeprefix("```").strip().removesuffix("```").strip()
+            return json.loads(content)
+        return None
+
+    def extract_text(self, data: dict) -> str | None:
+        content = self.get_message(data).get("content", "").strip()
+        return content or None
+
+    def format_assistant(self, data: dict) -> dict:
+        return self.get_message(data) or {"role": "assistant", "content": ""}
+
+    def format_tool_result(self, call_id: str | None, content: str) -> dict:
+        return {"role": "tool", "content": content}
+
+    def extract_usage(self, data: dict) -> TokenUsage:
+        raise NotImplementedError
+
+
+class OllamaParser(ResponseParser):
+    """Response parser for the native Ollama /api/chat endpoint."""
+
+    def get_message(self, data: dict) -> dict:
+        return data.get("message", {})
+
+    def extract_usage(self, data: dict) -> TokenUsage:
+        return TokenUsage(
+            prompt_tokens=data.get("prompt_eval_count", 0),
+            completion_tokens=data.get("eval_count", 0),
+        )
+
+
+class OpenAIParser(ResponseParser):
+    """Response parser for OpenAI-compatible /chat/completions endpoints."""
+
+    def get_message(self, data: dict) -> dict:
+        choices = data.get("choices", [])
+        return choices[0].get("message", {}) if choices else {}
+
+    def format_tool_result(self, call_id: str | None, content: str) -> dict:
+        if call_id is not None:
+            return {"role": "tool", "tool_call_id": call_id, "content": content}
+        return {"role": "tool", "content": content}
+
+    def extract_usage(self, data: dict) -> TokenUsage:
+        usage = data.get("usage", {})
+        return TokenUsage(
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+        )
+
+
 class LLMClient:
     """Encapsulates all communication with the LLM API (Ollama or OpenAI-compatible)."""
 
     def __init__(self, config: ApiConfig):
         self.config = config
         self.usage = TokenUsage()
+        self.parser: ResponseParser = OllamaParser() if config.is_ollama else OpenAIParser()
 
     def _build_payload(self, prompt: str, tools: list[dict] | None = None,
                        stream: bool = False) -> dict:
@@ -605,29 +697,7 @@ class LLMClient:
 
     def _extract_tool_args(self, data: dict) -> dict | None:
         """Extract tool-call arguments from a response, handling both API formats."""
-        if self.config.is_ollama:
-            tool_calls = data.get("message", {}).get("tool_calls", [])
-            if tool_calls:
-                raw = tool_calls[0]["function"]["arguments"]
-                return json.loads(raw) if isinstance(raw, str) else raw
-            # Fallback: content as JSON
-            content = data.get("message", {}).get("content", "").strip()
-        else:
-            choices = data.get("choices", [])
-            if not choices:
-                return None
-            msg = choices[0].get("message", {})
-            tool_calls = msg.get("tool_calls", [])
-            if tool_calls:
-                raw = tool_calls[0]["function"]["arguments"]
-                return json.loads(raw) if isinstance(raw, str) else raw
-            content = msg.get("content", "").strip()
-
-        # Fallback: parse content as JSON (both backends)
-        if content:
-            content = content.removeprefix("```json").removeprefix("```").strip().removesuffix("```").strip()
-            return json.loads(content)
-        return None
+        return self.parser.extract_tool_args(data)
 
     def _build_payload_messages(self, messages: list[dict],
                                 tools: list[dict] | None = None,
@@ -663,88 +733,30 @@ class LLMClient:
 
     def _extract_tool_call(self, data: dict) -> ToolCall | None:
         """Extract a tool call from an API response, handling both Ollama and OpenAI formats."""
-        if self.config.is_ollama:
-            tool_calls = data.get("message", {}).get("tool_calls", [])
-            if tool_calls:
-                tc = tool_calls[0]
-                raw = tc["function"]["arguments"]
-                args = json.loads(raw) if isinstance(raw, str) else raw
-                return ToolCall(
-                    name=tc["function"]["name"],
-                    arguments=args,
-                    call_id=tc.get("id"),
-                )
-        else:
-            choices = data.get("choices", [])
-            if not choices:
-                return None
-            msg = choices[0].get("message", {})
-            tool_calls = msg.get("tool_calls", [])
-            if tool_calls:
-                tc = tool_calls[0]
-                raw = tc["function"]["arguments"]
-                args = json.loads(raw) if isinstance(raw, str) else raw
-                return ToolCall(
-                    name=tc["function"]["name"],
-                    arguments=args,
-                    call_id=tc.get("id"),
-                )
-        return None
+        return self.parser.extract_tool_call(data)
 
     def _extract_text_content(self, data: dict) -> str | None:
         """Extract plain text content from a response when no tool call is present."""
-        if self.config.is_ollama:
-            content = data.get("message", {}).get("content", "").strip()
-        else:
-            choices = data.get("choices", [])
-            if not choices:
-                return None
-            content = choices[0].get("message", {}).get("content", "").strip()
-        return content or None
+        return self.parser.extract_text(data)
 
     def _extract_reasoning(self, data: dict) -> str | None:
-        """Extract reasoning/thinking tokens from an API response if present.
-
-        Handles the two common OpenRouter formats:
-        - message.reasoning        (most thinking models)
-        - message.reasoning_content (DeepSeek-R1 style)
-        """
-        if self.config.is_ollama:
-            return None
-        choices = data.get("choices", [])
-        if not choices:
-            return None
-        msg = choices[0].get("message", {})
-        reasoning = msg.get("reasoning") or msg.get("reasoning_content")
-        return reasoning.strip() if reasoning else None
+        """Extract reasoning/thinking tokens from an API response if present."""
+        return self.parser.extract_reasoning(data)
 
     def _format_assistant_tool_call(self, data: dict) -> dict:
         """Extract the assistant message from a raw API response for conversation history.
 
         Using the raw response message guarantees the format Ollama/OpenAI expects to see back.
         """
-        if self.config.is_ollama:
-            return data.get("message", {"role": "assistant", "content": ""})
-        return data.get("choices", [{}])[0].get("message", {"role": "assistant", "content": ""})
+        return self.parser.format_assistant(data)
 
     def _format_tool_result(self, call_id: str | None, content: str) -> dict:
         """Build a tool-result message for appending to conversation history."""
-        if call_id is not None and not self.config.is_ollama:
-            return {"role": "tool", "tool_call_id": call_id, "content": content}
-        return {"role": "tool", "content": content}
+        return self.parser.format_tool_result(call_id, content)
 
     def _extract_usage(self, data: dict) -> TokenUsage:
         """Extract token usage from an API response (Ollama or OpenAI format)."""
-        if self.config.is_ollama:
-            return TokenUsage(
-                prompt_tokens=data.get("prompt_eval_count", 0),
-                completion_tokens=data.get("eval_count", 0),
-            )
-        usage = data.get("usage", {})
-        return TokenUsage(
-            prompt_tokens=usage.get("prompt_tokens", 0),
-            completion_tokens=usage.get("completion_tokens", 0),
-        )
+        return self.parser.extract_usage(data)
 
     def call(self, prompt: str, num_ctx: int | None = None) -> str:
         """Call the LLM with streaming and return the assistant message text."""
@@ -1394,20 +1406,58 @@ def propose_commits(result: ProposeCommitsArgs, analyzer: "GitAnalyzer") -> tupl
     if not commits:
         raise ValueError("Model returned no valid commit groups.")
 
-    # Validate that all referenced hunk IDs actually exist
+    # Mend unknown hunk IDs: try to match by file path, then warn/reject
     hunk_map = getattr(analyzer, '_hunk_map', None)
     if hunk_map is not None:
+        valid_ids = set(hunk_map.keys())
+        # Build file→hunks index for fuzzy matching
+        file_to_hunks: dict[str, list[str]] = {}
+        for hid in valid_ids:
+            fpath = hid.rsplit("#", 1)[0] if "#" in hid else hid
+            file_to_hunks.setdefault(fpath, []).append(hid)
+
+        mended: dict[str, str] = {}
+        for c in commits:
+            for hid in c.get("hunks", []):
+                if hid in valid_ids or hid in mended:
+                    continue
+                # Try to find the intended hunk by file path
+                if "#" in hid:
+                    base_path = hid.rsplit("#", 1)[0]
+                    candidates = file_to_hunks.get(base_path, [])
+                    if len(candidates) == 1:
+                        mended[hid] = candidates[0]
+                    elif candidates:
+                        # Multiple hunks for file — try closest index
+                        try:
+                            idx = int(hid.rsplit("#", 1)[1])
+                            closest = min(candidates,
+                                          key=lambda k: abs(int(k.rsplit("#", 1)[1]) - idx))
+                            mended[hid] = closest
+                        except (ValueError, IndexError):
+                            pass
+
+        # Apply corrections
+        if mended:
+            for old, new in sorted(mended.items()):
+                _log(f"  {_ansi('~', _ANSI_DIM)} mended hunk ID {old!r} → {new!r}")
+            for c in commits:
+                c["hunks"] = [mended.get(h, h) for h in c.get("hunks", [])]
+
+        # Re-check: reject only if EVERY referenced hunk is still invalid
         all_referenced: set[str] = set()
         for c in commits:
             all_referenced.update(c.get("hunks", []))
-        unknown = all_referenced - set(hunk_map.keys())
-        if unknown:
-            available = sorted(hunk_map.keys())
+        still_unknown = all_referenced - valid_ids
+        still_valid = all_referenced & valid_ids
+        if still_unknown and not still_valid:
             raise ValueError(
-                f"Unknown hunk IDs: {sorted(unknown)}. "
-                f"You MUST use ONLY the exact hunk IDs from the Available hunks list. "
-                f"Valid IDs are: {available}"
+                f"ALL hunk IDs are invalid: {sorted(still_unknown)}. "
+                f"Valid IDs are: {sorted(valid_ids)}"
             )
+        if still_unknown:
+            _log(f"  {_ansi('!', _ANSI_DIM)} {len(still_unknown)} unknown hunk(s) "
+                 f"will be skipped: {sorted(still_unknown)}")
 
     commits = analyzer.merge_overlapping_commits(commits)
     return commits, result.gitignore
