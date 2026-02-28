@@ -700,6 +700,8 @@ class LLMClient:
         self._http = httpx.Client(
             timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0),
         )
+        self.last_result_store: dict[str, str] = {}
+        self.last_messages: list[dict] = []
 
     # -- resource management ---------------------------------------------------
 
@@ -1159,6 +1161,8 @@ class LLMClient:
             if tool_call.name == terminal_name:
                 try:
                     validated = terminal_model.model_validate(raw_args).post_process()
+                    self.last_result_store = dict(result_store)
+                    self.last_messages = list(messages)
                     return terminal_tool(validated, **kwargs)
                 except ValidationError as e:
                     err_str = (
@@ -1226,6 +1230,8 @@ class LLMClient:
                     "content": warning_text,
                 })
 
+        self.last_result_store = dict(result_store)
+        self.last_messages = list(messages)
         raise RuntimeError(
             f"agentic_loop exceeded {max_turns} turns without calling {terminal_name}"
         )
@@ -3238,6 +3244,32 @@ def _main_body(client: LLMClient, repo: Path, args, issue_patterns) -> None:
                       file=sys.stderr)
 
 
+def _persist_plan_to_temp(commits, gitignore, hunk_map, analyzer=None):
+    """Write plan, context, and result_store to a temp directory for debugging/replay."""
+    try:
+        plan_dir = tempfile.mkdtemp(prefix="gsc-plan-")
+        hunk_patches = {hid: dh.patch for hid, dh in hunk_map.items() if not dh.is_untracked}
+        plan_data = {
+            "commits": commits,
+            "gitignore": gitignore,
+            "hunk_patches": hunk_patches,
+        }
+        with open(os.path.join(plan_dir, "plan.json"), "w") as f:
+            json.dump(plan_data, f, indent=2, default=str)
+
+        if analyzer is not None:
+            # Persist conversation context from the agentic loop
+            with open(os.path.join(plan_dir, "context.json"), "w") as f:
+                json.dump(analyzer.client.last_messages, f, indent=2, default=str)
+            # Persist the result_store (compressed tool results)
+            with open(os.path.join(plan_dir, "result_store.json"), "w") as f:
+                json.dump(analyzer.client.last_result_store, f, indent=2, default=str)
+
+        print(f"Plan persisted to: {plan_dir}", file=sys.stderr)
+    except Exception as e:
+        print(f"Warning: could not persist plan: {e}", file=sys.stderr)
+
+
 def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
     """Returns True if commits were executed, False otherwise."""
     # Plan replay mode: load a previously saved plan, skip classification
@@ -3258,6 +3290,7 @@ def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
                 hunk_map[hunk_id] = DiffHunk(
                     hunk_id=hunk_id, file_path=fpath, patch=patch
                 )
+        _persist_plan_to_temp(commits, gitignore, hunk_map)
         if args.dry_run:
             print_proposed_commits(commits, gitignore, hunk_map)
             return False
@@ -3294,6 +3327,8 @@ def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
     usage = analyzer.client.usage
     if usage.total_tokens > 0:
         _log(f"  {_ansi(str(usage), _ANSI_DIM)}")
+
+    _persist_plan_to_temp(commits, gitignore, hunk_map, analyzer=analyzer)
 
     # JSON mode: dump plan (including patches for self-contained replay) and exit
     if args.json_out:
@@ -3332,6 +3367,7 @@ def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
                 usage = analyzer.client.usage
                 if usage.total_tokens > 0:
                     _log(f"  {_ansi(str(usage), _ANSI_DIM)}")
+                _persist_plan_to_temp(commits, gitignore, hunk_map, analyzer=analyzer)
                 continue
             commits = result
             break
