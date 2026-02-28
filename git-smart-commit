@@ -1036,6 +1036,13 @@ class LLMClient:
                         f"{terminal_name} again.",
                     ))
                     continue
+                except ValueError as e:
+                    messages.append(self._format_tool_result(
+                        tool_call.call_id,
+                        f"Error: {e}\nPlease fix the arguments and call "
+                        f"{terminal_name} again.",
+                    ))
+                    continue
 
             tool_fn = extended_registry.get(tool_call.name)
             if tool_fn is None:
@@ -1387,6 +1394,21 @@ def propose_commits(result: ProposeCommitsArgs, analyzer: "GitAnalyzer") -> tupl
     if not commits:
         raise ValueError("Model returned no valid commit groups.")
 
+    # Validate that all referenced hunk IDs actually exist
+    hunk_map = getattr(analyzer, '_hunk_map', None)
+    if hunk_map is not None:
+        all_referenced: set[str] = set()
+        for c in commits:
+            all_referenced.update(c.get("hunks", []))
+        unknown = all_referenced - set(hunk_map.keys())
+        if unknown:
+            available = sorted(hunk_map.keys())
+            raise ValueError(
+                f"Unknown hunk IDs: {sorted(unknown)}. "
+                f"You MUST use ONLY the exact hunk IDs from the Available hunks list. "
+                f"Valid IDs are: {available}"
+            )
+
     commits = analyzer.merge_overlapping_commits(commits)
     return commits, result.gitignore
 
@@ -1634,10 +1656,11 @@ class GitAnalyzer:
                     patch=patch,
                 )
 
-        # Untracked (new) files are staged whole via git add — use #0 suffix
+        # Untracked (new) files are staged whole via git add — use #1 suffix
+        # (consistent with tracked-file 1-based indexing so LLMs don't mis-reference)
         untracked = self.git(["ls-files", "--others", "--exclude-standard"]).splitlines()
         for fpath in untracked:
-            hunk_id = f"{fpath}#0"
+            hunk_id = f"{fpath}#1"
             hunk_map[hunk_id] = DiffHunk(
                 hunk_id=hunk_id,
                 file_path=fpath,
@@ -1805,6 +1828,7 @@ class GitAnalyzer:
 
         Returns (commits, gitignore_patterns).
         """
+        self._hunk_map = hunk_map   # expose for validation in propose_commits
         hunk_context = self.build_hunk_context(hunk_map)
 
         critique_section = ""
@@ -1973,13 +1997,23 @@ class GitAnalyzer:
             # Group hunk IDs by file path (preserving order)
             by_file: dict[str, list[DiffHunk]] = {}
             untracked_paths: list[str] = []
+            untracked_seen: set[str] = set()
             for hid in hunk_ids:
                 dh = hunk_map.get(hid)
+                if dh is None and "#" in hid:
+                    # Fallback: LLM may have used wrong index for an untracked file
+                    base_path = hid.rsplit("#", 1)[0]
+                    fallback = f"{base_path}#1"
+                    if fallback in hunk_map and hunk_map[fallback].is_untracked:
+                        dh = hunk_map[fallback]
+                        print(f"  ~ Remapped {hid!r} → {fallback!r} (untracked file)", file=sys.stderr)
                 if dh is None:
                     print(f"  ! Unknown hunk {hid!r}, skipping", file=sys.stderr)
                     continue
                 if dh.is_untracked:
-                    untracked_paths.append(dh.file_path)
+                    if dh.file_path not in untracked_seen:
+                        untracked_seen.add(dh.file_path)
+                        untracked_paths.append(dh.file_path)
                 else:
                     by_file.setdefault(dh.file_path, []).append(dh)
 
