@@ -1727,7 +1727,7 @@ class GitAnalyzer:
                 {hunk}
             """)
 
-            summary = self.client.call(prompt, num_ctx=HUNK_SUMMARIZE_CTX)
+            summary = self.client.call(prompt)
             hunk_summaries.append(summary.strip())
 
         print()
