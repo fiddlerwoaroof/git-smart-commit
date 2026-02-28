@@ -943,7 +943,7 @@ class LLMClient:
 
                 Answer concisely and directly based only on the content above.
             """)
-            return self.call(prompt, num_ctx=HUNK_SUMMARIZE_CTX)
+            return self.call(prompt)
 
         # ── build extended registry that includes query_tool_result ─────────────
         extended_registry = dict(tool_registry)
