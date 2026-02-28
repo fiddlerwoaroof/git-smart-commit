@@ -868,7 +868,7 @@ class LLMClient:
 
                 {content[:TOOL_RESULT_SUMMARIZE_INPUT]}
             """)
-            summary = self.call(prompt, num_ctx=HUNK_SUMMARIZE_CTX)
+            summary = self.call(prompt)
             return (
                 f"[Summarized — id: '{result_id}'. "
                 f"Use query_tool_result to ask specific questions about the full output.]\n"
