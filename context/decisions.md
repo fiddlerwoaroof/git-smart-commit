@@ -43,3 +43,26 @@
 **Rationale:** The original `_TOOL_REGISTRY` dict was populated but never read — all dispatch went through `fn._tool_spec` and `fn._tool_model` attributes. Removing it simplifies the code with no behavioral change.
 
 All tool functions accept `**kwargs` forwarded from the loop, with `analyzer: GitAnalyzer` being the primary context object passed through.
+
+## steropes Extraction (gsc-2fj, gsc-7eo, gsc-03f, gsc-bx8)
+
+**Decision:** Extract the general-purpose LLM agent framework from `git-smart-commit` into a separate package called `steropes`.
+
+**Rationale:** The script contained ~700 lines of reusable LLM infrastructure (client, tool system, parsers, context management) intertwined with git-commit-specific logic. Extracting it enables reuse for other agent-based tools.
+
+**Package structure:** `src/steropes-pkg/steropes/` with modules:
+- `text.py` — `wrap_markdown`, `_wrap_line_preserving_inline`
+- `config.py` — `AgentConfig` (tuning constants), `ApiConfig` (connection config, no hardcoded defaults)
+- `types.py` — `ToolCall`, `TokenUsage` dataclasses
+- `tools.py` — `@tool` decorator, `_summarize_args`, `_total_message_chars`
+- `parsers.py` — `ResponseParser`, `OllamaParser`, `OpenAIParser`
+- `client.py` — `LLMClient` (call, call_with_tool, agentic_loop), `QueryResultArgs`
+- `ui.py` — `ansi()`, `log()`, `log_reasoning()`, ANSI constants
+
+**Key design decisions:**
+- `AgentConfig` dataclass replaces module-level tuning constants; `LLMClient` reads from it
+- `ApiConfig` is parameterized (no hardcoded OLLAMA_BASE_URL/DEFAULT_MODEL); app provides values
+- `LLMClient.__init__` accepts `log_fn` and `log_reasoning_fn` callbacks so the app controls output (e.g. respecting `--quiet`)
+- `QueryResultArgs` moved to framework since it's integral to `agentic_loop`'s context management
+- steropes depends only on `httpx` and `pydantic`; no git, subprocess, or textual
+- Symlink support: script resolves its real path via `Path(__file__).resolve()` to find the local steropes package
