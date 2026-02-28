@@ -2212,6 +2212,12 @@ def print_proposed_commits(commits: list[dict], gitignore: list[str],
 
 # ── Textual TUI ────────────────────────────────────────────────────────────────
 
+@dataclass
+class _Reclassify:
+    """Signal returned by the TUI / text-mode to trigger a fresh classification."""
+    critique: str
+
+
 def _build_commit_markup(commit: dict, hunk_map: dict | None, index: int, total: int) -> str:
     """Build a Rich markup string for the commit detail panel."""
     from rich.markup import escape as esc
@@ -2350,16 +2356,18 @@ def _run_text_confirmation(
 ) -> list[dict] | None:
     """Interactive text-mode confirmation loop (used when stdout is not a TTY)."""
     HELP = (
-        "  y          — proceed with commits as shown\n"
-        "  n / q      — cancel\n"
-        "  e <N>      — open $EDITOR for commit N's full message\n"
-        "  m <A> <B>  — merge commits A and B (keeps A's subject)\n"
-        "  ?          — show this help\n"
+        "  y              — proceed with commits as shown\n"
+        "  n / q          — cancel\n"
+        "  e <N>          — open $EDITOR for commit N's full message\n"
+        "  m <A> <B>      — merge commits A and B (keeps A's subject)\n"
+        "  d <N>          — delete commit N (hunks remain unstaged)\n"
+        "  r <critique>   — re-classify with critique and re-show plan\n"
+        "  ?              — show this help\n"
     )
     while True:
         print_proposed_commits(commits, gitignore, hunk_map)
         print()
-        print("Commands: y=proceed  n=cancel  e <N>=edit  m <A> <B>=merge  ?=help")
+        print("Commands: y=proceed  n=cancel  e <N>=edit  m <A> <B>=merge  d <N>=delete  r <critique>=re-classify  ?=help")
         try:
             answer = input("> ").strip()
         except (KeyboardInterrupt, EOFError):
@@ -2411,6 +2419,29 @@ def _run_text_confirmation(
             commits = _merge_two_commits(commits, a, b)
             print(f"Merged commits {a + 1} and {b + 1}.")
             continue
+
+        if parts and parts[0] == "d" and len(parts) == 2:
+            try:
+                n = int(parts[1]) - 1
+            except ValueError:
+                print("Usage: d <N>  (e.g. d 2)")
+                continue
+            if len(commits) <= 1:
+                print("Cannot delete the only commit.")
+                continue
+            if not (0 <= n < len(commits)):
+                print(f"Commit {n + 1} does not exist (1–{len(commits)}).")
+                continue
+            commits.pop(n)
+            print(f"Deleted commit {n + 1} (hunks remain unstaged).")
+            continue
+
+        if parts and parts[0] == "r":
+            critique = " ".join(parts[1:]).strip()
+            if not critique:
+                print("Usage: r <critique>  (e.g. r put the test changes in a separate commit)")
+                continue
+            return _Reclassify(critique=critique)
 
         print("Unknown command — type ? for help.")
 
@@ -2464,7 +2495,35 @@ def _run_confirm_tui(
         def action_dismiss_none(self) -> None:
             self.dismiss(None)
 
-    class _App(App[list[dict] | None]):
+    class _CritiqueModal(ModalScreen[str | None]):
+        """Modal dialog for entering a re-classification critique."""
+
+        DEFAULT_CSS = """
+        _CritiqueModal { align: center middle; }
+        _CritiqueModal > Vertical {
+            width: 76; height: auto;
+            border: double $warning; padding: 1 2; background: $surface;
+        }
+        """
+
+        BINDINGS = [Binding("escape", "dismiss_none", "Cancel", priority=True)]
+
+        def compose(self) -> ComposeResult:
+            with Vertical():
+                yield Label("Re-classify with critique:")
+                yield Input(placeholder="e.g. put the test changes in a separate commit", id="critique-input")
+                yield Label("[dim]Enter to submit · Esc to cancel[/dim]", markup=True)
+
+        def on_mount(self) -> None:
+            self.query_one(Input).focus()
+
+        def on_input_submitted(self, event: Input.Submitted) -> None:
+            self.dismiss(event.value.strip() or None)
+
+        def action_dismiss_none(self) -> None:
+            self.dismiss(None)
+
+    class _App(App[list[dict] | _Reclassify | None]):
         """Two-panel TUI: commit list on the left, details on the right."""
 
         TITLE = "git-smart-commit — review proposed commits"
@@ -2479,14 +2538,16 @@ def _run_confirm_tui(
         """
 
         BINDINGS = [
-            Binding("y", "confirm",      "Proceed",      priority=True),
-            Binding("n", "cancel",       "Cancel",       priority=True),
-            Binding("q", "cancel",       "Quit",         priority=True),
-            Binding("e", "edit_subject", "Edit subject"),
-            Binding("E", "edit_message", "Edit message ($EDITOR)"),
-            Binding("m", "merge_next",   "Merge ↓"),
-            Binding("k", "cursor_up",    "",             show=False),
-            Binding("j", "cursor_down",  "",             show=False),
+            Binding("y", "confirm",        "Proceed",      priority=True),
+            Binding("n", "cancel",         "Cancel",       priority=True),
+            Binding("q", "cancel",         "Quit",         priority=True),
+            Binding("e", "edit_subject",   "Edit subject"),
+            Binding("E", "edit_message",   "Edit message ($EDITOR)"),
+            Binding("m", "merge_next",     "Merge ↓"),
+            Binding("d", "delete_commit",  "Delete"),
+            Binding("r", "reclassify",     "Re-classify"),
+            Binding("k", "cursor_up",      "",             show=False),
+            Binding("j", "cursor_down",    "",             show=False),
         ]
 
         def __init__(
@@ -2500,6 +2561,7 @@ def _run_confirm_tui(
             self._gitignore = gitignore_patterns
             self._hunk_map  = hunk_map
             self._sel       = 0          # plain int — no reactive watcher needed
+            self._list_gen  = 0          # bumped on each rebuild to avoid duplicate IDs
 
         # ── layout ───────────────────────────────────────────────────────────
 
@@ -2509,7 +2571,7 @@ def _run_confirm_tui(
                 with Vertical(id="sidebar"):
                     with ListView(id="list"):
                         for i in range(len(self._commits)):
-                            yield ListItem(Label(self._label(i)), id=f"ci-{i}")
+                            yield ListItem(Label(self._label(i)), id=f"ci-{self._list_gen}-{i}")
                 # Initialise detail with the first commit so no on_mount needed.
                 init = (
                     _build_commit_markup(
@@ -2533,7 +2595,7 @@ def _run_confirm_tui(
             old, self._sel = self._sel, idx
             for i in (old, idx):
                 try:
-                    self.query_one(f"#ci-{i}", ListItem).query_one(Label).update(
+                    self.query_one(f"#ci-{self._list_gen}-{i}", ListItem).query_one(Label).update(
                         self._label(i)
                     )
                 except Exception:
@@ -2553,7 +2615,7 @@ def _run_confirm_tui(
             if event.item is None:
                 return
             try:
-                idx = int(event.item.id.split("-", 1)[1])
+                idx = int(event.item.id.split("-")[-1])
             except Exception:
                 return
             if idx != self._sel:
@@ -2587,7 +2649,7 @@ def _run_confirm_tui(
                     return
                 self._commits[idx]["subject"] = new_subject
                 try:
-                    self.query_one(f"#ci-{idx}", ListItem).query_one(Label).update(
+                    self.query_one(f"#ci-{self._list_gen}-{idx}", ListItem).query_one(Label).update(
                         self._label(idx)
                     )
                     self.query_one("#detail", Static).update(
@@ -2613,7 +2675,7 @@ def _run_confirm_tui(
             if result:
                 self._commits = _apply_editor_result(self._commits, idx, result)
                 try:
-                    self.query_one(f"#ci-{idx}", ListItem).query_one(Label).update(
+                    self.query_one(f"#ci-{self._list_gen}-{idx}", ListItem).query_one(Label).update(
                         self._label(idx)
                     )
                     self.query_one("#detail", Static).update(
@@ -2626,11 +2688,16 @@ def _run_confirm_tui(
                     pass
 
         def _rebuild_list(self) -> None:
-            """Repopulate the sidebar list after the commit list changes."""
+            """Repopulate the sidebar list after the commit list changes.
+
+            lv.clear() schedules removal asynchronously, so we bump _list_gen
+            to ensure newly mounted items always get fresh unique IDs.
+            """
+            self._list_gen += 1
             lv = self.query_one("#list", ListView)
             lv.clear()
             for i in range(len(self._commits)):
-                lv.mount(ListItem(Label(self._label(i)), id=f"ci-{i}"))
+                lv.mount(ListItem(Label(self._label(i)), id=f"ci-{self._list_gen}-{i}"))
 
         def action_merge_next(self) -> None:
             """Merge the selected commit with the next one."""
@@ -2648,6 +2715,31 @@ def _run_confirm_tui(
                         self._sel + 1, len(self._commits),
                     )
                 )
+
+        def action_delete_commit(self) -> None:
+            """Drop the selected commit (its hunks remain unstaged)."""
+            if len(self._commits) <= 1:
+                self.notify("Cannot delete the only commit", severity="warning")
+                return
+            idx = self._sel
+            self._commits.pop(idx)
+            self._sel = min(idx, len(self._commits) - 1)
+            self._rebuild_list()
+            if self._commits:
+                self.query_one("#detail", Static).update(
+                    _build_commit_markup(
+                        self._commits[self._sel], self._hunk_map,
+                        self._sel + 1, len(self._commits),
+                    )
+                )
+            self.notify(f"Commit {idx + 1} deleted — hunks remain unstaged")
+
+        def action_reclassify(self) -> None:
+            """Prompt for a critique and re-run the LLM classifier."""
+            def _submit(critique: str | None) -> None:
+                if critique:
+                    self.exit(_Reclassify(critique=critique))
+            self.push_screen(_CritiqueModal(), _submit)
 
     return _App(commits, gitignore, hunk_map).run()
 
@@ -2832,17 +2924,26 @@ def main() -> None:
     # Interactive TUI when stdout is a terminal; plain-text fallback otherwise.
     if args.yes:
         print_proposed_commits(commits, gitignore, hunk_map)
-    elif sys.stdout.isatty():
-        result = _run_confirm_tui(commits, gitignore, hunk_map)
-        if result is None:
-            print("Cancelled.")
-            return
-        commits = result
     else:
-        result = _run_text_confirmation(commits, gitignore, hunk_map)
-        if result is None:
-            return
-        commits = result
+        while True:
+            if sys.stdout.isatty():
+                result = _run_confirm_tui(commits, gitignore, hunk_map)
+            else:
+                result = _run_text_confirmation(commits, gitignore, hunk_map)
+            if result is None:
+                print("Cancelled.")
+                return
+            if isinstance(result, _Reclassify):
+                _log(f"Re-classifying with critique: {result.critique!r}…")
+                commits, gitignore = analyzer.classify_changes(
+                    hunk_map, critique=result.critique, issue_patterns=issue_patterns or None
+                )
+                usage = analyzer.client.usage
+                if usage.total_tokens > 0:
+                    _log(f"  {_ansi(str(usage), _ANSI_DIM)}")
+                continue
+            commits = result
+            break
 
     analyzer.execute_commits(commits, hunk_map)
     analyzer.update_gitignore(gitignore, yes=args.yes)
