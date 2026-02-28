@@ -308,6 +308,17 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     - finalize_commits(gitignore): Finalize all emitted commits. Call this once after you
       have emitted all commits via emit_commit. Pass any suggested .gitignore patterns here.
 
+    ## Context management
+    Tool results are automatically summarized when they exceed a size threshold.
+    You will see a header like: [Summarized — id: 'rN'. Use query_tool_result to retrieve original content]
+    followed by a compact summary.
+
+    Key rules:
+    - Do NOT re-request content via read_file after seeing a summary. Use query_tool_result(result_id) instead.
+    - Summary IDs (like 'r5') are stable and can be queried multiple times.
+    - query_tool_result returns the full original content for any summarized result.
+    - Plan your investigation to minimize re-reads: extract what you need from summaries first.
+
     Investigation strategy:
     - Start with the file list and stats you receive
     - Use get_git_log early to learn this project's commit style conventions
