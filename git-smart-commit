@@ -2305,10 +2305,10 @@ class GitAnalyzer:
             binary_seen: set[str] = set()
             for hid in hunk_ids:
                 dh = hunk_map.get(hid)
-                if dh is None and "#" in hid:
+                if dh is None and "::" in hid:
                     # Fallback: LLM may have used wrong index for an untracked file
-                    base_path = hid.rsplit("#", 1)[0]
-                    fallback = f"{base_path}#1"
+                    base_path = hid.rsplit("::", 1)[0]
+                    fallback = f"{base_path}::1"
                     if fallback in hunk_map and hunk_map[fallback].is_untracked:
                         dh = hunk_map[fallback]
                         print(f"  ~ Remapped {hid!r} → {fallback!r} (untracked file)", file=sys.stderr)
