@@ -398,7 +398,6 @@ DEFAULT_MODEL = "gpt-oss:20b"
 
 DIFF_CHARS_PER_FILE = 6000    # files larger than this get hunk-summarized
 DIFF_TOTAL_CHARS   = 120000   # hard cap on total context sent to classifier
-HUNK_SUMMARIZE_CTX = 8192     # smaller context for summarization calls (faster)
 PRIOR_HUNK_WINDOW  = 4        # how many previous hunk summaries to include as context
 
 MAX_AGENTIC_TURNS     = 20    # base safeguard for the agentic investigation loop
