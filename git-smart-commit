@@ -891,6 +891,7 @@ class LLMClient:
     def agentic_loop(self, system_prompt: str, initial_user_message: str,
                      tool_registry: dict[str, Callable],
                      terminal_tool: Callable, max_turns: int = MAX_AGENTIC_TURNS,
+                     countdown_message_fn: Callable | None = None,
                      **kwargs) -> Any:
         """Run a multi-turn agentic loop until the terminal tool is called.
 
@@ -1165,13 +1166,17 @@ class LLMClient:
             # Inject a countdown warning when few turns remain so the model
             # knows it must call the terminal tool soon.
             if 0 < turns_remaining <= TURNS_WARN_AT:
-                messages.append({
-                    "role": "user",
-                    "content": (
+                if countdown_message_fn is not None:
+                    warning_text = countdown_message_fn(turns_remaining)
+                else:
+                    warning_text = (
                         f"WARNING: Only {turns_remaining} turn(s) remaining. "
                         f"Stop gathering context and call {terminal_name} NOW with "
                         f"your best grouping based on what you already know."
-                    ),
+                    )
+                messages.append({
+                    "role": "user",
+                    "content": warning_text,
                 })
 
         raise RuntimeError(
@@ -2081,12 +2086,35 @@ class GitAnalyzer:
         if max_turns > MAX_AGENTIC_TURNS:
             _log(f"  {_ansi(f'[{n_hunks} hunks — up to {max_turns} turns]', _ANSI_DIM)}")
 
+        # ── countdown closure: context-aware warning based on emission state ──
+        all_hunk_ids = set(hunk_map.keys())
+
+        def _countdown_message(turns_remaining: int) -> str:
+            if not emitted_commits:
+                return (
+                    f"WARNING: Only {turns_remaining} turn(s) remaining. "
+                    f"You are running low on turns. Start emitting commits "
+                    f"with emit_commit, then call finalize_commits."
+                )
+            remaining_hunks = all_hunk_ids - emitted_hunks
+            if remaining_hunks:
+                return (
+                    f"WARNING: Only {turns_remaining} turn(s) remaining. "
+                    f"{len(remaining_hunks)} hunks still unassigned. "
+                    f"Emit remaining commits or call finalize_commits NOW."
+                )
+            return (
+                f"WARNING: Only {turns_remaining} turn(s) remaining. "
+                f"All hunks assigned. Call finalize_commits NOW."
+            )
+
         return self.client.agentic_loop(
             system_prompt=system_prompt,
             initial_user_message=initial_message,
             tool_registry=tool_registry,
             terminal_tool=finalize_commits,
             max_turns=max_turns,
+            countdown_message_fn=_countdown_message,
             analyzer=self,
         )
 
