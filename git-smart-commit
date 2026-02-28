@@ -250,6 +250,12 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     - You CAN split a file across multiple commits by assigning different hunks
       from that file to different commits. Prefer splitting when hunks are unrelated.
     - Keep related hunks together (same feature, same module, same concern).
+    - Prefer fewer, cohesive commits over many tiny ones. A typical changeset
+      should produce 2-5 commits. A single conceptual change that touches
+      multiple locations should be ONE commit, not one commit per edit site.
+    - Do NOT create separate commits for each individual edit to the same
+      logical change. For example, renaming a delimiter across 10 call sites
+      is one refactor commit, not 10.
     - Dependency/lockfile changes belong with the commit that caused them.
     - Test files belong with the code they test.
     - Use strict conventional commit format:
@@ -302,9 +308,9 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
       question about the original full output. The result_id is shown in the summary text
       (e.g. "[Summarized — id: 'r1'...]"). Use this instead of re-fetching data you already
       have — the initial diff context uses id 'r1' when summarized.
-    - emit_commit(commit): Emit a single logical commit. Call this as soon as you identify
-      a logical grouping of hunks. It validates hunk IDs, rejects duplicates, and returns
-      the remaining unassigned hunks so you can plan the next commit.
+    - emit_commit(commit): Emit a single logical commit. It validates hunk IDs, rejects
+      duplicates, and returns the remaining unassigned hunks so you can plan the next commit.
+      You do NOT need to emit immediately — investigate first to build a holistic picture.
     - finalize_commits(gitignore): Finalize all emitted commits. Call this once after you
       have emitted all commits via emit_commit. Pass any suggested .gitignore patterns here.
 
@@ -327,10 +333,11 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     - Use search_diff to find patterns across all changes (debug prints, TODOs, etc.)
     - If the initial diff context or a prior tool result was summarized, use
       query_tool_result with the id shown in the summary before re-fetching it
-    - As you identify logical groupings of hunks, call emit_commit immediately for
-      each commit. Check the remaining unassigned hunks in the response.
-    - When all hunks are assigned (or remaining hunks should be ignored), call
-      finalize_commits
+    - Investigate before committing: explore the changes to understand the full picture
+      before emitting any commits. It is fine to delay emit_commit until you have a
+      clear mental model of how the changes relate to each other.
+    - When you are confident in a grouping, call emit_commit. Check the remaining
+      unassigned hunks in the response and continue until done, then call finalize_commits.
 
     You do not need to commit every file. Skip junk files (editor backups,
     build artifacts, OS metadata). Instead, collect suggested .gitignore patterns
@@ -377,6 +384,12 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     - You CAN split a file across multiple commits by assigning different hunks
       from that file to different commits. Prefer splitting when hunks are unrelated.
     - Keep related hunks together (same feature, same module, same concern).
+    - Prefer fewer, cohesive commits over many tiny ones. A typical changeset
+      should produce 2-5 commits. A single conceptual change that touches
+      multiple locations should be ONE commit, not one commit per edit site.
+    - Do NOT create separate commits for each individual edit to the same
+      logical change. For example, renaming a delimiter across 10 call sites
+      is one refactor commit, not 10.
     - Dependency/lockfile changes belong with the commit that caused them.
     - Test files belong with the code they test.
     - Use strict conventional commit format:
@@ -407,9 +420,10 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
       must update. Also add '!' after the type in the subject (e.g. 'feat!(api):').
       Leave breaking_change empty for purely additive or internal changes.
 
-    When you have investigated enough to be confident in a grouping, call emit_commit
-    immediately for that commit. Continue investigating and emitting commits until all
-    hunks are assigned or remaining hunks should be ignored, then call finalize_commits.
+    Investigate the changes thoroughly before emitting commits. Once you have a clear
+    picture of how the changes relate, emit commits for each logical grouping. Continue
+    until all hunks are assigned or remaining hunks should be ignored, then call
+    finalize_commits.
 """)
 
 
