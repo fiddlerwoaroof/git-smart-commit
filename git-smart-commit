@@ -1072,17 +1072,25 @@ class LLMClient:
                     validated = terminal_model.model_validate(raw_args).post_process()
                     return terminal_tool(validated, **kwargs)
                 except ValidationError as e:
-                    messages.append(self._format_tool_result(
-                        tool_call.call_id,
+                    err_str = (
                         f"Validation error: {e}\nPlease fix the arguments and call "
-                        f"{terminal_name} again.",
+                        f"{terminal_name} again."
+                    )
+                    if len(err_str) > TOOL_RESULT_SUMMARIZE_SKIP:
+                        err_str = _summarize_and_store(len(messages), err_str)
+                    messages.append(self._format_tool_result(
+                        tool_call.call_id, err_str,
                     ))
                     continue
                 except ValueError as e:
-                    messages.append(self._format_tool_result(
-                        tool_call.call_id,
+                    err_str = (
                         f"Error: {e}\nPlease fix the arguments and call "
-                        f"{terminal_name} again.",
+                        f"{terminal_name} again."
+                    )
+                    if len(err_str) > TOOL_RESULT_SUMMARIZE_SKIP:
+                        err_str = _summarize_and_store(len(messages), err_str)
+                    messages.append(self._format_tool_result(
+                        tool_call.call_id, err_str,
                     ))
                     continue
 
@@ -1097,6 +1105,12 @@ class LLMClient:
                     result_str = result if isinstance(result, str) else json.dumps(result)
                 except Exception as e:
                     result_str = f"Error calling {tool_call.name}: {e}"
+
+            # Proactive summarization: summarize large tool results immediately
+            # so the LLM works from compact summaries and can drill down via
+            # query_tool_result. _trim_with_summaries remains as a safety net.
+            if len(result_str) > TOOL_RESULT_SUMMARIZE_SKIP:
+                result_str = _summarize_and_store(len(messages), result_str)
 
             messages.append(self._format_tool_result(tool_call.call_id, result_str))
 
