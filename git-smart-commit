@@ -1840,15 +1840,15 @@ class GitAnalyzer:
                 files.append(f)
         return files
 
-    def collect_hunks(self) -> dict[str, DiffHunk]:
+    def collect_hunks(self) -> tuple[dict[str, DiffHunk], list[str]]:
         """Collect all diff hunks from the working tree, indexed by hunk ID.
 
         Any currently staged changes are first unstaged (git reset HEAD) so that
         everything is treated uniformly as unstaged working-tree changes.  This is
         safe: working-tree content is never modified.
 
-        Returns a dict mapping hunk_id → DiffHunk.  Hunk IDs for unstaged changes
-        look like "path/file.py#1"; untracked new files use "path/file.py#1".
+        Returns a tuple of (hunk_map, staged_files) where hunk_map maps
+        hunk_id → DiffHunk and staged_files lists files that were originally staged.
         """
         hunk_map: dict[str, DiffHunk] = {}
 
