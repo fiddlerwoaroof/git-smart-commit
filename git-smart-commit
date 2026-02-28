@@ -246,7 +246,7 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     Rules:
     - CRITICAL: Tool calls must use JSON for arguments. Other formats will result in failure. In particular, strings must be surrounded by double-quotes (") and if one occurs literally, escape with backslashes.
     - Changes are represented as individual diff hunks, each identified by an ID
-      like "src/main.py#1". Untracked (new) files also use "filepath#1".
+      like "src/main.py::1". Untracked (new) files also use "filepath::1".
     - You CAN split a file across multiple commits by assigning different hunks
       from that file to different commits. Prefer splitting when hunks are unrelated.
     - Keep related hunks together (same feature, same module, same concern).
@@ -362,7 +362,7 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     Rules:
     - CRITICAL: Tool calls must use JSON for arguments. Other formats will result in failure. In particular, strings must be surrounded by double-quotes (") and if one occurs literally, escape with backslashes.
     - Changes are represented as individual diff hunks, each identified by an ID
-      like "src/main.py#1". Untracked (new) files also use "filepath#1".
+      like "src/main.py::1". Untracked (new) files also use "filepath::1".
     - You CAN split a file across multiple commits by assigning different hunks
       from that file to different commits. Prefer splitting when hunks are unrelated.
     - Keep related hunks together (same feature, same module, same concern).
