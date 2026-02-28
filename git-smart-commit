@@ -1865,7 +1865,7 @@ class GitAnalyzer:
                 continue
             # Detect binary files: create a single hunk with is_binary=True
             if _is_binary_diff(diff):
-                hunk_id = f"{fpath}#1"
+                hunk_id = f"{fpath}::1"
                 hunk_map[hunk_id] = DiffHunk(
                     hunk_id=hunk_id,
                     file_path=fpath,
@@ -1875,7 +1875,7 @@ class GitAnalyzer:
                 continue
             file_hunks = split_hunks(diff)
             for i, patch in enumerate(file_hunks, 1):
-                hunk_id = f"{fpath}#{i}"
+                hunk_id = f"{fpath}::{i}"
                 hunk_map[hunk_id] = DiffHunk(
                     hunk_id=hunk_id,
                     file_path=fpath,
