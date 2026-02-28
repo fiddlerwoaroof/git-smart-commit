@@ -3240,34 +3240,34 @@ def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
         for hunk_id, patch in plan.get("hunk_patches", {}).items():
             if hunk_id not in hunk_map:
                 # Best-effort: reconstruct a DiffHunk from the saved patch
-                fpath = hunk_id.rsplit("#", 1)[0] if "#" in hunk_id else hunk_id
+                fpath = hunk_id.rsplit("::", 1)[0] if "::" in hunk_id else hunk_id
                 hunk_map[hunk_id] = DiffHunk(
                     hunk_id=hunk_id, file_path=fpath, patch=patch
                 )
         if args.dry_run:
             print_proposed_commits(commits, gitignore, hunk_map)
-            return
+            return False
         if args.yes:
             print_proposed_commits(commits, gitignore, hunk_map)
         elif sys.stdout.isatty():
             result = _run_confirm_tui(commits, gitignore, hunk_map)
             if result is None:
                 print("Cancelled.")
-                return
+                return False
             commits = result
         else:
             print_proposed_commits(commits, gitignore, hunk_map)
             try:
                 answer = input("Proceed with these commits? [y/N] ").strip().lower()
             except (KeyboardInterrupt, EOFError):
-                return
+                return False
             if answer not in ("y", "yes"):
                 print("Cancelled.")
-                return
+                return False
         analyzer.execute_commits(commits, hunk_map)
         analyzer.update_gitignore(gitignore, yes=args.yes)
         print("\nDone.")
-        return
+        return True
 
     n_files = len({dh.file_path for dh in hunk_map.values()})
     n_hunks = len(hunk_map)
