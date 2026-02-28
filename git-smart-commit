@@ -48,6 +48,7 @@ from typing import Any, Callable
 
 import argparse
 import ast
+import datetime
 import getpass
 import httpx
 import json
@@ -1159,6 +1160,8 @@ class LLMClient:
             if tool_call.name == terminal_name:
                 try:
                     validated = terminal_model.model_validate(raw_args).post_process()
+                    self._last_messages = list(messages)
+                    self._last_result_store = dict(result_store)
                     return terminal_tool(validated, **kwargs)
                 except ValidationError as e:
                     err_str = (
@@ -1226,6 +1229,8 @@ class LLMClient:
                     "content": warning_text,
                 })
 
+        self._last_messages = list(messages)
+        self._last_result_store = dict(result_store)
         raise RuntimeError(
             f"agentic_loop exceeded {max_turns} turns without calling {terminal_name}"
         )
@@ -3153,6 +3158,10 @@ def main() -> None:
         "--setup", action="store_true",
         help="Run the interactive configuration wizard and exit.",
     )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Save the full LLM conversation history and tool results to a JSON file for debugging.",
+    )
 
     args = parser.parse_args()
     global _QUIET
@@ -3240,6 +3249,19 @@ def _main_body(client: LLMClient, repo: Path, args, issue_patterns) -> None:
                       file=sys.stderr)
 
 
+def _dump_debug(client: LLMClient) -> None:
+    """Write the last agentic loop conversation and result store to a debug file."""
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    debug_path = Path(tempfile.gettempdir()) / f"gsc-debug-{ts}.json"
+    data = {
+        "timestamp": ts,
+        "messages": getattr(client, "_last_messages", []),
+        "result_store": getattr(client, "_last_result_store", {}),
+    }
+    debug_path.write_text(json.dumps(data, indent=2, default=str))
+    print(f"Debug conversation saved to {debug_path}", file=sys.stderr)
+
+
 def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
     """Returns True if commits were executed, False otherwise."""
     # Plan replay mode: load a previously saved plan, skip classification
@@ -3293,6 +3315,9 @@ def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
         hunk_map, critique=args.critique, issue_patterns=issue_patterns or None
     )
 
+    if args.debug:
+        _dump_debug(analyzer.client)
+
     usage = analyzer.client.usage
     if usage.total_tokens > 0:
         _log(f"  {_ansi(str(usage), _ANSI_DIM)}")
@@ -3331,6 +3356,8 @@ def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
                 commits, gitignore = analyzer.classify_changes(
                     hunk_map, critique=result.critique, issue_patterns=issue_patterns or None
                 )
+                if args.debug:
+                    _dump_debug(analyzer.client)
                 usage = analyzer.client.usage
                 if usage.total_tokens > 0:
                     _log(f"  {_ansi(str(usage), _ANSI_DIM)}")
