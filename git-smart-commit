@@ -871,21 +871,51 @@ class LLMClient:
         result_store: dict[str, str] = {}  # result_id → original full content
 
         def _summarize_and_store(msg_idx: int, content: str) -> str:
-            """Summarize a tool result via LLM, store the original, return summary."""
+            """Summarize a tool result via LLM with three-level escalation.
+
+            Level 1 -- Normal: 2-4 sentence summary preserving suspicious code.
+            Level 2 -- Aggressive: max 3 bullet points if Level 1 didn't shrink.
+            Level 3 -- Deterministic truncate: 512-char hard cut, no LLM call.
+
+            The original content is always stored in result_store so
+            query_tool_result can retrieve it later.
+            """
             result_id = f"r{msg_idx}"
             result_store[result_id] = content
-            prompt = textwrap.dedent(f"""\
+            header = (
+                f"[Summarized — id: '{result_id}'. "
+                f"Use query_tool_result to ask specific questions about the full output.]\n"
+            )
+            input_snippet = content[:TOOL_RESULT_SUMMARIZE_INPUT]
+
+            # Level 1 — Normal summary
+            prompt_l1 = textwrap.dedent(f"""\
                 Summarize this tool output in 2-4 sentences. Focus on filenames,
                 key changes, and any suspicious code. Preserve suspicious code verbatim.
 
-                {content[:TOOL_RESULT_SUMMARIZE_INPUT]}
+                {input_snippet}
             """)
-            summary = self.call(prompt)
-            return (
-                f"[Summarized — id: '{result_id}'. "
-                f"Use query_tool_result to ask specific questions about the full output.]\n"
-                f"{summary.strip()}"
-            )
+            summary_l1 = self.call(prompt_l1).strip()
+            if len(summary_l1) < len(content):
+                _log(f"  {_ansi('⋯', _ANSI_DIM)} summarization level 1 (normal) succeeded for #{msg_idx}")
+                return header + summary_l1
+
+            # Level 2 — Aggressive bullet points (target half the tokens)
+            prompt_l2 = textwrap.dedent(f"""\
+                Compress this to bullet points. Maximum 3 bullets, one line each.
+                Preserve file names and key identifiers only.
+
+                {input_snippet}
+            """)
+            summary_l2 = self.call(prompt_l2).strip()
+            if len(summary_l2) < len(content):
+                _log(f"  {_ansi('⋯', _ANSI_DIM)} summarization level 2 (aggressive) succeeded for #{msg_idx}")
+                return header + summary_l2
+
+            # Level 3 — Deterministic truncate (always reduces size)
+            _log(f"  {_ansi('⋯', _ANSI_DIM)} summarization level 3 (deterministic truncate) for #{msg_idx}")
+            truncated = content[:512] + "\n[Truncated — use query_tool_result for full content]"
+            return header + truncated
 
         def _trim_with_summaries(messages: list[dict]) -> None:
             """Summarize oldest large messages until total context is under threshold.
@@ -1381,6 +1411,19 @@ class ProposeCommitsArgs(BaseModel):
         self.commits = [commit.post_process() for commit in self.commits]
         return self
 
+class EmitCommitArgs(BaseModel):
+    commit: Commit = Field(description="REQUIRED. A single logical commit to emit")
+
+    def post_process(self):
+        self.commit = self.commit.post_process()
+        return self
+
+class FinalizeCommitsArgs(BaseModel):
+    gitignore: list[str] = Field(default_factory=list, description="Suggested .gitignore patterns for junk files")
+
+    def post_process(self):
+        return self
+
 sample_issue = Issue(
     message="Unused import 'os' on line 1",
     path="main.py"
@@ -1661,6 +1704,25 @@ class GitAnalyzer:
     def git(self, args: list[str]) -> str:
         return _git(args, self.repo)
 
+    def check_git_state(self) -> None:
+        """Detect in-progress merge, rebase, or cherry-pick and abort early."""
+        git_dir = self.repo / ".git"
+        checks = [
+            (git_dir / "MERGE_HEAD", "merge"),
+            (git_dir / "REBASE_HEAD", "rebase"),
+            (git_dir / "rebase-merge", "rebase"),
+            (git_dir / "rebase-apply", "rebase"),
+            (git_dir / "CHERRY_PICK_HEAD", "cherry-pick"),
+        ]
+        for path, operation in checks:
+            if path.exists():
+                print(
+                    f"Error: a {operation} is currently in progress. "
+                    f"Please complete or abort it before running git-smart-commit.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
     def get_changed_files(self) -> list[str]:
         """Return list of files with unstaged or staged changes."""
         staged = self.git(["diff", "--cached", "--name-only"]).splitlines()
@@ -1851,8 +1913,9 @@ class GitAnalyzer:
 
     def _read_file(self, path: str) -> str:
         """Read a repo file, rejecting path traversal and truncating large files."""
+        resolved_repo = self.repo.resolve()
         target = (self.repo / path).resolve()
-        if not str(target).startswith(str(self.repo) + os.sep) and target != self.repo:
+        if target == resolved_repo or not str(target).startswith(str(resolved_repo) + os.sep):
             return f"[error: path traversal rejected for '{path}']"
         if not target.exists():
             return f"[file not found: {path}]"
@@ -2925,6 +2988,7 @@ def main() -> None:
     )
     client = LLMClient(api_config)
     analyzer = GitAnalyzer(repo, client)
+    analyzer.check_git_state()
 
     # Collect hunks (unstages staged files first so everything is uniform)
     _log("Scanning for changes…")
