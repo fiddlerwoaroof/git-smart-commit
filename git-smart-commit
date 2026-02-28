@@ -501,6 +501,7 @@ class DiffHunk:
     file_path: str      # repository-relative path
     patch: str          # complete patch text for git apply --cached; empty for untracked
     is_untracked: bool = False
+    is_binary: bool = False
 
 
 @dataclass
@@ -1435,6 +1436,16 @@ def run_setup_wizard(repo: Path | None) -> None:
     print()
 
 
+def _is_binary_diff(diff_text: str) -> bool:
+    """Return True if the diff text represents a binary file change."""
+    for line in diff_text.splitlines():
+        if line.startswith("Binary files ") and line.endswith(" differ"):
+            return True
+        if line.startswith("GIT binary patch"):
+            return True
+    return False
+
+
 def split_hunks(diff_text: str) -> list[str]:
     """Split a unified diff into individual hunks (each starting with @@)."""
     lines = diff_text.splitlines(keepends=True)
@@ -1841,6 +1852,16 @@ class GitAnalyzer:
             diff = self.git(["diff", "--no-color", "--no-ext-diff", "--", fpath])
             if not diff.strip():
                 continue
+            # Detect binary files: create a single hunk with is_binary=True
+            if _is_binary_diff(diff):
+                hunk_id = f"{fpath}#1"
+                hunk_map[hunk_id] = DiffHunk(
+                    hunk_id=hunk_id,
+                    file_path=fpath,
+                    patch="",
+                    is_binary=True,
+                )
+                continue
             file_hunks = split_hunks(diff)
             for i, patch in enumerate(file_hunks, 1):
                 hunk_id = f"{fpath}#{i}"
@@ -1878,6 +1899,8 @@ class GitAnalyzer:
         for hunk_id, dh in hunk_map.items():
             if dh.is_untracked:
                 hunk_list_lines.append(f"  {hunk_id}  (new untracked file)")
+            elif dh.is_binary:
+                hunk_list_lines.append(f"  {hunk_id}  [binary file]")
             else:
                 adds = dh.patch.count("\n+") - dh.patch.count("\n+++")
                 dels = dh.patch.count("\n-") - dh.patch.count("\n---")
@@ -1890,6 +1913,9 @@ class GitAnalyzer:
             if dh.is_untracked:
                 diff_parts.append(f"--- {hunk_id} ---\n(new untracked file — no diff)")
                 total_chars += 50
+            elif dh.is_binary:
+                diff_parts.append(f"--- {hunk_id} ---\n[binary file]")
+                total_chars += 30
             elif len(dh.patch) <= DIFF_CHARS_PER_FILE:
                 diff_parts.append(f"--- {hunk_id} ---\n{dh.patch}")
                 total_chars += len(dh.patch)
@@ -2264,6 +2290,8 @@ class GitAnalyzer:
             by_file: dict[str, list[DiffHunk]] = {}
             untracked_paths: list[str] = []
             untracked_seen: set[str] = set()
+            binary_paths: list[str] = []
+            binary_seen: set[str] = set()
             for hid in hunk_ids:
                 dh = hunk_map.get(hid)
                 if dh is None and "#" in hid:
@@ -2280,6 +2308,10 @@ class GitAnalyzer:
                     if dh.file_path not in untracked_seen:
                         untracked_seen.add(dh.file_path)
                         untracked_paths.append(dh.file_path)
+                elif dh.is_binary:
+                    if dh.file_path not in binary_seen:
+                        binary_seen.add(dh.file_path)
+                        binary_paths.append(dh.file_path)
                 else:
                     by_file.setdefault(dh.file_path, []).append(dh)
 
@@ -2299,6 +2331,14 @@ class GitAnalyzer:
                     print(f"  ! Could not apply patch for {fpath}: {e}", file=sys.stderr)
                 finally:
                     os.unlink(patch_file)
+
+            # Add binary files whole (can't use git apply for binary content)
+            for fpath in binary_paths:
+                try:
+                    self.git(["add", "--", fpath])
+                    print(f"  + {fpath} (binary file)")
+                except RuntimeError as e:
+                    print(f"  ! Could not add {fpath}: {e}", file=sys.stderr)
 
             # Add untracked (new) files whole
             for fpath in untracked_paths:
