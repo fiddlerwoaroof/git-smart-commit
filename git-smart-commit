@@ -1944,6 +1944,52 @@ class GitAnalyzer:
         self._hunk_map = hunk_map   # expose for validation in propose_commits
         hunk_context = self.build_hunk_context(hunk_map)
 
+        # ── Local state for incremental commit emission ────────────────────────
+        emitted_commits: list[dict] = []
+        emitted_hunks: set[str] = set()
+
+        # ── emit_commit: closure over emitted_commits/emitted_hunks/hunk_map ──
+        @tool(EmitCommitArgs)
+        def emit_commit(args: EmitCommitArgs, **_: Any) -> str:
+            """Emit a single logical commit. Call once per commit as you identify groupings.
+
+            Validates hunk IDs, prevents duplicates, and returns remaining
+            unassigned hunks so you can plan the next commit.
+            """
+            # Validate hunk IDs against known hunks
+            for hid in args.commit.hunks:
+                if hid not in hunk_map:
+                    return (
+                        f"Error: unknown hunk ID {hid!r}. "
+                        f"Valid IDs are: {sorted(hunk_map.keys())}"
+                    )
+
+            # Check for hunks already emitted in a previous commit
+            for hid in args.commit.hunks:
+                if hid in emitted_hunks:
+                    return (
+                        f"Error: hunk {hid!r} was already assigned to a previous commit. "
+                        f"Each hunk can only appear in one commit."
+                    )
+
+            args.post_process()
+            commit_dict = args.commit.model_dump()
+            emitted_commits.append(commit_dict)
+            emitted_hunks.update(args.commit.hunks)
+
+            remaining = set(hunk_map.keys()) - emitted_hunks
+            return f"Commit emitted: '{args.commit.subject}'. Remaining unassigned hunks: {sorted(remaining)}"
+
+        # ── finalize_commits: terminal tool closure ───────────────────────────
+        @tool(FinalizeCommitsArgs)
+        def finalize_commits(args: FinalizeCommitsArgs, **_: Any) -> tuple:
+            """Finalize all emitted commits. Call after emitting all commits via emit_commit."""
+            if not emitted_commits:
+                raise ValueError("No commits have been emitted yet. Use emit_commit first.")
+            args.post_process()
+            merged = self.merge_overlapping_commits(emitted_commits)
+            return (merged, args.gitignore)
+
         critique_section = ""
         if critique:
             critique_section = (
@@ -1959,6 +2005,8 @@ class GitAnalyzer:
             "get_diff": get_diff,
             "get_git_log": get_git_log,
             "search_diff": search_diff,
+            "emit_commit": emit_commit,
+            "propose_commits": propose_commits,
         }
 
         # Build system prompt, appending any project-specific issue patterns
@@ -1982,7 +2030,7 @@ class GitAnalyzer:
             system_prompt=system_prompt,
             initial_user_message=initial_message,
             tool_registry=tool_registry,
-            terminal_tool=propose_commits,
+            terminal_tool=finalize_commits,
             max_turns=max_turns,
             analyzer=self,
         )
