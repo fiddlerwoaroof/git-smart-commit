@@ -3309,7 +3309,7 @@ def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
                 result = _run_text_confirmation(commits, gitignore, hunk_map)
             if result is None:
                 print("Cancelled.")
-                return
+                return False
             if isinstance(result, _Reclassify):
                 _log(f"Re-classifying with critique: {result.critique!r}…")
                 commits, gitignore = analyzer.classify_changes(
@@ -3325,6 +3325,7 @@ def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
     analyzer.execute_commits(commits, hunk_map)
     analyzer.update_gitignore(gitignore, yes=args.yes)
     print("\nDone.")
+    return True
 
 
 if __name__ == "__main__":
