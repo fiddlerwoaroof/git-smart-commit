@@ -1569,17 +1569,17 @@ def propose_commits(result: ProposeCommitsArgs, analyzer: "GitAnalyzer") -> tupl
                 if hid in valid_ids or hid in mended:
                     continue
                 # Try to find the intended hunk by file path
-                if "#" in hid:
-                    base_path = hid.rsplit("#", 1)[0]
+                if "::" in hid:
+                    base_path = hid.rsplit("::", 1)[0]
                     candidates = file_to_hunks.get(base_path, [])
                     if len(candidates) == 1:
                         mended[hid] = candidates[0]
                     elif candidates:
                         # Multiple hunks for file — try closest index
                         try:
-                            idx = int(hid.rsplit("#", 1)[1])
+                            idx = int(hid.rsplit("::", 1)[1])
                             closest = min(candidates,
-                                          key=lambda k: abs(int(k.rsplit("#", 1)[1]) - idx))
+                                          key=lambda k: abs(int(k.rsplit("::", 1)[1]) - idx))
                             mended[hid] = closest
                         except (ValueError, IndexError):
                             pass
