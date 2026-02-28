@@ -297,10 +297,11 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
       (staged=true for staged only, staged=false for unstaged only, omit for both)
     - get_git_log(n): Get the last n commit subjects to learn this project's conventions
     - search_diff(pattern, context_lines): Search all diffs for a regex pattern
-    - query_tool_result(result_id, question): When a previous tool result was summarized
-      to save context, use this to ask a targeted question about the original full output.
-      The result_id is shown in the summary (e.g. "r5"). Use this instead of re-fetching
-      a diff or file you already retrieved but whose details were compressed away.
+    - query_tool_result(result_id, question): When any prior content (the initial diff
+      context or a tool result) was summarized to save context, use this to ask a targeted
+      question about the original full output. The result_id is shown in the summary text
+      (e.g. "[Summarized — id: 'r1'...]"). Use this instead of re-fetching data you already
+      have — the initial diff context uses id 'r1' when summarized.
 
     Investigation strategy:
     - Start with the file list and stats you receive
@@ -308,7 +309,8 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     - Use get_diff on files whose grouping is unclear from stats alone
     - Use read_file when you need full file context (imports, class structure, etc.)
     - Use search_diff to find patterns across all changes (debug prints, TODOs, etc.)
-    - If a prior result was summarized, use query_tool_result before re-fetching it
+    - If the initial diff context or a prior tool result was summarized, use
+      query_tool_result with the id shown in the summary before re-fetching it
     - Investigate as many files as needed, then call propose_commits when confident
 
     You do not need to commit every file. Skip junk files (editor backups,
@@ -403,10 +405,17 @@ MAX_AGENTIC_TURNS     = 20    # base safeguard for the agentic investigation loo
 MAX_AGENTIC_TURNS_CAP = 50    # absolute ceiling when scaling with hunk count
 READ_FILE_LIMIT    = 50_000   # max chars returned by the read_file tool
 
-CONTEXT_TRIM_THRESHOLD       = 300_000  # total message chars before summarizing old results
-TOOL_RESULT_SUMMARIZE_SKIP   = 500      # results shorter than this are never summarized
-TOOL_RESULT_SUMMARIZE_INPUT  = 20_000   # max chars fed to the summarizer model
-TURNS_WARN_AT                = 4        # remaining turns at which to inject a commit warning
+CONTEXT_TRIM_THRESHOLD        = 300_000  # total message chars before summarizing old results
+TOOL_RESULT_SUMMARIZE_SKIP    = 500      # results shorter than this are never summarized
+TOOL_RESULT_SUMMARIZE_INPUT   = 20_000   # max chars fed to the summarizer model
+TURNS_WARN_AT                 = 4        # remaining turns at which to inject a commit warning
+
+# When compressing old context, the *most recent* tool result is kept verbatim unless it
+# exceeds this size — the model is likely still working with it and losing detail hurts quality.
+RECENT_TOOL_RESULT_CHARS      = 10_000
+
+# Ollama runs locally; a much lower trim threshold prevents timeouts from huge prompts.
+OLLAMA_CONTEXT_TRIM_THRESHOLD = 20_000
 
 # Preset backends for the setup wizard
 SETUP_BACKENDS = [
@@ -466,6 +475,15 @@ class ApiConfig:
         if self.api_key:
             return {"Authorization": f"Bearer {self.api_key}"}
         return {}
+
+    @property
+    def context_trim_threshold(self) -> int:
+        """Total message chars at which old content starts being summarised.
+
+        Ollama runs locally and is slow; trigger compression much earlier so that
+        the prompt sent to the model stays well within a size it can handle quickly.
+        """
+        return OLLAMA_CONTEXT_TRIM_THRESHOLD if self.is_ollama else CONTEXT_TRIM_THRESHOLD
 
 
 @dataclass
@@ -859,21 +877,47 @@ class LLMClient:
             )
 
         def _trim_with_summaries(messages: list[dict]) -> None:
-            """Summarize oldest large tool results until total context is under threshold."""
+            """Summarize oldest large messages until total context is under threshold.
+
+            Compresses (oldest first):
+            - The initial diff context (messages[1], role=user) when it's large.
+            - Tool results, skipping the most recent one unless it exceeds
+              RECENT_TOOL_RESULT_CHARS — the model is likely still using it.
+
+            All compressed content is stored in result_store so query_tool_result
+            can answer targeted questions without losing any information.
+            """
+            threshold = self.config.context_trim_threshold
+            # Index of the most recent tool message — kept verbatim if small
+            last_tool_idx = max(
+                (i for i, m in enumerate(messages) if m.get("role") == "tool"),
+                default=-1,
+            )
             for i, msg in enumerate(messages):
-                if _total_message_chars(messages) <= CONTEXT_TRIM_THRESHOLD:
+                if _total_message_chars(messages) <= threshold:
                     break
-                if msg.get("role") != "tool":
-                    continue
+                role = msg.get("role")
                 content = msg.get("content", "")
                 if not isinstance(content, str):
                     continue
-                if content.startswith("[Summarized"):  # already summarized
+                if content.startswith("[Summarized"):  # already compressed
                     continue
-                if len(content) <= TOOL_RESULT_SUMMARIZE_SKIP:
-                    continue
-                _log(f"  {_ansi('⋯', _ANSI_DIM)} compressing old result #{i} ({len(content):,} chars)")
-                messages[i] = {**msg, "content": _summarize_and_store(i, content)}
+
+                if role == "tool":
+                    # Protect the most recent tool result so the model can act on it
+                    if i == last_tool_idx and len(content) <= RECENT_TOOL_RESULT_CHARS:
+                        continue
+                    if len(content) <= TOOL_RESULT_SUMMARIZE_SKIP:
+                        continue
+                    _log(f"  {_ansi('⋯', _ANSI_DIM)} compressing tool result #{i} ({len(content):,} chars)")
+                    messages[i] = {**msg, "content": _summarize_and_store(i, content)}
+
+                elif role == "user" and i == 1:
+                    # The initial diff context message — also compressible when large
+                    if len(content) <= TOOL_RESULT_SUMMARIZE_SKIP:
+                        continue
+                    _log(f"  {_ansi('⋯', _ANSI_DIM)} compressing initial diff context ({len(content):,} chars)")
+                    messages[i] = {**msg, "content": _summarize_and_store(i, content)}
 
         # ── query_tool_result: closure over result_store and self ───────────────
         @tool(QueryResultArgs)
@@ -1008,10 +1052,10 @@ class LLMClient:
 
             messages.append(self._format_tool_result(tool_call.call_id, result_str))
 
-            # Context management: when messages are large, summarize old tool results
-            # with the LLM and store originals for query_tool_result access.
+            # Context management: when messages are large, summarize old content
+            # (diffs and tool results) and store originals for query_tool_result.
             total_chars = _total_message_chars(messages)
-            if total_chars > CONTEXT_TRIM_THRESHOLD:
+            if total_chars > self.config.context_trim_threshold:
                 _log(f"  {_ansi('⋯', _ANSI_DIM)} context {total_chars:,} chars — compressing old results")
                 _trim_with_summaries(messages)
 
