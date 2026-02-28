@@ -43,156 +43,54 @@ Config file: .smart-commit.toml in the repo root
 """
 
 from pathlib import Path
+
+import sys
+
+# Resolve the real script path (follows symlinks) so that the local steropes
+# package is found regardless of how the script is invoked (direct or symlink).
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_STEROPES_PKG = _SCRIPT_DIR / "src" / "steropes-pkg"
+if _STEROPES_PKG.is_dir() and str(_STEROPES_PKG) not in sys.path:
+    sys.path.insert(0, str(_STEROPES_PKG))
+
 from pydantic import BaseModel, Field, ValidationError
 from typing import Any, Callable
 
 import argparse
-import ast
 import datetime
 import getpass
-import httpx
 import json
 import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import textwrap
 from dataclasses import dataclass, field
 
-
-def wrap_markdown(text: str, width: int = 80) -> str:
-    """Wrap text at width, preserving markdown structure.
-
-    - Code blocks (```) are not wrapped
-    - Inline code (`...`) within a line is preserved
-    - List items wrap with a hanging indent; continuation lines (indented to
-      at least the marker end) are wrapped with the same indent
-    - Blockquotes are preserved with the correct continuation prefix
-    - Regular paragraphs preserve their leading indent on continuation lines
-    """
-    if not text:
-        return text
-
-    lines = text.split('\n')
-    result = []
-    in_code_block = False
-    # Number of leading spaces that mark a list continuation line; None when
-    # we are not inside a list item.
-    list_continuation_indent: int | None = None
-
-    for line in lines:
-        stripped = line.lstrip()
-        indent = len(line) - len(stripped)
-
-        # Code block fence toggles verbatim mode
-        if stripped.startswith('```'):
-            in_code_block = not in_code_block
-            list_continuation_indent = None
-            result.append(line)
-            continue
-
-        if in_code_block:
-            result.append(line)
-            continue
-
-        # Blank line resets list state
-        if not stripped:
-            list_continuation_indent = None
-            result.append(line)
-            continue
-
-        # New list item
-        list_match = re.match(r'^(\s*)([-*+]|\d+\.)\s+', line)
-        if list_match:
-            marker_end = list_match.end()
-            list_continuation_indent = marker_end
-            content = line[marker_end:]
-            wrapped_content = _wrap_line_preserving_inline(content, width - marker_end)
-            wrapped_lines = wrapped_content.split('\n')
-            result.append(line[:marker_end] + wrapped_lines[0])
-            for wrapped_line in wrapped_lines[1:]:
-                result.append(' ' * marker_end + wrapped_line)
-            continue
-
-        # List continuation line: indented to at least the marker position
-        if list_continuation_indent is not None and indent >= list_continuation_indent:
-            cont_prefix = ' ' * indent
-            wrapped_content = _wrap_line_preserving_inline(stripped, width - indent)
-            wrapped_lines = wrapped_content.split('\n')
-            result.append(cont_prefix + wrapped_lines[0])
-            for wrapped_line in wrapped_lines[1:]:
-                result.append(cont_prefix + wrapped_line)
-            continue
-
-        # Not a list continuation — reset list state
-        list_continuation_indent = None
-
-        # Blockquote
-        if stripped.startswith('>'):
-            quote_match = re.match(r'^(\s*)(>+\s?)', line)
-            if quote_match:
-                full_prefix = quote_match.group(1) + quote_match.group(2)
-                content = line[len(full_prefix):]
-                wrapped_content = _wrap_line_preserving_inline(content, width - len(full_prefix))
-                wrapped_lines = wrapped_content.split('\n')
-                result.append(full_prefix + wrapped_lines[0])
-                for wrapped_line in wrapped_lines[1:]:
-                    result.append(full_prefix + wrapped_line)
-                continue
-
-        # Regular paragraph — preserve leading indent on all continuation lines
-        cont_prefix = ' ' * indent
-        wrapped_content = _wrap_line_preserving_inline(stripped, width - indent)
-        wrapped_lines = wrapped_content.split('\n')
-        result.append(cont_prefix + wrapped_lines[0])
-        for wrapped_line in wrapped_lines[1:]:
-            result.append(cont_prefix + wrapped_line)
-
-    return '\n'.join(result)
-
-
-def _wrap_line_preserving_inline(text: str, width: int) -> str:
-    """Wrap a line while preserving inline code spans."""
-    if len(text) <= width:
-        return text
-
-    # Split on inline code to preserve it
-    parts = re.split(r'(`[^`]+`)', text)
-    lines = []
-    current_line = ''
-
-    for part in parts:
-        if not part:
-            continue
-        if part.startswith('`') and part.endswith('`'):
-            # Inline code - add to current line if it fits, else start new line
-            if current_line and len(current_line) + 1 + len(part) > width:
-                lines.append(current_line.rstrip())
-                current_line = part
-            else:
-                if current_line:
-                    current_line += ' '
-                current_line += part
-        else:
-            # Regular text - wrap it
-            words = part.split(' ')
-            for word in words:
-                if not word:
-                    continue
-                if current_line and len(current_line) + 1 + len(word) > width:
-                    lines.append(current_line.rstrip())
-                    current_line = word
-                else:
-                    if current_line:
-                        current_line += ' '
-                    current_line += word
-
-    if current_line:
-        lines.append(current_line.rstrip())
-
-    return '\n'.join(lines)
+from steropes import (
+    AgentConfig,
+    ApiConfig,
+    LLMClient,
+    QueryResultArgs,
+    TokenUsage,
+    ToolCall,
+    tool,
+    wrap_markdown,
+)
+from steropes.tools import _summarize_args, _total_message_chars
+from steropes.ui import (
+    ANSI_BOLD,
+    ANSI_CYAN,
+    ANSI_DIM,
+    ANSI_GREEN,
+    ANSI_RED,
+    ANSI_RESET,
+    ANSI_YELLOW,
+    ansi as _ansi,
+    log as _default_log,
+    log_reasoning as _default_log_reasoning,
+)
 
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -485,42 +383,6 @@ SETUP_BACKENDS = [
 
 
 @dataclass
-class ApiConfig:
-    """API connection and model configuration."""
-    base_url: str = OLLAMA_BASE_URL
-    model: str = DEFAULT_MODEL
-    api_key: str | None = None
-    num_ctx: int = 128000
-
-    @property
-    def is_ollama(self) -> bool:
-        """True when targeting a native Ollama endpoint (not OpenAI-compatible)."""
-        # OpenAI-compatible APIs use /v1 in the path; Ollama doesn't.
-        return "/v1" not in self.base_url
-
-    @property
-    def chat_url(self) -> str:
-        if self.is_ollama:
-            return f"{self.base_url}/api/chat"
-        return f"{self.base_url}/chat/completions"
-
-    @property
-    def auth_headers(self) -> dict[str, str]:
-        if self.api_key:
-            return {"Authorization": f"Bearer {self.api_key}"}
-        return {}
-
-    @property
-    def context_trim_threshold(self) -> int:
-        """Total message chars at which old content starts being summarised.
-
-        Ollama runs locally and is slow; trigger compression much earlier so that
-        the prompt sent to the model stays well within a size it can handle quickly.
-        """
-        return OLLAMA_CONTEXT_TRIM_THRESHOLD if self.is_ollama else CONTEXT_TRIM_THRESHOLD
-
-
-@dataclass
 class DiffHunk:
     """A single diff hunk that can be independently staged via git apply --cached."""
     hunk_id: str        # e.g. "src/main.py::1" (same scheme for tracked and untracked files)
@@ -530,712 +392,6 @@ class DiffHunk:
     is_binary: bool = False
 
 
-@dataclass
-class ToolCall:
-    """Represents a tool call extracted from an LLM response."""
-    name: str
-    arguments: dict
-    call_id: str | None = None
-
-
-# ── Tool decorator ─────────────────────────────────────────────────────────────
-#
-# Defining a new tool:
-#   1. Define argument types as pydantic BaseModel subclasses
-#   2. Define a top-level args model (also a BaseModel) for the tool
-#   3. Decorate a function with @tool(ArgsModel)
-#
-# Schema generation, validation, and parsing are all handled automatically.
-
-def tool(args_model: type[BaseModel]):
-    """Decorator factory. @tool(MyArgsModel) attaches LLM tool metadata to a function."""
-    def decorator(fn: Callable) -> Callable:
-        spec = {
-            "type": "function",
-            "function": {
-                "name": fn.__name__,
-                "description": (fn.__doc__ or "").strip(),
-                "parameters": args_model.model_json_schema(),
-            },
-        }
-        fn._tool_spec = spec
-        fn._tool_model = args_model
-        return fn
-    return decorator
-
-
-def _summarize_args(arguments: dict, max_len: int = 80) -> str:
-    """Return a compact one-line summary of tool call arguments for logging."""
-    raw = json.dumps(arguments, separators=(",", ":"))
-    if len(raw) <= max_len:
-        return raw
-    return raw[:max_len - 3] + "..."
-
-
-def _total_message_chars(messages: list[dict]) -> int:
-    """Count total characters across all message content fields."""
-    return sum(len(str(m.get("content", "") or "")) for m in messages)
-
-
-# ── LLM client ────────────────────────────────────────────────────────────────
-
-@dataclass
-class TokenUsage:
-    """Accumulated token usage across all API calls in a session."""
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-
-    def __add__(self, other: "TokenUsage") -> "TokenUsage":
-        return TokenUsage(
-            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
-            completion_tokens=self.completion_tokens + other.completion_tokens,
-        )
-
-    @property
-    def total_tokens(self) -> int:
-        return self.prompt_tokens + self.completion_tokens
-
-    def __str__(self) -> str:
-        return (f"{self.total_tokens:,} tokens "
-                f"({self.prompt_tokens:,} in / {self.completion_tokens:,} out)")
-
-
-class ResponseParser:
-    """Backend-specific API response parsing.
-
-    Subclass and override get_message() for new backends.  Override
-    REASONING_FIELDS to control which response fields are checked for
-    thinking/reasoning tokens (checked in order, first non-empty wins).
-    """
-
-    REASONING_FIELDS: tuple[str, ...] = ("thinking", "reasoning", "reasoning_content")
-
-    def get_message(self, data: dict) -> dict:
-        """Extract the assistant message dict from a raw API response."""
-        raise NotImplementedError
-
-    def extract_reasoning(self, data: dict) -> str | None:
-        msg = self.get_message(data)
-        for field in self.REASONING_FIELDS:
-            value = msg.get(field)
-            if value and isinstance(value, str) and value.strip():
-                return value.strip()
-        return None
-
-    def extract_tool_call(self, data: dict) -> "ToolCall | None":
-        msg = self.get_message(data)
-        tool_calls = msg.get("tool_calls", [])
-        if tool_calls:
-            tc = tool_calls[0]
-            raw = tc["function"]["arguments"]
-            args = json.loads(raw) if isinstance(raw, str) else raw
-            return ToolCall(name=tc["function"]["name"], arguments=args,
-                            call_id=tc.get("id"))
-        return None
-
-    def extract_tool_args(self, data: dict) -> dict | None:
-        """Extract tool-call arguments, falling back to content-as-JSON."""
-        tc = self.extract_tool_call(data)
-        if tc is not None:
-            return tc.arguments
-        content = self.get_message(data).get("content", "").strip()
-        if content:
-            content = content.removeprefix("```json").removeprefix("```").strip().removesuffix("```").strip()
-            return json.loads(content)
-        return None
-
-    def extract_text(self, data: dict) -> str | None:
-        content = self.get_message(data).get("content", "").strip()
-        return content or None
-
-    def format_assistant(self, data: dict) -> dict:
-        return self.get_message(data) or {"role": "assistant", "content": ""}
-
-    def format_tool_result(self, call_id: str | None, content: str) -> dict:
-        return {"role": "tool", "content": content}
-
-    def extract_usage(self, data: dict) -> TokenUsage:
-        raise NotImplementedError
-
-
-class OllamaParser(ResponseParser):
-    """Response parser for the native Ollama /api/chat endpoint."""
-
-    def get_message(self, data: dict) -> dict:
-        return data.get("message", {})
-
-    def extract_usage(self, data: dict) -> TokenUsage:
-        return TokenUsage(
-            prompt_tokens=data.get("prompt_eval_count", 0),
-            completion_tokens=data.get("eval_count", 0),
-        )
-
-
-class OpenAIParser(ResponseParser):
-    """Response parser for OpenAI-compatible /chat/completions endpoints."""
-
-    def get_message(self, data: dict) -> dict:
-        choices = data.get("choices", [])
-        return choices[0].get("message", {}) if choices else {}
-
-    def format_tool_result(self, call_id: str | None, content: str) -> dict:
-        if call_id is not None:
-            return {"role": "tool", "tool_call_id": call_id, "content": content}
-        return {"role": "tool", "content": content}
-
-    def extract_usage(self, data: dict) -> TokenUsage:
-        usage = data.get("usage", {})
-        return TokenUsage(
-            prompt_tokens=usage.get("prompt_tokens", 0),
-            completion_tokens=usage.get("completion_tokens", 0),
-        )
-
-
-class LLMClient:
-    """Encapsulates all communication with the LLM API (Ollama or OpenAI-compatible)."""
-
-    def __init__(self, config: ApiConfig):
-        self.config = config
-        self.usage = TokenUsage()
-        self.parser: ResponseParser = OllamaParser() if config.is_ollama else OpenAIParser()
-        self._http = httpx.Client(
-            timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0),
-        )
-        self._last_result_store: dict[str, str] = {}
-        self._last_messages: list[dict] = []
-
-    # -- resource management ---------------------------------------------------
-
-    def close(self) -> None:
-        """Close the underlying HTTP connection pool."""
-        self._http.close()
-
-    def __enter__(self) -> "LLMClient":
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.close()
-
-    def _build_payload(self, prompt: str, tools: list[dict] | None = None,
-                       stream: bool = False) -> dict:
-        """Build an API request payload, adapting to Ollama or OpenAI format."""
-        if self.config.is_ollama:
-            payload: dict[str, Any] = {
-                "model": self.config.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": stream,
-                "keep_alive": "1h",
-                "options": {
-                    "temperature": 0.2,
-                    "num_ctx": self.config.num_ctx,
-                },
-            }
-            if tools:
-                payload["tools"] = tools
-        else:
-            payload = {
-                "model": self.config.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": stream,
-                "temperature": 0.2,
-            }
-            if tools:
-                payload["tools"] = tools
-                # Force the model to call the specific tool
-                payload["tool_choice"] = {
-                    "type": "function",
-                    "function": {"name": tools[0]["function"]["name"]},
-                }
-        return payload
-
-    def _extract_tool_args(self, data: dict) -> dict | None:
-        """Extract tool-call arguments from a response, handling both API formats."""
-        return self.parser.extract_tool_args(data)
-
-    def _build_payload_messages(self, messages: list[dict],
-                                tools: list[dict] | None = None,
-                                tool_choice: str | dict | None = None,
-                                stream: bool = False) -> dict:
-        """Build a payload from a full conversation history (messages list)."""
-        if self.config.is_ollama:
-            payload: dict[str, Any] = {
-                "model": self.config.model,
-                "messages": messages,
-                "stream": stream,
-                "keep_alive": "1h",
-                "options": {
-                    "temperature": 0.2,
-                    "num_ctx": self.config.num_ctx,
-                },
-            }
-            if tools:
-                payload["tools"] = tools
-            # Ollama does not support tool_choice — omit it
-        else:
-            payload = {
-                "model": self.config.model,
-                "messages": messages,
-                "stream": stream,
-                "temperature": 0.2,
-            }
-            if tools:
-                payload["tools"] = tools
-            if tool_choice is not None:
-                payload["tool_choice"] = tool_choice
-        return payload
-
-    def _extract_tool_call(self, data: dict) -> ToolCall | None:
-        """Extract a tool call from an API response, handling both Ollama and OpenAI formats."""
-        return self.parser.extract_tool_call(data)
-
-    def _extract_text_content(self, data: dict) -> str | None:
-        """Extract plain text content from a response when no tool call is present."""
-        return self.parser.extract_text(data)
-
-    def _extract_reasoning(self, data: dict) -> str | None:
-        """Extract reasoning/thinking tokens from an API response if present."""
-        return self.parser.extract_reasoning(data)
-
-    def _format_assistant_tool_call(self, data: dict) -> dict:
-        """Extract the assistant message from a raw API response for conversation history.
-
-        Using the raw response message guarantees the format Ollama/OpenAI expects to see back.
-        """
-        return self.parser.format_assistant(data)
-
-    def _format_tool_result(self, call_id: str | None, content: str) -> dict:
-        """Build a tool-result message for appending to conversation history."""
-        return self.parser.format_tool_result(call_id, content)
-
-    def _extract_usage(self, data: dict) -> TokenUsage:
-        """Extract token usage from an API response (Ollama or OpenAI format)."""
-        return self.parser.extract_usage(data)
-
-    def _retry_request(self, fn: Callable, max_retries: int = 3, initial_delay: float = 1.0) -> Any:
-        """Execute fn with exponential backoff on transient errors."""
-        for attempt in range(max_retries + 1):
-            try:
-                return fn()
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout,
-                    httpx.PoolTimeout, httpx.ConnectTimeout) as e:
-                if attempt == max_retries:
-                    raise
-                delay = initial_delay * (2 ** attempt)
-                _log(f"  {_ansi('↻', _ANSI_DIM)} retry {attempt + 1}/{max_retries} after {delay:.1f}s: {type(e).__name__}")
-                import time
-                time.sleep(delay)
-            except httpx.HTTPStatusError as e:
-                # Retry on 429 (rate limit) and 5xx (server errors)
-                if e.response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
-                    delay = initial_delay * (2 ** attempt)
-                    # Honor Retry-After header if present
-                    retry_after = e.response.headers.get("retry-after")
-                    if retry_after:
-                        try:
-                            delay = max(delay, float(retry_after))
-                        except ValueError:
-                            pass
-                    _log(f"  {_ansi('↻', _ANSI_DIM)} retry {attempt + 1}/{max_retries} after {delay:.1f}s: HTTP {e.response.status_code}")
-                    import time
-                    time.sleep(delay)
-                else:
-                    raise
-
-    def call(self, prompt: str, num_ctx: int | None = None) -> str:
-        """Call the LLM with streaming and return the assistant message text."""
-        payload = self._build_payload(prompt, stream=True)
-        if num_ctx is not None and self.config.is_ollama:
-            payload["options"]["num_ctx"] = num_ctx
-        headers = {**self.config.auth_headers, "Content-Type": "application/json"}
-
-        def _do_stream() -> str:
-            with self._http.stream("POST", self.config.chat_url, json=payload, headers=headers) as response:
-                response.raise_for_status()
-                chunks: list[str] = []
-                for line in response.iter_lines():
-                    if not line:
-                        continue
-                    # OpenAI SSE format: lines prefixed with "data: "
-                    if line.startswith("data: "):
-                        line = line[6:]
-                    if line.strip() == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if self.config.is_ollama:
-                        content = data.get("message", {}).get("content", "")
-                        done = data.get("done", False)
-                    else:
-                        delta = (data.get("choices", [{}])[0]
-                                 .get("delta", {}))
-                        content = delta.get("content", "")
-                        done = data.get("choices", [{}])[0].get("finish_reason") is not None
-                    if content:
-                        chunks.append(content)
-                    if done:
-                        self.usage = self.usage + self._extract_usage(data)
-                        break
-                return "".join(chunks)
-
-        return self._retry_request(_do_stream)
-
-    def call_with_tool(self, prompt: str, tool_fn: Callable, **tool_kwargs) -> Any:
-        """Call the LLM forcing tool_fn to be called.
-
-        Parses and validates the response into the tool's args model, then calls
-        tool_fn(validated_args, **tool_kwargs) and returns its result.
-        """
-        spec = tool_fn._tool_spec
-        args_model: type[BaseModel] = tool_fn._tool_model
-        actual_prompt = prompt
-        retries = 0
-        failures = []
-        while True:
-            retries += 1
-            payload = self._build_payload(actual_prompt, tools=[spec], stream=False)
-            headers = {**self.config.auth_headers, "Content-Type": "application/json"}
-
-            def _do_tool_post() -> dict:
-                response = self._http.post(self.config.chat_url, json=payload, headers=headers)
-                response.raise_for_status()
-                return response.json()
-
-            data = self._retry_request(_do_tool_post)
-            self.usage = self.usage + self._extract_usage(data)
-
-            raw_args = self._extract_tool_args(data)
-            if raw_args is None:
-                raw_args = {}
-
-            # Fix stringified nested values: some models return e.g.
-            # {"commits": "[{'subject': ...}]"} instead of a proper nested structure.
-            # Detect strings that look like Python lists/dicts and try to parse them.
-            for key, val in raw_args.items():
-                if isinstance(val, str) and val.strip().startswith(("[", "{")):
-                    try:
-                        raw_args[key] = json.loads(val)
-                    except json.JSONDecodeError:
-                        try:
-                            raw_args[key] = ast.literal_eval(val)
-                        except (ValueError, SyntaxError):
-                            pass  # leave as-is, let pydantic report the error
-
-            try:
-                validated = args_model.model_validate(raw_args).post_process()
-                return tool_fn(validated, **tool_kwargs)
-            except ValidationError as e:
-                failures.append(str(e))
-                if retries > 5:
-                    raise
-
-                failure_summary = "\n".join(set(failures))
-                actual_prompt = textwrap.dedent(f"""
-                Your previous ({len(failures)}) attempts failed with a validation error:
-                {failure_summary}
-
-                Try again following this prompt exactly:
-                {prompt}
-                """)
-
-    def agentic_loop(self, system_prompt: str, initial_user_message: str,
-                     tool_registry: dict[str, Callable],
-                     terminal_tool: Callable, max_turns: int = MAX_AGENTIC_TURNS,
-                     countdown_message_fn: Callable | None = None,
-                     **kwargs) -> Any:
-        """Run a multi-turn agentic loop until the terminal tool is called.
-
-        Each turn: send messages → extract tool call → dispatch.
-        Investigation tool results are appended to history.
-        Validation errors for the terminal tool become tool-result messages.
-        On the last turn, only the terminal tool is offered.
-
-        Context management: when total message size exceeds CONTEXT_TRIM_THRESHOLD,
-        old tool-result messages are replaced with LLM-generated summaries. The
-        original full content is stored and accessible via the query_tool_result
-        tool so the model can ask targeted questions without re-fetching.
-        A countdown warning is injected when TURNS_WARN_AT turns remain.
-        """
-        # ── result storage for compressed tool results ─────────────────────────
-        result_store: dict[str, str] = {}  # result_id → original full content
-
-        def _summarize_and_store(msg_idx: int, content: str) -> str:
-            """Summarize a tool result via LLM with three-level escalation.
-
-            Level 1 -- Normal: 2-4 sentence summary preserving suspicious code.
-            Level 2 -- Aggressive: max 3 bullet points if Level 1 didn't shrink.
-            Level 3 -- Deterministic truncate: 512-char hard cut, no LLM call.
-
-            The original content is always stored in result_store so
-            query_tool_result can retrieve it later.
-            """
-            result_id = f"r{msg_idx}"
-            result_store[result_id] = content
-            header = (
-                f"[Summarized — id: '{result_id}'. "
-                f"Use query_tool_result to ask specific questions about the full output.]\n"
-            )
-            input_snippet = content[:TOOL_RESULT_SUMMARIZE_INPUT]
-
-            # Level 1 — Normal summary
-            prompt_l1 = textwrap.dedent(f"""\
-                Summarize this tool output in 2-4 sentences. Focus on filenames,
-                key changes, and any suspicious code. Preserve suspicious code verbatim.
-
-                {input_snippet}
-            """)
-            summary_l1 = self.call(prompt_l1).strip()
-            if len(summary_l1) < len(content):
-                _log(f"  {_ansi('⋯', _ANSI_DIM)} summarization level 1 (normal) succeeded for #{msg_idx}")
-                return header + summary_l1
-
-            # Level 2 — Aggressive bullet points (target half the tokens)
-            prompt_l2 = textwrap.dedent(f"""\
-                Compress this to bullet points. Maximum 3 bullets, one line each.
-                Preserve file names and key identifiers only.
-
-                {input_snippet}
-            """)
-            summary_l2 = self.call(prompt_l2).strip()
-            if len(summary_l2) < len(content):
-                _log(f"  {_ansi('⋯', _ANSI_DIM)} summarization level 2 (aggressive) succeeded for #{msg_idx}")
-                return header + summary_l2
-
-            # Level 3 — Deterministic truncate (always reduces size)
-            _log(f"  {_ansi('⋯', _ANSI_DIM)} summarization level 3 (deterministic truncate) for #{msg_idx}")
-            truncated = content[:512] + "\n[Truncated — use query_tool_result for full content]"
-            return header + truncated
-
-        def _trim_with_summaries(messages: list[dict]) -> None:
-            """Summarize oldest large messages until total context is under threshold.
-
-            Compresses (oldest first):
-            - The initial diff context (messages[1], role=user) when it's large.
-            - Tool results, skipping the most recent one unless it exceeds
-              RECENT_TOOL_RESULT_CHARS — the model is likely still using it.
-
-            All compressed content is stored in result_store so query_tool_result
-            can answer targeted questions without losing any information.
-            """
-            threshold = self.config.context_trim_threshold
-            # Index of the most recent tool message — kept verbatim if small
-            last_tool_idx = max(
-                (i for i, m in enumerate(messages) if m.get("role") == "tool"),
-                default=-1,
-            )
-            for i, msg in enumerate(messages):
-                if _total_message_chars(messages) <= threshold:
-                    break
-                role = msg.get("role")
-                content = msg.get("content", "")
-                if not isinstance(content, str):
-                    continue
-                if content.startswith("[Summarized"):  # already compressed
-                    continue
-
-                if role == "tool":
-                    # Protect the most recent tool result so the model can act on it
-                    if i == last_tool_idx and len(content) <= RECENT_TOOL_RESULT_CHARS:
-                        continue
-                    if len(content) <= TOOL_RESULT_SUMMARIZE_SKIP:
-                        continue
-                    _log(f"  {_ansi('⋯', _ANSI_DIM)} compressing tool result #{i} ({len(content):,} chars)")
-                    messages[i] = {**msg, "content": _summarize_and_store(i, content)}
-
-                elif role == "user" and i == 1:
-                    # The initial diff context message — also compressible when large
-                    if len(content) <= TOOL_RESULT_SUMMARIZE_SKIP:
-                        continue
-                    _log(f"  {_ansi('⋯', _ANSI_DIM)} compressing initial diff context ({len(content):,} chars)")
-                    messages[i] = {**msg, "content": _summarize_and_store(i, content)}
-
-        # ── query_tool_result: closure over result_store and self ───────────────
-        @tool(QueryResultArgs)
-        def query_tool_result(args: QueryResultArgs, **_: Any) -> str:
-            """Access the full (unsummarized) content of a previously summarized tool result.
-
-            When a tool result was compressed to save context, use this to ask a
-            targeted question. The answer is generated from the original full content
-            so no information is lost.
-            """
-            full = result_store.get(args.result_id)
-            if full is None:
-                available = list(result_store.keys()) or ["none"]
-                return (
-                    f"No stored result with id '{args.result_id}'. "
-                    f"Available ids: {available}"
-                )
-            prompt = textwrap.dedent(f"""\
-                The following is the full content of stored tool result '{args.result_id}':
-
-                {full[:50_000]}
-
-                Question: {args.question}
-
-                Answer concisely and directly based only on the content above.
-            """)
-            return self.call(prompt)
-
-        # ── build extended registry that includes query_tool_result ─────────────
-        extended_registry = dict(tool_registry)
-        extended_registry["query_tool_result"] = query_tool_result
-
-        messages: list[dict] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": initial_user_message},
-        ]
-
-        terminal_spec = terminal_tool._tool_spec
-        terminal_name: str = terminal_spec["function"]["name"]
-        terminal_model: type[BaseModel] = terminal_tool._tool_model
-        all_tool_specs = [fn._tool_spec for fn in extended_registry.values()] + [terminal_spec]
-
-        headers = {**self.config.auth_headers, "Content-Type": "application/json"}
-
-        for turn in range(1, max_turns + 1):
-            is_last_turn = (turn == max_turns)
-            turns_remaining = max_turns - turn
-
-            if is_last_turn:
-                tools = [terminal_spec]
-                tool_choice: str | dict | None = (
-                    None if self.config.is_ollama
-                    else {"type": "function", "function": {"name": terminal_name}}
-                )
-            else:
-                tools = all_tool_specs
-                tool_choice = None if self.config.is_ollama else "auto"
-
-            payload = self._build_payload_messages(messages, tools=tools,
-                                                   tool_choice=tool_choice, stream=False)
-
-            def _do_agentic_post() -> dict:
-                response = self._http.post(self.config.chat_url, json=payload, headers=headers)
-                response.raise_for_status()
-                return response.json()
-
-            data = self._retry_request(_do_agentic_post)
-            self.usage = self.usage + self._extract_usage(data)
-
-            reasoning = self._extract_reasoning(data)
-            if reasoning:
-                _log_reasoning(reasoning)
-
-            tool_call = self._extract_tool_call(data)
-
-            if tool_call is None:
-                text = self._extract_text_content(data) or ""
-                _log(
-                    f"  {_ansi('⟳', _ANSI_DIM)} {_ansi(f'[{turn}/{max_turns}]', _ANSI_DIM)}"
-                    f" {_ansi('(no tool call — nudging)', _ANSI_DIM)}"
-                )
-                messages.append({"role": "assistant", "content": text})
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"Please call a tool. Use the investigation tools to gather more "
-                        f"information, or call {terminal_name} if you are ready to propose commits."
-                    ),
-                })
-                continue
-
-            _log(
-                f"  {_ansi('⟳', _ANSI_DIM)} {_ansi(f'[{turn}/{max_turns}]', _ANSI_DIM)}"
-                f" {_ansi(tool_call.name, _ANSI_CYAN)}"
-                f"({_ansi(_summarize_args(tool_call.arguments), _ANSI_DIM)})"
-            )
-            messages.append(self._format_assistant_tool_call(data))
-
-            # Coerce stringified nested values (some models return JSON-as-string)
-            raw_args = dict(tool_call.arguments)
-            for key, val in raw_args.items():
-                if isinstance(val, str) and val.strip().startswith(("[", "{")):
-                    try:
-                        raw_args[key] = json.loads(val)
-                    except json.JSONDecodeError:
-                        try:
-                            raw_args[key] = ast.literal_eval(val)
-                        except (ValueError, SyntaxError):
-                            pass
-
-            if tool_call.name == terminal_name:
-                try:
-                    validated = terminal_model.model_validate(raw_args).post_process()
-                    self._last_messages = list(messages)
-                    self._last_result_store = dict(result_store)
-                    return terminal_tool(validated, **kwargs)
-                except ValidationError as e:
-                    err_str = (
-                        f"Validation error: {e}\nPlease fix the arguments and call "
-                        f"{terminal_name} again."
-                    )
-                    if len(err_str) > TOOL_RESULT_SUMMARIZE_SKIP:
-                        err_str = _summarize_and_store(len(messages), err_str)
-                    messages.append(self._format_tool_result(
-                        tool_call.call_id, err_str,
-                    ))
-                    continue
-                except ValueError as e:
-                    err_str = (
-                        f"Error: {e}\nPlease fix the arguments and call "
-                        f"{terminal_name} again."
-                    )
-                    if len(err_str) > TOOL_RESULT_SUMMARIZE_SKIP:
-                        err_str = _summarize_and_store(len(messages), err_str)
-                    messages.append(self._format_tool_result(
-                        tool_call.call_id, err_str,
-                    ))
-                    continue
-
-            tool_fn = extended_registry.get(tool_call.name)
-            if tool_fn is None:
-                result_str = (f"Unknown tool: {tool_call.name!r}. "
-                              f"Available: {list(extended_registry.keys())}")
-            else:
-                try:
-                    validated_args = tool_fn._tool_model.model_validate(raw_args).post_process()
-                    result = tool_fn(validated_args, **kwargs)
-                    result_str = result if isinstance(result, str) else json.dumps(result)
-                except Exception as e:
-                    result_str = f"Error calling {tool_call.name}: {e}"
-
-            # Proactive summarization: summarize large tool results immediately
-            # so the LLM works from compact summaries and can drill down via
-            # query_tool_result. _trim_with_summaries remains as a safety net.
-            if len(result_str) > TOOL_RESULT_SUMMARIZE_SKIP:
-                result_str = _summarize_and_store(len(messages), result_str)
-
-            messages.append(self._format_tool_result(tool_call.call_id, result_str))
-
-            # Context management: when messages are large, summarize old content
-            # (diffs and tool results) and store originals for query_tool_result.
-            total_chars = _total_message_chars(messages)
-            if total_chars > self.config.context_trim_threshold:
-                _log(f"  {_ansi('⋯', _ANSI_DIM)} context {total_chars:,} chars — compressing old results")
-                _trim_with_summaries(messages)
-
-            # Inject a countdown warning when few turns remain so the model
-            # knows it must call the terminal tool soon.
-            if 0 < turns_remaining <= TURNS_WARN_AT:
-                if countdown_message_fn is not None:
-                    warning_text = countdown_message_fn(turns_remaining)
-                else:
-                    warning_text = (
-                        f"WARNING: Only {turns_remaining} turn(s) remaining. "
-                        f"Stop gathering context and call {terminal_name} NOW with "
-                        f"your best grouping based on what you already know."
-                    )
-                messages.append({
-                    "role": "user",
-                    "content": warning_text,
-                })
-
-        self._last_messages = list(messages)
-        self._last_result_store = dict(result_store)
-        raise RuntimeError(
-            f"agentic_loop exceeded {max_turns} turns without calling {terminal_name}"
-        )
 
 
 
@@ -1780,15 +936,6 @@ def search_diff(result: SearchDiffArgs, analyzer: "GitAnalyzer") -> str:
     if len(matches) >= MAX_MATCHES:
         text += f"\n... (limited to {MAX_MATCHES} matches)"
     return text
-
-
-class QueryResultArgs(BaseModel):
-    result_id: str = Field(
-        description="The result_id shown in the summarized tool output (e.g. 'r5')")
-    question: str = Field(
-        description="Specific question to answer from the full stored result")
-
-    def post_process(self): return self
 
 
 MERGE_PROMPT = textwrap.dedent("""\
@@ -2449,21 +1596,15 @@ class GitAnalyzer:
 
 
 # ── Terminal color helpers ──────────────────────────────────────────────────────
+# Re-exported from steropes with underscore-prefixed aliases for compatibility.
 
-_ANSI_RESET  = "\033[0m"
-_ANSI_BOLD   = "\033[1m"
-_ANSI_DIM    = "\033[2m"
-_ANSI_RED    = "\033[31m"
-_ANSI_GREEN  = "\033[32m"
-_ANSI_YELLOW = "\033[33m"
-_ANSI_CYAN   = "\033[36m"
-
-
-def _ansi(text: str, *codes: str) -> str:
-    """Wrap text in ANSI escape codes when stdout is a TTY (no-op otherwise)."""
-    if not sys.stdout.isatty():
-        return text
-    return "".join(codes) + text + _ANSI_RESET
+_ANSI_RESET  = ANSI_RESET
+_ANSI_BOLD   = ANSI_BOLD
+_ANSI_DIM    = ANSI_DIM
+_ANSI_RED    = ANSI_RED
+_ANSI_GREEN  = ANSI_GREEN
+_ANSI_YELLOW = ANSI_YELLOW
+_ANSI_CYAN   = ANSI_CYAN
 
 
 def _diff_stats(patch: str) -> tuple[int, int]:
@@ -3228,7 +2369,20 @@ def main() -> None:
             or gc.get("smart-commit.api-key")
         ),
     )
-    client = LLMClient(api_config)
+    trim_threshold = (OLLAMA_CONTEXT_TRIM_THRESHOLD if api_config.is_ollama
+                      else CONTEXT_TRIM_THRESHOLD)
+    agent_config = AgentConfig(
+        max_agentic_turns=MAX_AGENTIC_TURNS,
+        max_agentic_turns_cap=MAX_AGENTIC_TURNS_CAP,
+        read_file_limit=READ_FILE_LIMIT,
+        context_trim_threshold=trim_threshold,
+        tool_result_summarize_skip=TOOL_RESULT_SUMMARIZE_SKIP,
+        tool_result_summarize_input=TOOL_RESULT_SUMMARIZE_INPUT,
+        turns_warn_at=TURNS_WARN_AT,
+        recent_tool_result_chars=RECENT_TOOL_RESULT_CHARS,
+    )
+    client = LLMClient(api_config, agent_config=agent_config,
+                        log_fn=_log, log_reasoning_fn=_log_reasoning)
     try:
         _main_body(client, repo, args, issue_patterns)
     finally:
