@@ -2301,6 +2301,7 @@ class GitAnalyzer:
 
     def execute_commits(self, commits: list[dict], hunk_map: dict[str, DiffHunk]) -> None:
         """Stage and commit each group using git apply --cached for individual hunks."""
+        anchor = self.git(["rev-parse", "HEAD"]).strip()
         for i, commit in enumerate(commits, 1):
             subject = commit["subject"]
             body = commit.get("body", "").strip()
@@ -2393,6 +2394,16 @@ class GitAnalyzer:
                 print(f"  \u2713 Committed")
             except RuntimeError as e:
                 print(f"  ! Error committing: {e}", file=sys.stderr)
+                current = self.git(["rev-parse", "HEAD"]).strip()
+                if current != anchor:
+                    done = i - 1
+                    print(
+                        f"\n*** Partial commit failure: {done} of {len(commits)} "
+                        f"commits succeeded.\n"
+                        f"*** To undo the partial commits while keeping changes staged:\n"
+                        f"***   git reset --soft {anchor}\n",
+                        file=sys.stderr,
+                    )
                 raise
 
     def update_gitignore(self, patterns: list[str], yes: bool = False) -> None:
