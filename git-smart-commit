@@ -2508,7 +2508,7 @@ def print_proposed_commits(commits: list[dict], gitignore: list[str],
                     dh = hunk_map[hid]
                     by_file.setdefault(dh.file_path, []).append(dh)
                 else:
-                    fpath = hid.rsplit("#", 1)[0] if "#" in hid else hid
+                    fpath = hid.rsplit("::", 1)[0] if "::" in hid else hid
                     by_file.setdefault(fpath, [])
 
             max_path = max((len(fp) for fp in by_file), default=0)
