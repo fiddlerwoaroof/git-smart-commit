@@ -2162,6 +2162,141 @@ def _build_commit_markup(commit: dict, hunk_map: dict | None, index: int, total:
     return "\n".join(lines)
 
 
+def _get_editor() -> str:
+    """Return the preferred editor from environment variables."""
+    return (
+        os.environ.get("GIT_EDITOR")
+        or os.environ.get("VISUAL")
+        or os.environ.get("EDITOR")
+        or "vi"
+    )
+
+
+def _open_editor_for_message(msg: str) -> str | None:
+    """Open $EDITOR with *msg* and return the edited text, or None if unchanged/empty."""
+    with tempfile.NamedTemporaryFile(suffix=".txt", mode="w", encoding="utf-8", delete=False) as f:
+        f.write(msg + "\n")
+        tmpfile = f.name
+    try:
+        subprocess.run([_get_editor(), tmpfile], check=False)
+        with open(tmpfile, encoding="utf-8") as f:
+            edited = f.read().strip()
+        return edited if edited else None
+    finally:
+        try:
+            os.unlink(tmpfile)
+        except OSError:
+            pass
+
+
+def _merge_two_commits(commits: list[dict], a: int, b: int) -> list[dict]:
+    """Merge commits at indices *a* and *b* into one (keeping *a*'s subject)."""
+    if a == b or not (0 <= a < len(commits)) or not (0 <= b < len(commits)):
+        return commits
+    if a > b:
+        a, b = b, a
+    ca, cb = commits[a], commits[b]
+    bodies = [c.get("body", "") for c in (ca, cb) if c.get("body", "").strip()]
+    merged: dict = {
+        "subject": ca["subject"],
+        "body": "\n\n".join(bodies),
+        "hunks": list(ca.get("hunks", [])) + list(cb.get("hunks", [])),
+        "issues": list(ca.get("issues", [])) + list(cb.get("issues", [])),
+    }
+    if ca.get("breaking_change") or cb.get("breaking_change"):
+        merged["breaking_change"] = ca.get("breaking_change") or cb.get("breaking_change")
+    result = []
+    for i, c in enumerate(commits):
+        if i == a:
+            result.append(merged)
+        elif i == b:
+            pass  # dropped — merged into a
+        else:
+            result.append(c)
+    return result
+
+
+def _apply_editor_result(commits: list[dict], idx: int, new_msg: str) -> list[dict]:
+    """Parse *new_msg* (subject + optional body) back into *commits[idx]*."""
+    if "\n\n" in new_msg:
+        subject, _, body = new_msg.partition("\n\n")
+    else:
+        subject, body = new_msg, ""
+    commits[idx]["subject"] = subject.strip()
+    commits[idx]["body"] = body.strip()
+    return commits
+
+
+def _run_text_confirmation(
+    commits: list[dict], gitignore: list[str], hunk_map: dict | None
+) -> list[dict] | None:
+    """Interactive text-mode confirmation loop (used when stdout is not a TTY)."""
+    HELP = (
+        "  y          — proceed with commits as shown\n"
+        "  n / q      — cancel\n"
+        "  e <N>      — open $EDITOR for commit N's full message\n"
+        "  m <A> <B>  — merge commits A and B (keeps A's subject)\n"
+        "  ?          — show this help\n"
+    )
+    while True:
+        print_proposed_commits(commits, gitignore, hunk_map)
+        print()
+        print("Commands: y=proceed  n=cancel  e <N>=edit  m <A> <B>=merge  ?=help")
+        try:
+            answer = input("> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return None
+
+        if answer in ("y", "yes"):
+            return commits
+
+        if answer in ("n", "no", "q", "quit"):
+            print("Cancelled.")
+            return None
+
+        if answer in ("?", "h", "help"):
+            print(HELP)
+            continue
+
+        parts = answer.split()
+        if parts and parts[0] == "e" and len(parts) == 2:
+            try:
+                n = int(parts[1]) - 1
+            except ValueError:
+                print("Usage: e <N>  (e.g. e 1)")
+                continue
+            if not (0 <= n < len(commits)):
+                print(f"Commit {n + 1} does not exist (1–{len(commits)}).")
+                continue
+            c = commits[n]
+            msg = c["subject"]
+            if c.get("body"):
+                msg += "\n\n" + c["body"]
+            result = _open_editor_for_message(msg)
+            if result:
+                commits = _apply_editor_result(commits, n, result)
+            continue
+
+        if parts and parts[0] == "m" and len(parts) == 3:
+            try:
+                a, b = int(parts[1]) - 1, int(parts[2]) - 1
+            except ValueError:
+                print("Usage: m <A> <B>  (e.g. m 1 2)")
+                continue
+            if a == b:
+                print("Cannot merge a commit with itself.")
+                continue
+            if not (0 <= a < len(commits)) or not (0 <= b < len(commits)):
+                print(f"Commit numbers must be between 1 and {len(commits)}.")
+                continue
+            commits = _merge_two_commits(commits, a, b)
+            print(f"Merged commits {a + 1} and {b + 1}.")
+            continue
+
+        print("Unknown command — type ? for help.")
+
+
 def _run_confirm_tui(
     commits: list[dict], gitignore: list[str], hunk_map: dict | None
 ) -> list[dict] | None:
@@ -2230,6 +2365,8 @@ def _run_confirm_tui(
             Binding("n", "cancel",       "Cancel",       priority=True),
             Binding("q", "cancel",       "Quit",         priority=True),
             Binding("e", "edit_subject", "Edit subject"),
+            Binding("E", "edit_message", "Edit message ($EDITOR)"),
+            Binding("m", "merge_next",   "Merge ↓"),
             Binding("k", "cursor_up",    "",             show=False),
             Binding("j", "cursor_down",  "",             show=False),
         ]
@@ -2345,6 +2482,54 @@ def _run_confirm_tui(
                     pass
 
             self.push_screen(_EditModal(self._commits[idx]["subject"]), _apply)
+
+        def action_edit_message(self) -> None:
+            """Open $EDITOR with the full commit message (subject + body)."""
+            idx = self._sel
+            commit = self._commits[idx]
+            msg = commit["subject"]
+            if commit.get("body"):
+                msg += "\n\n" + commit["body"]
+            with self.suspend():
+                result = _open_editor_for_message(msg)
+            if result:
+                self._commits = _apply_editor_result(self._commits, idx, result)
+                try:
+                    self.query_one(f"#ci-{idx}", ListItem).query_one(Label).update(
+                        self._label(idx)
+                    )
+                    self.query_one("#detail", Static).update(
+                        _build_commit_markup(
+                            self._commits[idx], self._hunk_map,
+                            idx + 1, len(self._commits),
+                        )
+                    )
+                except Exception:
+                    pass
+
+        def _rebuild_list(self) -> None:
+            """Repopulate the sidebar list after the commit list changes."""
+            lv = self.query_one("#list", ListView)
+            lv.clear()
+            for i in range(len(self._commits)):
+                lv.mount(ListItem(Label(self._label(i)), id=f"ci-{i}"))
+
+        def action_merge_next(self) -> None:
+            """Merge the selected commit with the next one."""
+            idx = self._sel
+            if idx >= len(self._commits) - 1:
+                self.notify("No next commit to merge with", severity="warning")
+                return
+            self._commits = _merge_two_commits(self._commits, idx, idx + 1)
+            self._sel = min(idx, len(self._commits) - 1)
+            self._rebuild_list()
+            if self._commits:
+                self.query_one("#detail", Static).update(
+                    _build_commit_markup(
+                        self._commits[self._sel], self._hunk_map,
+                        self._sel + 1, len(self._commits),
+                    )
+                )
 
     return _App(commits, gitignore, hunk_map).run()
 
@@ -2533,14 +2718,10 @@ def main() -> None:
             return
         commits = result
     else:
-        print_proposed_commits(commits, gitignore, hunk_map)
-        try:
-            answer = input("Proceed with these commits? [y/N] ").strip().lower()
-        except (KeyboardInterrupt, EOFError):
+        result = _run_text_confirmation(commits, gitignore, hunk_map)
+        if result is None:
             return
-        if answer not in ("y", "yes"):
-            print("Cancelled.")
-            return
+        commits = result
 
     analyzer.execute_commits(commits, hunk_map)
     analyzer.update_gitignore(gitignore, yes=args.yes)
