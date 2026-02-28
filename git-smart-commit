@@ -1886,7 +1886,7 @@ class GitAnalyzer:
         # (consistent with tracked-file 1-based indexing so LLMs don't mis-reference)
         untracked = self.git(["ls-files", "--others", "--exclude-standard"]).splitlines()
         for fpath in untracked:
-            hunk_id = f"{fpath}#1"
+            hunk_id = f"{fpath}::1"
             hunk_map[hunk_id] = DiffHunk(
                 hunk_id=hunk_id,
                 file_path=fpath,
