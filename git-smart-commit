@@ -1560,7 +1560,7 @@ def propose_commits(result: ProposeCommitsArgs, analyzer: "GitAnalyzer") -> tupl
         # Build file→hunks index for fuzzy matching
         file_to_hunks: dict[str, list[str]] = {}
         for hid in valid_ids:
-            fpath = hid.rsplit("#", 1)[0] if "#" in hid else hid
+            fpath = hid.rsplit("::", 1)[0] if "::" in hid else hid
             file_to_hunks.setdefault(fpath, []).append(hid)
 
         mended: dict[str, str] = {}
