@@ -1453,6 +1453,9 @@ class GitAnalyzer:
             subject = commit["subject"]
             body = commit.get("body", "").strip()
             breaking = commit.get("breaking_change", "").strip()
+            # Strip any BREAKING CHANGE trailer the LLM baked into the body
+            # to avoid duplication with the breaking_change field.
+            body = _strip_breaking_change_trailer(body)
             parts = [subject]
             if body:
                 parts.append(body)
@@ -1605,6 +1608,32 @@ _ANSI_RED    = ANSI_RED
 _ANSI_GREEN  = ANSI_GREEN
 _ANSI_YELLOW = ANSI_YELLOW
 _ANSI_CYAN   = ANSI_CYAN
+
+
+def _strip_breaking_change_trailer(body: str) -> str:
+    """Remove BREAKING CHANGE trailer blocks from a commit body.
+
+    The LLM sometimes bakes a 'BREAKING CHANGE:' trailer directly into the body
+    text in addition to populating the breaking_change field.  Stripping it here
+    prevents duplicate trailers in the final commit message.
+
+    Removes the trailer line and any continuation lines (non-blank lines
+    immediately following the trailer) until the next blank line or end of text.
+    """
+    lines = body.splitlines()
+    cleaned = []
+    in_trailer = False
+    for line in lines:
+        if re.match(r'^BREAKING[- ]CHANGE\s*:', line, re.IGNORECASE):
+            in_trailer = True
+            continue
+        if in_trailer:
+            if not line.strip():
+                in_trailer = False
+            else:
+                continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
 
 
 def _diff_stats(patch: str) -> tuple[int, int]:
@@ -1853,8 +1882,13 @@ def _merge_two_commits(commits: list[dict], a: int, b: int) -> list[dict]:
         "hunks": list(ca.get("hunks", [])) + list(cb.get("hunks", [])),
         "issues": list(ca.get("issues", [])) + list(cb.get("issues", [])),
     }
-    if ca.get("breaking_change") or cb.get("breaking_change"):
-        merged["breaking_change"] = ca.get("breaking_change") or cb.get("breaking_change")
+    bc_a = ca.get("breaking_change", "").strip()
+    bc_b = cb.get("breaking_change", "").strip()
+    if bc_a or bc_b:
+        if bc_a and bc_b and bc_a != bc_b:
+            merged["breaking_change"] = f"{bc_a}; {bc_b}"
+        else:
+            merged["breaking_change"] = bc_a or bc_b
     result = []
     for i, c in enumerate(commits):
         if i == a:
