@@ -1232,7 +1232,9 @@ class GitAnalyzer:
         hunk_context = self.build_hunk_context(hunk_map)
 
         # ── Local state for incremental commit emission ────────────────────────
-        emitted_commits: list[dict] = []
+        # Stored on self so partial results survive interrupts for plan persistence.
+        self._emitted_commits: list[dict] = []
+        emitted_commits = self._emitted_commits
         emitted_hunks: set[str] = set()
 
         # ── emit_commit: closure over emitted_commits/emitted_hunks/hunk_map ──
@@ -2539,9 +2541,17 @@ def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
     n_hunks = len(hunk_map)
     _log(f"Found {n_hunks} hunk(s) across {n_files} file(s). Analyzing…")
 
-    commits, gitignore = analyzer.classify_changes(
-        hunk_map, critique=args.critique, issue_patterns=issue_patterns or None
-    )
+    try:
+        commits, gitignore = analyzer.classify_changes(
+            hunk_map, critique=args.critique, issue_patterns=issue_patterns or None
+        )
+    except (KeyboardInterrupt, Exception) as exc:
+        # Persist whatever partial state exists so the user's tokens aren't wasted.
+        partial = getattr(analyzer, "_emitted_commits", [])
+        if partial or analyzer.client._last_messages:
+            _log(f"\n  {_ansi('⚠', _ANSI_YELLOW)} Interrupted — persisting partial plan…")
+            _persist_plan_to_temp(partial, [], hunk_map, analyzer=analyzer)
+        raise
 
     if args.debug:
         _dump_debug(analyzer.client)
@@ -2583,9 +2593,16 @@ def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
                 return False
             if isinstance(result, _Reclassify):
                 _log(f"Re-classifying with critique: {result.critique!r}…")
-                commits, gitignore = analyzer.classify_changes(
-                    hunk_map, critique=result.critique, issue_patterns=issue_patterns or None
-                )
+                try:
+                    commits, gitignore = analyzer.classify_changes(
+                        hunk_map, critique=result.critique, issue_patterns=issue_patterns or None
+                    )
+                except (KeyboardInterrupt, Exception):
+                    partial = getattr(analyzer, "_emitted_commits", [])
+                    if partial or analyzer.client._last_messages:
+                        _log(f"\n  {_ansi('⚠', _ANSI_YELLOW)} Interrupted — persisting partial plan…")
+                        _persist_plan_to_temp(partial, [], hunk_map, analyzer=analyzer)
+                    raise
                 if args.debug:
                     _dump_debug(analyzer.client)
                 usage = analyzer.client.usage
