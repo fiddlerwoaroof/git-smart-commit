@@ -105,8 +105,9 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     "refactor Z").
 
     You do not need to commit every file. Skip junk files (editor backups,
-    build artifacts, OS metadata). Instead, collect suggested .gitignore patterns
-    for them in the gitignore argument.
+    build artifacts, OS metadata). Collect .gitignore patterns in the gitignore
+    argument, and list skipped hunk IDs in the skipped_hunks argument of
+    finalize_commits.
 
     You also actively look for common coding issues that a linter
     would catch and code smells such as using conditionals where
@@ -210,8 +211,10 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     - emit_commit(commit): Emit a single logical commit. It validates hunk IDs, rejects
       duplicates, and returns the remaining unassigned hunks so you can plan the next commit.
       You do NOT need to emit immediately — investigate first to build a holistic picture.
-    - finalize_commits(gitignore): Finalize all emitted commits. Call this once after you
-      have emitted all commits via emit_commit. Pass any suggested .gitignore patterns here.
+    - finalize_commits(gitignore, skipped_hunks): Finalize all emitted commits. Call this
+      once after you have emitted all commits via emit_commit. Pass any suggested .gitignore
+      patterns in gitignore. Any unassigned hunks must be listed in skipped_hunks — the tool
+      will reject if hunks are neither committed nor explicitly skipped.
 
     ## Context management
     Tool results are automatically summarized when they exceed a size threshold.
@@ -239,8 +242,9 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
       unassigned hunks in the response and continue until done, then call finalize_commits.
 
     You do not need to commit every file. Skip junk files (editor backups,
-    build artifacts, OS metadata). Instead, collect suggested .gitignore patterns
-    for them in the gitignore argument.
+    build artifacts, OS metadata). Collect .gitignore patterns in the gitignore
+    argument, and list skipped hunk IDs in the skipped_hunks argument of
+    finalize_commits.
 
     You also actively look for common coding issues that a linter
     would catch and code smells such as using conditionals where
@@ -700,6 +704,8 @@ class EmitCommitArgs(BaseModel):
 
 class FinalizeCommitsArgs(BaseModel):
     gitignore: list[str] = Field(default_factory=list, description="Suggested .gitignore patterns for junk files")
+    skipped_hunks: list[str] = Field(default_factory=list,
+        description="Hunk IDs intentionally not committed (junk files, build artifacts, etc.)")
 
     def post_process(self):
         return self
@@ -1275,6 +1281,23 @@ class GitAnalyzer:
             """Finalize all emitted commits. Call after emitting all commits via emit_commit."""
             if not emitted_commits:
                 raise ValueError("No commits have been emitted yet. Use emit_commit first.")
+
+            # Reject invalid skip IDs before checking coverage
+            bad_skips = set(args.skipped_hunks) - all_hunk_ids
+            if bad_skips:
+                raise ValueError(
+                    f"Unknown hunk IDs in skipped_hunks: {sorted(bad_skips)}. "
+                    f"Valid IDs are: {sorted(all_hunk_ids)}"
+                )
+
+            # Validate all hunks accounted for
+            unassigned = all_hunk_ids - emitted_hunks - set(args.skipped_hunks)
+            if unassigned:
+                raise ValueError(
+                    f"{len(unassigned)} hunk(s) are neither committed nor explicitly skipped: "
+                    f"{sorted(unassigned)}. Either emit_commit them or list them in skipped_hunks."
+                )
+
             args.post_process()
             merged = self.merge_overlapping_commits(emitted_commits)
             return (merged, args.gitignore)
@@ -1329,8 +1352,8 @@ class GitAnalyzer:
             if remaining_hunks:
                 return (
                     f"WARNING: Only {turns_remaining} turn(s) remaining. "
-                    f"{len(remaining_hunks)} hunks still unassigned. "
-                    f"Emit remaining commits or call finalize_commits NOW."
+                    f"{len(remaining_hunks)} hunks still unassigned: {sorted(remaining_hunks)}. "
+                    f"Emit remaining commits or call finalize_commits with these in skipped_hunks NOW."
                 )
             return (
                 f"WARNING: Only {turns_remaining} turn(s) remaining. "
