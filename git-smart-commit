@@ -336,6 +336,7 @@ DEFAULT_MODEL = "gpt-oss:20b"
 DIFF_CHARS_PER_FILE = 6000    # files larger than this get hunk-summarized
 DIFF_TOTAL_CHARS   = 120000   # hard cap on total context sent to classifier
 PRIOR_HUNK_WINDOW  = 4        # how many previous hunk summaries to include as context
+HUNK_SUMMARIZE_CTX = 8192    # smaller context window for hunk summarization calls (speed)
 
 MAX_AGENTIC_TURNS     = 20    # base safeguard for the agentic investigation loop
 MAX_AGENTIC_TURNS_CAP = 50    # absolute ceiling when scaling with hunk count
@@ -1106,7 +1107,8 @@ class GitAnalyzer:
                 total_chars += len(dh.patch)
             else:
                 _log(f"  {_ansi('⋯', _ANSI_DIM)} summarizing large hunk: {hunk_id} ({len(dh.patch):,} chars)")
-                summary = self._summarize_file_diff(dh.file_path, dh.patch)
+                remaining_budget = DIFF_TOTAL_CHARS - total_chars
+                summary = self._summarize_file_diff(dh.file_path, dh.patch, remaining_budget)
                 diff_parts.append(f"--- {hunk_id} ---\n{summary}")
                 total_chars += len(summary)
 
@@ -1132,11 +1134,43 @@ class GitAnalyzer:
             parts.append("Untracked (new files):\n" + "\n".join(f"  {f}" for f in untracked))
         return "\n\n".join(parts)
 
-    def _summarize_file_diff(self, fname: str, diff_text: str) -> str:
-        """Ask the model to summarize each hunk, passing the last N summaries as context."""
+    def _summarize_file_diff(self, fname: str, diff_text: str, remaining_budget: int | None = None) -> str:
+        """Ask the model to summarize each hunk, passing the last N summaries as context.
+
+        If remaining_budget is provided and small, use batched summarization to reduce LLM calls.
+        """
         hunks = split_hunks(diff_text)
         hunk_summaries: list[str] = []
 
+        # Aggressive mode: when budget is tight, batch multiple hunks per LLM call
+        total_hunk_size = sum(len(h) for h in hunks)
+        budget_ratio = remaining_budget / DIFF_TOTAL_CHARS if remaining_budget else 1.0
+
+        if budget_ratio < 0.3 and total_hunk_size > DIFF_CHARS_PER_FILE * 2:
+            # Aggressive summarization: batch hunks into groups and summarize each group
+            batch_size = max(1, len(hunks) // 3)  # At most 3 LLM calls per file
+            for batch_idx in range(0, len(hunks), batch_size):
+                batch = hunks[batch_idx:batch_idx + batch_size]
+                start_hunk = batch_idx + 1
+                end_hunk = min(batch_idx + batch_size, len(hunks))
+
+                batch_text = "\n\n".join(f"Hunk {batch_idx + i + 1}:\n{h}" for i, h in enumerate(batch))
+                prompt = textwrap.dedent(f"""\
+                    Summarize hunks {start_hunk}-{end_hunk} of {len(hunks)} from '{fname}' in 2-4 plain English sentences.
+                    Focus on the overall changes across these hunks. Be concise.
+
+                    {batch_text}
+                """)
+
+                summary = self.client.call(prompt, num_ctx=HUNK_SUMMARIZE_CTX)
+                hunk_summaries.extend([summary.strip()] * len(batch))
+            print()
+            return f"[batched summary — {len(hunks)} hunk(s)]\n" + "\n".join(
+                f"  Hunks {i}-{min(i + batch_size - 1, len(hunks))}: {hunk_summaries[i - 1]}"
+                for i in range(1, len(hunks) + 1, batch_size)
+            )
+
+        # Standard mode: summarize each hunk individually
         for i, hunk in enumerate(hunks, 1):
             prior_context = ""
             if hunk_summaries:
@@ -1186,7 +1220,8 @@ class GitAnalyzer:
                     content = file_diff
                 else:
                     _log(f"  {_ansi('⋯', _ANSI_DIM)} summarizing large diff: {fname} ({len(file_diff):,} chars)")
-                    content = self._summarize_file_diff(fname, file_diff)
+                    remaining_budget = DIFF_TOTAL_CHARS - total_chars
+                    content = self._summarize_file_diff(fname, file_diff, remaining_budget)
 
                 parts.append(content)
                 total_chars += len(content)
