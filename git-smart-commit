@@ -1298,9 +1298,12 @@ class GitAnalyzer:
         if not target.exists():
             return f"[file not found: {path}]"
         try:
-            content = target.read_text(errors="replace")
+            raw = target.read_bytes()
         except OSError as e:
             return f"[error reading {path}: {e}]"
+        if b"\x00" in raw:
+            return f"[binary file — {len(raw):,} bytes, cannot display]"
+        content = raw.decode("utf-8", errors="replace")
         if len(content) > READ_FILE_LIMIT:
             size = target.stat().st_size
             return (

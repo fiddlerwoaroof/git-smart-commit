@@ -422,6 +422,7 @@ class LLMClient:
         headers = {**self.config.auth_headers, "Content-Type": "application/json"}
 
         consecutive_no_tool_calls = 0
+        _extended_for_terminal_validation = False  # allow at most one extra turn on last-turn failure
 
         for turn in range(1, max_turns + 1):
             is_last_turn = (turn == max_turns) or (consecutive_no_tool_calls >= 3)
@@ -503,6 +504,9 @@ class LLMClient:
                         f"Validation error: {e}\nPlease fix the arguments and call "
                         f"{terminal_name} again."
                     )
+                    if is_last_turn and not _extended_for_terminal_validation:
+                        max_turns += 1
+                        _extended_for_terminal_validation = True
                     if len(err_str) > ac.tool_result_summarize_skip:
                         err_str = _summarize_and_store(len(messages), err_str)
                     messages.append(self._format_tool_result(
@@ -514,6 +518,9 @@ class LLMClient:
                         f"Error: {e}\nPlease fix the arguments and call "
                         f"{terminal_name} again."
                     )
+                    if is_last_turn and not _extended_for_terminal_validation:
+                        max_turns += 1
+                        _extended_for_terminal_validation = True
                     if len(err_str) > ac.tool_result_summarize_skip:
                         err_str = _summarize_and_store(len(messages), err_str)
                     messages.append(self._format_tool_result(
@@ -562,6 +569,11 @@ class LLMClient:
 
         self._last_messages = list(messages)
         self._last_result_store = dict(result_store)
+        if _extended_for_terminal_validation:
+            raise RuntimeError(
+                f"agentic_loop: {terminal_name} was called but failed validation on the "
+                f"final turn and could not be corrected within {max_turns} turns"
+            )
         raise RuntimeError(
             f"agentic_loop exceeded {max_turns} turns without calling {terminal_name}"
         )
