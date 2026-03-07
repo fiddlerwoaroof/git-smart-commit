@@ -95,6 +95,22 @@ from steropes.ui import (
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
+HUNK_GROUPING_RULES = textwrap.dedent("""\
+    - Changes are represented as individual diff hunks, each identified by an ID
+      like "src/main.py::1". Untracked (new) files also use "filepath::1".
+    - You CAN split a file across multiple commits by assigning different hunks
+      from that file to different commits. Prefer splitting when hunks are unrelated.
+    - Keep related hunks together (same feature, same module, same concern).
+    - Prefer fewer, cohesive commits over many tiny ones. A typical changeset
+      should produce 2-5 commits. A single conceptual change that touches
+      multiple locations should be ONE commit, not one commit per edit site.
+    - Do NOT create separate commits for each individual edit to the same
+      logical change. For example, renaming a delimiter across 10 call sites
+      is one refactor commit, not 10.
+    - Dependency/lockfile changes belong with the commit that caused them.
+    - Test files belong with the code they test.\
+""")
+
 BREAKING_CHANGE_RULES = textwrap.dedent("""\
     - In the issues field, call out any bugs, incorrect API usage, or suspicious
       patterns you observe in the diff. Examples: wrong number of arguments,
@@ -164,19 +180,7 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 
     Rules:
     - CRITICAL: Tool calls must use JSON for arguments. Other formats will result in failure. In particular, strings must be surrounded by double-quotes (") and if one occurs literally, escape with backslashes.
-    - Changes are represented as individual diff hunks, each identified by an ID
-      like "src/main.py::1". Untracked (new) files also use "filepath::1".
-    - You CAN split a file across multiple commits by assigning different hunks
-      from that file to different commits. Prefer splitting when hunks are unrelated.
-    - Keep related hunks together (same feature, same module, same concern).
-    - Prefer fewer, cohesive commits over many tiny ones. A typical changeset
-      should produce 2-5 commits. A single conceptual change that touches
-      multiple locations should be ONE commit, not one commit per edit site.
-    - Do NOT create separate commits for each individual edit to the same
-      logical change. For example, renaming a delimiter across 10 call sites
-      is one refactor commit, not 10.
-    - Dependency/lockfile changes belong with the commit that caused them.
-    - Test files belong with the code they test.
+    {HUNK_GROUPING_RULES}
     - Use strict conventional commit format:
         subject: type(scope): short description  (under 72 chars)
         body: 4-10 lines, plain text, wrapped at 80 chars, no markdown
@@ -197,8 +201,7 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     enough context — for example, to see which class a changed function belongs
     to, what imports already exist, or how unchanged surrounding code looks.
     Call read_file as many times as needed, then call propose_commits when ready.
-""").format(CODE_ISSUE_DETECTION=CODE_ISSUE_DETECTION,
-           BREAKING_CHANGE_RULES=BREAKING_CHANGE_RULES)
+""").format(HUNK_GROUPING_RULES=HUNK_GROUPING_RULES, BREAKING_CHANGE_RULES=BREAKING_CHANGE_RULES)
 
 
 AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
@@ -266,19 +269,7 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
 
     Rules:
     - CRITICAL: Tool calls must use JSON for arguments. Other formats will result in failure. In particular, strings must be surrounded by double-quotes (") and if one occurs literally, escape with backslashes.
-    - Changes are represented as individual diff hunks, each identified by an ID
-      like "src/main.py::1". Untracked (new) files also use "filepath::1".
-    - You CAN split a file across multiple commits by assigning different hunks
-      from that file to different commits. Prefer splitting when hunks are unrelated.
-    - Keep related hunks together (same feature, same module, same concern).
-    - Prefer fewer, cohesive commits over many tiny ones. A typical changeset
-      should produce 2-5 commits. A single conceptual change that touches
-      multiple locations should be ONE commit, not one commit per edit site.
-    - Do NOT create separate commits for each individual edit to the same
-      logical change. For example, renaming a delimiter across 10 call sites
-      is one refactor commit, not 10.
-    - Dependency/lockfile changes belong with the commit that caused them.
-    - Test files belong with the code they test.
+    {HUNK_GROUPING_RULES}
     - Use strict conventional commit format:
         subject: type(scope): short description  (under 72 chars)
         body: 4-10 lines, plain text, wrapped at 80 chars, no markdown
@@ -299,8 +290,7 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     picture of how the changes relate, emit commits for each logical grouping. Continue
     until all hunks are assigned or remaining hunks should be ignored, then call
     finalize_commits.
-""").format(CODE_ISSUE_DETECTION=CODE_ISSUE_DETECTION,
-           BREAKING_CHANGE_RULES=BREAKING_CHANGE_RULES)
+""").format(HUNK_GROUPING_RULES=HUNK_GROUPING_RULES, BREAKING_CHANGE_RULES=BREAKING_CHANGE_RULES)
 
 
 OLLAMA_BASE_URL = "http://localhost:11434"
