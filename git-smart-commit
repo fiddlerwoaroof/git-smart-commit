@@ -214,6 +214,9 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
       (staged=true for staged only, staged=false for unstaged only, omit for both)
     - get_git_log(n): Get the last n commit subjects to learn this project's conventions
     - search_diff(pattern, context_lines): Search all diffs for a regex pattern
+    - search_codebase(pattern, glob, context_lines, max_results): Search the full
+      repository with ripgrep. Use when you need to find definitions, usages, or
+      patterns not visible in the current diff (requires rg on PATH)
     - query_tool_result(result_id, question): When any prior content (the initial diff
       context or a tool result) was summarized to save context, use this to ask a targeted
       question about the original full output. The result_id is shown in the summary text
@@ -1051,6 +1054,76 @@ def search_diff(result: SearchDiffArgs, analyzer: "GitAnalyzer") -> str:
     return text
 
 
+class SearchCodebaseArgs(BaseModel):
+    pattern: str = Field(description="Regex pattern to search for across the full repository")
+    glob: str | None = Field(default=None, description="Glob filter for file paths (e.g. '*.py', 'src/**')")
+    context_lines: int = Field(default=2, description="Lines of context around each match (0-5)")
+    max_results: int = Field(default=30, description="Maximum number of matches to return (1-100)")
+
+    def post_process(self): return self
+
+
+@tool(SearchCodebaseArgs)
+def search_codebase(result: SearchCodebaseArgs, analyzer: "GitAnalyzer") -> str:
+    """Search the full repository with ripgrep. Useful for finding definitions,
+    usages, or patterns not visible in the current diff."""
+    if shutil.which("rg") is None:
+        return "[search_codebase unavailable: ripgrep (rg) not found on PATH]"
+
+    ctx = max(0, min(5, result.context_lines))
+    cap = max(1, min(100, result.max_results))
+
+    cmd = ["rg", "--json", f"-C{ctx}", f"--max-count={cap}", "--", result.pattern, str(analyzer.repo)]
+    if result.glob:
+        cmd = ["rg", "--json", f"-C{ctx}", f"--max-count={cap}", "--glob", result.glob, "--", result.pattern, str(analyzer.repo)]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return "[search_codebase timed out after 15s]"
+    except OSError as e:
+        return f"[search_codebase error: {e}]"
+
+    matches: list[str] = []
+    current_file: str | None = None
+    context_buf: list[str] = []
+
+    for line in proc.stdout.splitlines():
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kind = msg.get("type")
+        data = msg.get("data", {})
+        if kind == "begin":
+            if context_buf:
+                matches.append("\n".join(context_buf))
+                context_buf = []
+            current_file = data.get("path", {}).get("text", "?")
+            context_buf = [f"── {current_file} ──"]
+        elif kind in ("match", "context"):
+            lineno = data.get("line_number", "?")
+            text = data.get("lines", {}).get("text", "").rstrip("\n")
+            prefix = ">" if kind == "match" else " "
+            context_buf.append(f"{prefix}{lineno}: {text}")
+        elif kind == "end":
+            if context_buf:
+                matches.append("\n".join(context_buf))
+                context_buf = []
+            current_file = None
+
+    if context_buf:
+        matches.append("\n".join(context_buf))
+
+    if not matches:
+        return f"No matches found for pattern: {result.pattern!r}"
+
+    out = "\n\n".join(matches[:cap])
+    if len(matches) >= cap:
+        out += f"\n\n... (capped at {cap} matches)"
+    return out
+
+
 MERGE_PROMPT = textwrap.dedent("""\
     You are merging multiple proposed commits that share the same diff hunks
     and therefore cannot be committed separately.
@@ -1507,6 +1580,7 @@ class GitAnalyzer:
             "get_diff": get_diff,
             "get_git_log": get_git_log,
             "search_diff": search_diff,
+            "search_codebase": search_codebase,
             "emit_commit": emit_commit,
             "propose_commits": propose_commits,
         }
