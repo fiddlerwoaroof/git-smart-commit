@@ -1,0 +1,13 @@
+[project]
+name = "steropes"
+dynamic = ["version"]
+description = "A lightweight LLM agent framework with tool calling and context management"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx",
+    "pydantic",
+]
+
+[build-system]
+requires = ["flit_core>=3.4"]
+build-backend = "flit_core.buildapi"

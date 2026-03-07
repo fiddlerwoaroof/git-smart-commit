@@ -115,6 +115,7 @@ def build_messages(example: dict, max_diff_chars: int = 30000) -> list[dict]:
 
 # ── JSON extraction ───────────────────────────────────────────────────────────
 
+
 def extract_json_object(text: str) -> str:
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*\n?", "", text, flags=re.MULTILINE)
@@ -149,6 +150,7 @@ def extract_json_object(text: str) -> str:
 
 # ── API call ──────────────────────────────────────────────────────────────────
 
+
 async def call_model(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
@@ -182,6 +184,7 @@ async def call_model(
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
+
 
 def commit_type(subject: str) -> str:
     """Extract the type prefix from a conventional commit subject."""
@@ -260,21 +263,27 @@ def junk_routing_score(
                 if filename.endswith(suffix) or name.endswith(suffix):
                     return True
             elif pattern.endswith("/"):
-                if ("/" + pattern[:-1] + "/") in ("/" + filename) or filename.startswith(pattern[:-1]):
+                if ("/" + pattern[:-1] + "/") in (
+                    "/" + filename
+                ) or filename.startswith(pattern[:-1]):
                     return True
             else:
-                if name == pattern or filename == pattern or filename.endswith("/" + pattern):
+                if (
+                    name == pattern
+                    or filename == pattern
+                    or filename.endswith("/" + pattern)
+                ):
                     return True
         return False
 
     correctly_routed = sum(
-        1 for f in injected_files
-        if f not in committed_files and is_gitignored(f)
+        1 for f in injected_files if f not in committed_files and is_gitignored(f)
     )
     return correctly_routed / len(injected_files)
 
 
 # ── Per-example evaluation ────────────────────────────────────────────────────
+
 
 async def eval_one(
     client: httpx.AsyncClient,
@@ -289,7 +298,9 @@ async def eval_one(
     injected_files = example.get("injected_files", [])
 
     pred = await call_model(
-        client, semaphore, messages,
+        client,
+        semaphore,
+        messages,
         api_url=args.api_url,
         api_key=args.api_key,
         model=args.model,
@@ -303,7 +314,9 @@ async def eval_one(
     }
 
     if pred is not None:
-        result["file_grouping_f1"] = file_grouping_f1(pred.get("commits", []), label_commits)
+        result["file_grouping_f1"] = file_grouping_f1(
+            pred.get("commits", []), label_commits
+        )
         result["type_accuracy"] = type_accuracy(pred.get("commits", []), label_commits)
         junk = junk_routing_score(pred, injected_files)
         if junk is not None:
@@ -317,6 +330,7 @@ async def eval_one(
 
 # ── Aggregation and reporting ─────────────────────────────────────────────────
 
+
 def print_report(results: list[dict]) -> None:
     n = len(results)
     parsed = [r for r in results if r["parsed"]]
@@ -327,16 +341,16 @@ def print_report(results: list[dict]) -> None:
     junk_scores = [r["junk_routing"] for r in parsed if "junk_routing" in r]
 
     def avg(xs: list[float]) -> str:
-        return f"{sum(xs)/len(xs):.3f}" if xs else "n/a"
+        return f"{sum(xs) / len(xs):.3f}" if xs else "n/a"
 
-    print(f"\n{'─'*50}")
+    print(f"\n{'─' * 50}")
     print(f"Evaluation Results  ({n} examples)")
-    print(f"{'─'*50}")
+    print(f"{'─' * 50}")
     print(f"  Parse rate:          {parse_rate:.1%}  ({len(parsed)}/{n})")
     print(f"  File grouping F1:    {avg(fg_scores)}  (n={len(fg_scores)})")
     print(f"  Type accuracy:       {avg(type_scores)}  (n={len(type_scores)})")
     print(f"  Junk routing:        {avg(junk_scores)}  (n={len(junk_scores)})")
-    print(f"{'─'*50}\n")
+    print(f"{'─' * 50}\n")
 
     # Breakdown by language
     lang_groups: dict[str, list[dict]] = {}
@@ -354,6 +368,7 @@ def print_report(results: list[dict]) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+
 async def run(args: argparse.Namespace) -> None:
     examples: list[dict] = []
     with open(args.val) as f:
@@ -364,12 +379,16 @@ async def run(args: argparse.Namespace) -> None:
             try:
                 examples.append(json.loads(line))
             except json.JSONDecodeError as e:
-                print(f"Warning: skipping malformed line {lineno}: {e}", file=sys.stderr)
+                print(
+                    f"Warning: skipping malformed line {lineno}: {e}", file=sys.stderr
+                )
 
     if args.limit:
         examples = examples[: args.limit]
 
-    print(f"Evaluating {len(examples)} examples with model: {args.model}", file=sys.stderr)
+    print(
+        f"Evaluating {len(examples)} examples with model: {args.model}", file=sys.stderr
+    )
 
     semaphore = asyncio.Semaphore(args.concurrency)
     timeout = httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=5.0)
@@ -387,8 +406,10 @@ async def run(args: argparse.Namespace) -> None:
             pct = done_count / len(examples) * 100
             print(
                 f"\r  {done_count}/{len(examples)} ({pct:.0f}%)  "
-                f"parse_rate={sum(1 for r in results if r['parsed'])/len(results):.1%}    ",
-                end="", file=sys.stderr, flush=True,
+                f"parse_rate={sum(1 for r in results if r['parsed']) / len(results):.1%}    ",
+                end="",
+                file=sys.stderr,
+                flush=True,
             )
 
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -411,35 +432,45 @@ def main() -> None:
         epilog=__doc__,
     )
     parser.add_argument(
-        "--val", default="val.jsonl",
+        "--val",
+        default="val.jsonl",
         help="Validation JSONL from prepare-sft-data (default: val.jsonl)",
     )
     parser.add_argument(
-        "--model", required=True,
+        "--model",
+        required=True,
         help="Model name to evaluate (e.g. qwen3-coder:30b-a3b-q8_0)",
     )
     parser.add_argument(
-        "--api-url", default="http://localhost:11434/v1",
+        "--api-url",
+        default="http://localhost:11434/v1",
         help="OpenAI-compatible API base URL (default: http://localhost:11434/v1)",
     )
     parser.add_argument(
-        "--api-key", default="ollama",
+        "--api-key",
+        default="ollama",
         help="API key / bearer token (default: ollama)",
     )
     parser.add_argument(
-        "--concurrency", type=int, default=4,
+        "--concurrency",
+        type=int,
+        default=4,
         help="Max concurrent requests (default: 4)",
     )
     parser.add_argument(
-        "--limit", type=int, default=None,
+        "--limit",
+        type=int,
+        default=None,
         help="Evaluate at most N examples (default: all)",
     )
     parser.add_argument(
-        "--output", default=None,
+        "--output",
+        default=None,
         help="Write detailed per-example results to JSONL file",
     )
     parser.add_argument(
-        "--verbose", action="store_true",
+        "--verbose",
+        action="store_true",
         help="Include predicted and label in output JSONL",
     )
     args = parser.parse_args()

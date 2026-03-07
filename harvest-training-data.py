@@ -140,6 +140,7 @@ def detect_languages(changed_files: list[str]) -> list[str]:
 
 # ── Gitignore mining ──────────────────────────────────────────────────────────
 
+
 def mine_gitignore(repo: Path, commit: str) -> list[str]:
     """Extract .gitignore patterns from the repo at a given commit.
 
@@ -153,8 +154,7 @@ def mine_gitignore(repo: Path, commit: str) -> list[str]:
         return []
 
     gitignore_files = [
-        f for f in out.strip().splitlines()
-        if Path(f).name == ".gitignore"
+        f for f in out.strip().splitlines() if Path(f).name == ".gitignore"
     ]
 
     for gi_path in gitignore_files:
@@ -175,6 +175,7 @@ def mine_gitignore(repo: Path, commit: str) -> list[str]:
 
 
 # ── Git helpers ───────────────────────────────────────────────────────────────
+
 
 def git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     """Run a git command, return CompletedProcess.
@@ -231,7 +232,7 @@ def normalize_url(url: str) -> str:
     """Normalize a git URL to github.com/owner/repo form."""
     for prefix in ["https://", "http://", "git@", "ssh://git@", "ssh://"]:
         if url.startswith(prefix):
-            url = url[len(prefix):]
+            url = url[len(prefix) :]
     # git@github.com:owner/repo.git -> github.com/owner/repo
     if ":" in url:
         host_part = url.split(":")[0]
@@ -275,7 +276,9 @@ def is_merge_commit(repo: Path, sha: str) -> bool:
 
 
 def get_first_parent_commits(
-    repo: Path, branch: str | None = None, max_count: int = 500,
+    repo: Path,
+    branch: str | None = None,
+    max_count: int = 500,
 ) -> list[str]:
     """Get commit SHAs along first-parent lineage."""
     cmd = ["log", "--first-parent", "--format=%H", f"--max-count={max_count}"]
@@ -332,6 +335,7 @@ def has_binary_files(repo: Path, base: str, head: str) -> bool:
 
 
 # ── Repo discovery ────────────────────────────────────────────────────────────
+
 
 def find_repos(repo_dirs: list[str]) -> list[Path]:
     """Find git repositories under the given directories.
@@ -411,6 +415,7 @@ def find_repos(repo_dirs: list[str]) -> list[Path]:
 
 # ── Main harvest logic ────────────────────────────────────────────────────────
 
+
 def get_all_commits(repo: Path, max_count: int = 5000) -> list[str]:
     """Get all commit SHAs in the repo across all branches, topo-sorted."""
     out = git_ok(
@@ -484,7 +489,7 @@ def harvest_one(
         head_idx = rng.randint(0, max_head_idx)
         head_sha = commits[head_idx]
         base_sha = commits[head_idx + n]
-        commit_shas = commits[head_idx:head_idx + n]
+        commit_shas = commits[head_idx : head_idx + n]
 
     # Get changed files
     changed_files = get_changed_files(repo, base_sha, head_sha)
@@ -546,52 +551,72 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--repo-dirs", nargs="+", required=True,
+        "--repo-dirs",
+        nargs="+",
+        required=True,
         help="Directories to scan for git repos (supports shell globs)",
     )
     parser.add_argument(
-        "--output", default="training-inputs.jsonl",
+        "--output",
+        default="training-inputs.jsonl",
         help="Output JSONL file (default: training-inputs.jsonl)",
     )
     parser.add_argument(
-        "--count", type=int, default=1000,
+        "--count",
+        type=int,
+        default=1000,
         help="Number of examples to generate (default: 1000)",
     )
     parser.add_argument(
-        "--max-files", type=int, default=20,
+        "--max-files",
+        type=int,
+        default=20,
         help="Skip commits touching more than this many files (default: 20)",
     )
     parser.add_argument(
-        "--max-diff-chars", type=int, default=200000,
+        "--max-diff-chars",
+        type=int,
+        default=200000,
         help="Skip diffs larger than this (default: 200000)",
     )
     parser.add_argument(
-        "--min-commits", type=int, default=1,
+        "--min-commits",
+        type=int,
+        default=1,
         help="Minimum commits to unwind (default: 1)",
     )
     parser.add_argument(
-        "--max-commits", type=int, default=8,
+        "--max-commits",
+        type=int,
+        default=8,
         help="Maximum commits to unwind (default: 8)",
     )
     parser.add_argument(
-        "--seed", type=int, default=42,
+        "--seed",
+        type=int,
+        default=42,
         help="Random seed (default: 42)",
     )
     parser.add_argument(
-        "--max-per-repo", type=int, default=None,
+        "--max-per-repo",
+        type=int,
+        default=None,
         help="Max examples per repo (default: unlimited). "
-             "Useful to prevent large repos from dominating the dataset.",
+        "Useful to prevent large repos from dominating the dataset.",
     )
     parser.add_argument(
-        "--fetch", action="store_true",
+        "--fetch",
+        action="store_true",
         help="Run 'git fetch --all' on each repo before harvesting",
     )
     parser.add_argument(
-        "--all-branches", action="store_true",
+        "--all-branches",
+        action="store_true",
         help="Sample from all local branches, not just the default branch",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Just discover repos and print stats, don't generate",
     )
 
@@ -623,7 +648,7 @@ def main():
         print("Fetching all remotes...", file=sys.stderr)
         for i, repo in enumerate(repos):
             url = get_remote_url(repo) or str(repo)
-            print(f"  [{i+1}/{len(repos)}] {url}", file=sys.stderr, end="")
+            print(f"  [{i + 1}/{len(repos)}] {url}", file=sys.stderr, end="")
             if fetch_all(repo):
                 print(" ✓", file=sys.stderr)
             else:
@@ -632,8 +657,7 @@ def main():
     if args.dry_run:
         if args.all_branches:
             print(
-                f"\n{'Repo':<55} {'Commits':>8}  "
-                f"{'Default':<12}  Languages",
+                f"\n{'Repo':<55} {'Commits':>8}  {'Default':<12}  Languages",
                 file=sys.stderr,
             )
             print("─" * 110, file=sys.stderr)
@@ -659,7 +683,9 @@ def main():
             default_commits = get_first_parent_commits(r, branch, max_count=500)
             if len(default_commits) > 1:
                 recent_files = get_changed_files(
-                    r, default_commits[-1], default_commits[0],
+                    r,
+                    default_commits[-1],
+                    default_commits[0],
                 )
             else:
                 recent_files = []
@@ -745,18 +771,20 @@ def main():
         print("\nStats:", file=sys.stderr)
         print(f"  Examples: {generated}", file=sys.stderr)
         print(f"  Unique repos used: {len(repo_url_counts)}", file=sys.stderr)
-        print(f"  Avg line size: {sum(sizes)//len(sizes):,} chars", file=sys.stderr)
+        print(f"  Avg line size: {sum(sizes) // len(sizes):,} chars", file=sys.stderr)
         print(
             f"  Commits unwound: min={min(commit_counts)} "
             f"max={max(commit_counts)} "
-            f"avg={sum(commit_counts)/len(commit_counts):.1f}",
+            f"avg={sum(commit_counts) / len(commit_counts):.1f}",
             file=sys.stderr,
         )
         print(f"  Languages: {json.dumps(lang_counts, indent=4)}", file=sys.stderr)
 
         # Show top repos by example count
         top_repos = sorted(
-            repo_url_counts.items(), key=lambda x: x[1], reverse=True,
+            repo_url_counts.items(),
+            key=lambda x: x[1],
+            reverse=True,
         )[:15]
         print("  Top repos:", file=sys.stderr)
         for url, count in top_repos:

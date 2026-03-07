@@ -34,40 +34,58 @@ def parse_args() -> argparse.Namespace:
         "--model",
         default="unsloth/Qwen3-30B-A3B-unsloth-bnb-4bit",
         help="Base model (Hugging Face repo or local path). "
-             "Default: unsloth/Qwen3-30B-A3B-unsloth-bnb-4bit",
+        "Default: unsloth/Qwen3-30B-A3B-unsloth-bnb-4bit",
     )
     p.add_argument(
-        "--dataset", default="train.jsonl",
+        "--dataset",
+        default="train.jsonl",
         help="Training JSONL from prepare-sft-data (default: train.jsonl)",
     )
     p.add_argument(
-        "--val-dataset", default="val.jsonl",
+        "--val-dataset",
+        default="val.jsonl",
         help="Validation JSONL (default: val.jsonl)",
     )
     p.add_argument(
-        "--output", default="lora-adapter",
+        "--output",
+        default="lora-adapter",
         help="Directory to save LoRA adapter (default: lora-adapter)",
     )
-    p.add_argument("--lora-rank", type=int, default=32, help="LoRA rank r (default: 32)")
-    p.add_argument("--lora-alpha", type=int, default=64, help="LoRA alpha (default: 64)")
-    p.add_argument("--epochs", type=int, default=3, help="Training epochs (default: 3)")
-    p.add_argument("--batch-size", type=int, default=4, help="Per-device batch size (default: 4)")
     p.add_argument(
-        "--grad-accum", type=int, default=4,
+        "--lora-rank", type=int, default=32, help="LoRA rank r (default: 32)"
+    )
+    p.add_argument(
+        "--lora-alpha", type=int, default=64, help="LoRA alpha (default: 64)"
+    )
+    p.add_argument("--epochs", type=int, default=3, help="Training epochs (default: 3)")
+    p.add_argument(
+        "--batch-size", type=int, default=4, help="Per-device batch size (default: 4)"
+    )
+    p.add_argument(
+        "--grad-accum",
+        type=int,
+        default=4,
         help="Gradient accumulation steps (default: 4, effective batch = batch-size × grad-accum)",
     )
-    p.add_argument("--lr", type=float, default=1.5e-4, help="Learning rate (default: 1.5e-4)")
     p.add_argument(
-        "--max-seq-length", type=int, default=8192,
+        "--lr", type=float, default=1.5e-4, help="Learning rate (default: 1.5e-4)"
+    )
+    p.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=8192,
         help="Max token sequence length (default: 8192)",
     )
     p.add_argument(
-        "--warmup-ratio", type=float, default=0.10,
+        "--warmup-ratio",
+        type=float,
+        default=0.10,
         help="Fraction of steps used for LR warmup (default: 0.10)",
     )
     p.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     p.add_argument(
-        "--no-4bit", action="store_true",
+        "--no-4bit",
+        action="store_true",
         help="Disable 4-bit quantization (use full bf16 LoRA instead)",
     )
     return p.parse_args()
@@ -83,7 +101,10 @@ def load_jsonl(path: str) -> list[dict]:
             try:
                 examples.append(json.loads(line))
             except json.JSONDecodeError as e:
-                print(f"Warning: skipping malformed line {lineno} in {path}: {e}", file=sys.stderr)
+                print(
+                    f"Warning: skipping malformed line {lineno} in {path}: {e}",
+                    file=sys.stderr,
+                )
     return examples
 
 
@@ -125,8 +146,13 @@ def main() -> None:
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
         target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
         ],
         lora_dropout=0,
         bias="none",
@@ -182,7 +208,9 @@ def main() -> None:
         remove_columns=["messages"],
     )
 
-    print(f"Train: {len(train_ds)} examples  Val: {len(val_ds)} examples", file=sys.stderr)
+    print(
+        f"Train: {len(train_ds)} examples  Val: {len(val_ds)} examples", file=sys.stderr
+    )
 
     # ── Training ──────────────────────────────────────────────────────────────
     output_dir = args.output
@@ -202,7 +230,7 @@ def main() -> None:
             per_device_train_batch_size=args.batch_size,
             per_device_eval_batch_size=args.batch_size,
             gradient_accumulation_steps=args.grad_accum,
-            gradient_checkpointing_kwargs = {"use_reentrant": True},
+            gradient_checkpointing_kwargs={"use_reentrant": True},
             num_train_epochs=args.epochs,
             learning_rate=args.lr,
             warmup_ratio=args.warmup_ratio,

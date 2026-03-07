@@ -43,155 +43,54 @@ Config file: .smart-commit.toml in the repo root
 """
 
 from pathlib import Path
+
+import sys
+
+# Resolve the real script path (follows symlinks) so that the local steropes
+# package is found regardless of how the script is invoked (direct or symlink).
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_STEROPES_PKG = _SCRIPT_DIR / "src" / "steropes-pkg"
+if _STEROPES_PKG.is_dir() and str(_STEROPES_PKG) not in sys.path:
+    sys.path.insert(0, str(_STEROPES_PKG))
+
 from pydantic import BaseModel, Field, ValidationError
 from typing import Any, Callable
 
 import argparse
-import ast
+import datetime
 import getpass
-import httpx
 import json
 import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import textwrap
 from dataclasses import dataclass, field
 
-
-def wrap_markdown(text: str, width: int = 80) -> str:
-    """Wrap text at width, preserving markdown structure.
-
-    - Code blocks (```) are not wrapped
-    - Inline code (`...`) within a line is preserved
-    - List items wrap with a hanging indent; continuation lines (indented to
-      at least the marker end) are wrapped with the same indent
-    - Blockquotes are preserved with the correct continuation prefix
-    - Regular paragraphs preserve their leading indent on continuation lines
-    """
-    if not text:
-        return text
-
-    lines = text.split('\n')
-    result = []
-    in_code_block = False
-    # Number of leading spaces that mark a list continuation line; None when
-    # we are not inside a list item.
-    list_continuation_indent: int | None = None
-
-    for line in lines:
-        stripped = line.lstrip()
-        indent = len(line) - len(stripped)
-
-        # Code block fence toggles verbatim mode
-        if stripped.startswith('```'):
-            in_code_block = not in_code_block
-            list_continuation_indent = None
-            result.append(line)
-            continue
-
-        if in_code_block:
-            result.append(line)
-            continue
-
-        # Blank line resets list state
-        if not stripped:
-            list_continuation_indent = None
-            result.append(line)
-            continue
-
-        # New list item
-        list_match = re.match(r'^(\s*)([-*+]|\d+\.)\s+', line)
-        if list_match:
-            marker_end = list_match.end()
-            list_continuation_indent = marker_end
-            content = line[marker_end:]
-            wrapped_content = _wrap_line_preserving_inline(content, width - marker_end)
-            wrapped_lines = wrapped_content.split('\n')
-            result.append(line[:marker_end] + wrapped_lines[0])
-            for wrapped_line in wrapped_lines[1:]:
-                result.append(' ' * marker_end + wrapped_line)
-            continue
-
-        # List continuation line: indented to at least the marker position
-        if list_continuation_indent is not None and indent >= list_continuation_indent:
-            cont_prefix = ' ' * indent
-            wrapped_content = _wrap_line_preserving_inline(stripped, width - indent)
-            wrapped_lines = wrapped_content.split('\n')
-            result.append(cont_prefix + wrapped_lines[0])
-            for wrapped_line in wrapped_lines[1:]:
-                result.append(cont_prefix + wrapped_line)
-            continue
-
-        # Not a list continuation — reset list state
-        list_continuation_indent = None
-
-        # Blockquote
-        if stripped.startswith('>'):
-            quote_match = re.match(r'^(\s*)(>+\s?)', line)
-            if quote_match:
-                full_prefix = quote_match.group(1) + quote_match.group(2)
-                content = line[len(full_prefix):]
-                wrapped_content = _wrap_line_preserving_inline(content, width - len(full_prefix))
-                wrapped_lines = wrapped_content.split('\n')
-                result.append(full_prefix + wrapped_lines[0])
-                for wrapped_line in wrapped_lines[1:]:
-                    result.append(full_prefix + wrapped_line)
-                continue
-
-        # Regular paragraph — preserve leading indent on all continuation lines
-        cont_prefix = ' ' * indent
-        wrapped_content = _wrap_line_preserving_inline(stripped, width - indent)
-        wrapped_lines = wrapped_content.split('\n')
-        result.append(cont_prefix + wrapped_lines[0])
-        for wrapped_line in wrapped_lines[1:]:
-            result.append(cont_prefix + wrapped_line)
-
-    return '\n'.join(result)
-
-
-def _wrap_line_preserving_inline(text: str, width: int) -> str:
-    """Wrap a line while preserving inline code spans."""
-    if len(text) <= width:
-        return text
-
-    # Split on inline code to preserve it
-    parts = re.split(r'(`[^`]+`)', text)
-    lines = []
-    current_line = ''
-
-    for part in parts:
-        if not part:
-            continue
-        if part.startswith('`') and part.endswith('`'):
-            # Inline code - add to current line if it fits, else start new line
-            if current_line and len(current_line) + 1 + len(part) > width:
-                lines.append(current_line.rstrip())
-                current_line = part
-            else:
-                if current_line:
-                    current_line += ' '
-                current_line += part
-        else:
-            # Regular text - wrap it
-            words = part.split(' ')
-            for word in words:
-                if not word:
-                    continue
-                if current_line and len(current_line) + 1 + len(word) > width:
-                    lines.append(current_line.rstrip())
-                    current_line = word
-                else:
-                    if current_line:
-                        current_line += ' '
-                    current_line += word
-
-    if current_line:
-        lines.append(current_line.rstrip())
-
-    return '\n'.join(lines)
+from steropes import (
+    AgentConfig,
+    ApiConfig,
+    LLMClient,
+    QueryResultArgs,
+    TokenUsage,
+    ToolCall,
+    tool,
+    wrap_markdown,
+)
+from steropes.tools import _summarize_args, _total_message_chars
+from steropes.ui import (
+    ANSI_BOLD,
+    ANSI_CYAN,
+    ANSI_DIM,
+    ANSI_GREEN,
+    ANSI_RED,
+    ANSI_RESET,
+    ANSI_YELLOW,
+    ansi as _ansi,
+    log as _default_log,
+    log_reasoning as _default_log_reasoning,
+)
 
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -206,8 +105,9 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     "refactor Z").
 
     You do not need to commit every file. Skip junk files (editor backups,
-    build artifacts, OS metadata). Instead, collect suggested .gitignore patterns
-    for them in the gitignore argument.
+    build artifacts, OS metadata). Collect .gitignore patterns in the gitignore
+    argument, and list skipped hunk IDs in the skipped_hunks argument of
+    finalize_commits.
 
     You also actively look for common coding issues that a linter
     would catch and code smells such as using conditionals where
@@ -246,10 +146,16 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     Rules:
     - CRITICAL: Tool calls must use JSON for arguments. Other formats will result in failure. In particular, strings must be surrounded by double-quotes (") and if one occurs literally, escape with backslashes.
     - Changes are represented as individual diff hunks, each identified by an ID
-      like "src/main.py#1". Untracked (new) files use "filepath#0".
+      like "src/main.py::1". Untracked (new) files also use "filepath::1".
     - You CAN split a file across multiple commits by assigning different hunks
       from that file to different commits. Prefer splitting when hunks are unrelated.
     - Keep related hunks together (same feature, same module, same concern).
+    - Prefer fewer, cohesive commits over many tiny ones. A typical changeset
+      should produce 2-5 commits. A single conceptual change that touches
+      multiple locations should be ONE commit, not one commit per edit site.
+    - Do NOT create separate commits for each individual edit to the same
+      logical change. For example, renaming a delimiter across 10 call sites
+      is one refactor commit, not 10.
     - Dependency/lockfile changes belong with the commit that caused them.
     - Test files belong with the code they test.
     - Use strict conventional commit format:
@@ -291,16 +197,35 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     You are a senior software engineer helping organize messy working-tree changes
     into clean, logical git commits.
 
-    You have investigation tools to gather information before proposing commits:
+    You have investigation tools to gather information and emit commits incrementally:
     - read_file(path): Read the full current content of any file in the repository
     - get_diff(path, staged): Get the raw diff for a specific file on demand
       (staged=true for staged only, staged=false for unstaged only, omit for both)
     - get_git_log(n): Get the last n commit subjects to learn this project's conventions
     - search_diff(pattern, context_lines): Search all diffs for a regex pattern
-    - query_tool_result(result_id, question): When a previous tool result was summarized
-      to save context, use this to ask a targeted question about the original full output.
-      The result_id is shown in the summary (e.g. "r5"). Use this instead of re-fetching
-      a diff or file you already retrieved but whose details were compressed away.
+    - query_tool_result(result_id, question): When any prior content (the initial diff
+      context or a tool result) was summarized to save context, use this to ask a targeted
+      question about the original full output. The result_id is shown in the summary text
+      (e.g. "[Summarized — id: 'r1'...]"). Use this instead of re-fetching data you already
+      have — the initial diff context uses id 'r1' when summarized.
+    - emit_commit(commit): Emit a single logical commit. It validates hunk IDs, rejects
+      duplicates, and returns the remaining unassigned hunks so you can plan the next commit.
+      You do NOT need to emit immediately — investigate first to build a holistic picture.
+    - finalize_commits(gitignore, skipped_hunks): Finalize all emitted commits. Call this
+      once after you have emitted all commits via emit_commit. Pass any suggested .gitignore
+      patterns in gitignore. Any unassigned hunks must be listed in skipped_hunks — the tool
+      will reject if hunks are neither committed nor explicitly skipped.
+
+    ## Context management
+    Tool results are automatically summarized when they exceed a size threshold.
+    You will see a header like: [Summarized — id: 'rN'. Use query_tool_result to retrieve original content]
+    followed by a compact summary.
+
+    Key rules:
+    - Do NOT re-request content via read_file after seeing a summary. Use query_tool_result(result_id) instead.
+    - Summary IDs (like 'r5') are stable and can be queried multiple times.
+    - query_tool_result returns the full original content for any summarized result.
+    - Plan your investigation to minimize re-reads: extract what you need from summaries first.
 
     Investigation strategy:
     - Start with the file list and stats you receive
@@ -308,12 +233,18 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     - Use get_diff on files whose grouping is unclear from stats alone
     - Use read_file when you need full file context (imports, class structure, etc.)
     - Use search_diff to find patterns across all changes (debug prints, TODOs, etc.)
-    - If a prior result was summarized, use query_tool_result before re-fetching it
-    - Investigate as many files as needed, then call propose_commits when confident
+    - If the initial diff context or a prior tool result was summarized, use
+      query_tool_result with the id shown in the summary before re-fetching it
+    - Investigate before committing: explore the changes to understand the full picture
+      before emitting any commits. It is fine to delay emit_commit until you have a
+      clear mental model of how the changes relate to each other.
+    - When you are confident in a grouping, call emit_commit. Check the remaining
+      unassigned hunks in the response and continue until done, then call finalize_commits.
 
     You do not need to commit every file. Skip junk files (editor backups,
-    build artifacts, OS metadata). Instead, collect suggested .gitignore patterns
-    for them in the gitignore argument.
+    build artifacts, OS metadata). Collect .gitignore patterns in the gitignore
+    argument, and list skipped hunk IDs in the skipped_hunks argument of
+    finalize_commits.
 
     You also actively look for common coding issues that a linter
     would catch and code smells such as using conditionals where
@@ -352,10 +283,16 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     Rules:
     - CRITICAL: Tool calls must use JSON for arguments. Other formats will result in failure. In particular, strings must be surrounded by double-quotes (") and if one occurs literally, escape with backslashes.
     - Changes are represented as individual diff hunks, each identified by an ID
-      like "src/main.py#1". Untracked (new) files use "filepath#0".
+      like "src/main.py::1". Untracked (new) files also use "filepath::1".
     - You CAN split a file across multiple commits by assigning different hunks
       from that file to different commits. Prefer splitting when hunks are unrelated.
     - Keep related hunks together (same feature, same module, same concern).
+    - Prefer fewer, cohesive commits over many tiny ones. A typical changeset
+      should produce 2-5 commits. A single conceptual change that touches
+      multiple locations should be ONE commit, not one commit per edit site.
+    - Do NOT create separate commits for each individual edit to the same
+      logical change. For example, renaming a delimiter across 10 call sites
+      is one refactor commit, not 10.
     - Dependency/lockfile changes belong with the commit that caused them.
     - Test files belong with the code they test.
     - Use strict conventional commit format:
@@ -386,8 +323,10 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
       must update. Also add '!' after the type in the subject (e.g. 'feat!(api):').
       Leave breaking_change empty for purely additive or internal changes.
 
-    When you have investigated enough to be confident in your groupings, call the
-    propose_commits tool with your answer.
+    Investigate the changes thoroughly before emitting commits. Once you have a clear
+    picture of how the changes relate, emit commits for each logical grouping. Continue
+    until all hunks are assigned or remaining hunks should be ignored, then call
+    finalize_commits.
 """)
 
 
@@ -396,17 +335,23 @@ DEFAULT_MODEL = "gpt-oss:20b"
 
 DIFF_CHARS_PER_FILE = 6000    # files larger than this get hunk-summarized
 DIFF_TOTAL_CHARS   = 120000   # hard cap on total context sent to classifier
-HUNK_SUMMARIZE_CTX = 8192     # smaller context for summarization calls (faster)
 PRIOR_HUNK_WINDOW  = 4        # how many previous hunk summaries to include as context
 
 MAX_AGENTIC_TURNS     = 20    # base safeguard for the agentic investigation loop
 MAX_AGENTIC_TURNS_CAP = 50    # absolute ceiling when scaling with hunk count
 READ_FILE_LIMIT    = 50_000   # max chars returned by the read_file tool
 
-CONTEXT_TRIM_THRESHOLD       = 300_000  # total message chars before summarizing old results
-TOOL_RESULT_SUMMARIZE_SKIP   = 500      # results shorter than this are never summarized
-TOOL_RESULT_SUMMARIZE_INPUT  = 20_000   # max chars fed to the summarizer model
-TURNS_WARN_AT                = 4        # remaining turns at which to inject a commit warning
+CONTEXT_TRIM_THRESHOLD        = 300_000  # total message chars before summarizing old results
+TOOL_RESULT_SUMMARIZE_SKIP    = 500      # results shorter than this are never summarized
+TOOL_RESULT_SUMMARIZE_INPUT   = 20_000   # max chars fed to the summarizer model
+TURNS_WARN_AT                 = 6        # remaining turns at which to inject a commit warning
+
+# When compressing old context, the *most recent* tool result is kept verbatim unless it
+# exceeds this size — the model is likely still working with it and losing detail hurts quality.
+RECENT_TOOL_RESULT_CHARS      = 10_000
+
+# Ollama runs locally; a much lower trim threshold prevents timeouts from huge prompts.
+OLLAMA_CONTEXT_TRIM_THRESHOLD = 20_000
 
 # Preset backends for the setup wizard
 SETUP_BACKENDS = [
@@ -442,594 +387,15 @@ SETUP_BACKENDS = [
 
 
 @dataclass
-class ApiConfig:
-    """API connection and model configuration."""
-    base_url: str = OLLAMA_BASE_URL
-    model: str = DEFAULT_MODEL
-    api_key: str | None = None
-    num_ctx: int = 128000
-
-    @property
-    def is_ollama(self) -> bool:
-        """True when targeting a native Ollama endpoint (not OpenAI-compatible)."""
-        # OpenAI-compatible APIs use /v1 in the path; Ollama doesn't.
-        return "/v1" not in self.base_url
-
-    @property
-    def chat_url(self) -> str:
-        if self.is_ollama:
-            return f"{self.base_url}/api/chat"
-        return f"{self.base_url}/chat/completions"
-
-    @property
-    def auth_headers(self) -> dict[str, str]:
-        if self.api_key:
-            return {"Authorization": f"Bearer {self.api_key}"}
-        return {}
-
-
-@dataclass
 class DiffHunk:
     """A single diff hunk that can be independently staged via git apply --cached."""
-    hunk_id: str        # e.g. "src/main.py#1" or "src/main.py#0" for untracked new files
+    hunk_id: str        # e.g. "src/main.py::1" (same scheme for tracked and untracked files)
     file_path: str      # repository-relative path
     patch: str          # complete patch text for git apply --cached; empty for untracked
     is_untracked: bool = False
+    is_binary: bool = False
 
 
-@dataclass
-class ToolCall:
-    """Represents a tool call extracted from an LLM response."""
-    name: str
-    arguments: dict
-    call_id: str | None = None
-
-
-# ── Tool decorator ─────────────────────────────────────────────────────────────
-#
-# Defining a new tool:
-#   1. Define argument types as pydantic BaseModel subclasses
-#   2. Define a top-level args model (also a BaseModel) for the tool
-#   3. Decorate a function with @tool(ArgsModel)
-#
-# Schema generation, validation, and parsing are all handled automatically.
-
-def tool(args_model: type[BaseModel]):
-    """Decorator factory. @tool(MyArgsModel) attaches LLM tool metadata to a function."""
-    def decorator(fn: Callable) -> Callable:
-        spec = {
-            "type": "function",
-            "function": {
-                "name": fn.__name__,
-                "description": (fn.__doc__ or "").strip(),
-                "parameters": args_model.model_json_schema(),
-            },
-        }
-        fn._tool_spec = spec
-        fn._tool_model = args_model
-        return fn
-    return decorator
-
-
-def _summarize_args(arguments: dict, max_len: int = 80) -> str:
-    """Return a compact one-line summary of tool call arguments for logging."""
-    raw = json.dumps(arguments, separators=(",", ":"))
-    if len(raw) <= max_len:
-        return raw
-    return raw[:max_len - 3] + "..."
-
-
-def _total_message_chars(messages: list[dict]) -> int:
-    """Count total characters across all message content fields."""
-    return sum(len(str(m.get("content", "") or "")) for m in messages)
-
-
-# ── LLM client ────────────────────────────────────────────────────────────────
-
-@dataclass
-class TokenUsage:
-    """Accumulated token usage across all API calls in a session."""
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-
-    def __add__(self, other: "TokenUsage") -> "TokenUsage":
-        return TokenUsage(
-            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
-            completion_tokens=self.completion_tokens + other.completion_tokens,
-        )
-
-    @property
-    def total_tokens(self) -> int:
-        return self.prompt_tokens + self.completion_tokens
-
-    def __str__(self) -> str:
-        return (f"{self.total_tokens:,} tokens "
-                f"({self.prompt_tokens:,} in / {self.completion_tokens:,} out)")
-
-
-class LLMClient:
-    """Encapsulates all communication with the LLM API (Ollama or OpenAI-compatible)."""
-
-    def __init__(self, config: ApiConfig):
-        self.config = config
-        self.usage = TokenUsage()
-
-    def _build_payload(self, prompt: str, tools: list[dict] | None = None,
-                       stream: bool = False) -> dict:
-        """Build an API request payload, adapting to Ollama or OpenAI format."""
-        if self.config.is_ollama:
-            payload: dict[str, Any] = {
-                "model": self.config.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": stream,
-                "keep_alive": "1h",
-                "options": {
-                    "temperature": 0.2,
-                    "num_ctx": self.config.num_ctx,
-                },
-            }
-            if tools:
-                payload["tools"] = tools
-        else:
-            payload = {
-                "model": self.config.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": stream,
-                "temperature": 0.2,
-            }
-            if tools:
-                payload["tools"] = tools
-                # Force the model to call the specific tool
-                payload["tool_choice"] = {
-                    "type": "function",
-                    "function": {"name": tools[0]["function"]["name"]},
-                }
-        return payload
-
-    def _extract_tool_args(self, data: dict) -> dict | None:
-        """Extract tool-call arguments from a response, handling both API formats."""
-        if self.config.is_ollama:
-            tool_calls = data.get("message", {}).get("tool_calls", [])
-            if tool_calls:
-                raw = tool_calls[0]["function"]["arguments"]
-                return json.loads(raw) if isinstance(raw, str) else raw
-            # Fallback: content as JSON
-            content = data.get("message", {}).get("content", "").strip()
-        else:
-            choices = data.get("choices", [])
-            if not choices:
-                return None
-            msg = choices[0].get("message", {})
-            tool_calls = msg.get("tool_calls", [])
-            if tool_calls:
-                raw = tool_calls[0]["function"]["arguments"]
-                return json.loads(raw) if isinstance(raw, str) else raw
-            content = msg.get("content", "").strip()
-
-        # Fallback: parse content as JSON (both backends)
-        if content:
-            content = content.removeprefix("```json").removeprefix("```").strip().removesuffix("```").strip()
-            return json.loads(content)
-        return None
-
-    def _build_payload_messages(self, messages: list[dict],
-                                tools: list[dict] | None = None,
-                                tool_choice: str | dict | None = None,
-                                stream: bool = False) -> dict:
-        """Build a payload from a full conversation history (messages list)."""
-        if self.config.is_ollama:
-            payload: dict[str, Any] = {
-                "model": self.config.model,
-                "messages": messages,
-                "stream": stream,
-                "keep_alive": "1h",
-                "options": {
-                    "temperature": 0.2,
-                    "num_ctx": self.config.num_ctx,
-                },
-            }
-            if tools:
-                payload["tools"] = tools
-            # Ollama does not support tool_choice — omit it
-        else:
-            payload = {
-                "model": self.config.model,
-                "messages": messages,
-                "stream": stream,
-                "temperature": 0.2,
-            }
-            if tools:
-                payload["tools"] = tools
-            if tool_choice is not None:
-                payload["tool_choice"] = tool_choice
-        return payload
-
-    def _extract_tool_call(self, data: dict) -> ToolCall | None:
-        """Extract a tool call from an API response, handling both Ollama and OpenAI formats."""
-        if self.config.is_ollama:
-            tool_calls = data.get("message", {}).get("tool_calls", [])
-            if tool_calls:
-                tc = tool_calls[0]
-                raw = tc["function"]["arguments"]
-                args = json.loads(raw) if isinstance(raw, str) else raw
-                return ToolCall(
-                    name=tc["function"]["name"],
-                    arguments=args,
-                    call_id=tc.get("id"),
-                )
-        else:
-            choices = data.get("choices", [])
-            if not choices:
-                return None
-            msg = choices[0].get("message", {})
-            tool_calls = msg.get("tool_calls", [])
-            if tool_calls:
-                tc = tool_calls[0]
-                raw = tc["function"]["arguments"]
-                args = json.loads(raw) if isinstance(raw, str) else raw
-                return ToolCall(
-                    name=tc["function"]["name"],
-                    arguments=args,
-                    call_id=tc.get("id"),
-                )
-        return None
-
-    def _extract_text_content(self, data: dict) -> str | None:
-        """Extract plain text content from a response when no tool call is present."""
-        if self.config.is_ollama:
-            content = data.get("message", {}).get("content", "").strip()
-        else:
-            choices = data.get("choices", [])
-            if not choices:
-                return None
-            content = choices[0].get("message", {}).get("content", "").strip()
-        return content or None
-
-    def _extract_reasoning(self, data: dict) -> str | None:
-        """Extract reasoning/thinking tokens from an API response if present.
-
-        Handles the two common OpenRouter formats:
-        - message.reasoning        (most thinking models)
-        - message.reasoning_content (DeepSeek-R1 style)
-        """
-        if self.config.is_ollama:
-            return None
-        choices = data.get("choices", [])
-        if not choices:
-            return None
-        msg = choices[0].get("message", {})
-        reasoning = msg.get("reasoning") or msg.get("reasoning_content")
-        return reasoning.strip() if reasoning else None
-
-    def _format_assistant_tool_call(self, data: dict) -> dict:
-        """Extract the assistant message from a raw API response for conversation history.
-
-        Using the raw response message guarantees the format Ollama/OpenAI expects to see back.
-        """
-        if self.config.is_ollama:
-            return data.get("message", {"role": "assistant", "content": ""})
-        return data.get("choices", [{}])[0].get("message", {"role": "assistant", "content": ""})
-
-    def _format_tool_result(self, call_id: str | None, content: str) -> dict:
-        """Build a tool-result message for appending to conversation history."""
-        if call_id is not None and not self.config.is_ollama:
-            return {"role": "tool", "tool_call_id": call_id, "content": content}
-        return {"role": "tool", "content": content}
-
-    def _extract_usage(self, data: dict) -> TokenUsage:
-        """Extract token usage from an API response (Ollama or OpenAI format)."""
-        if self.config.is_ollama:
-            return TokenUsage(
-                prompt_tokens=data.get("prompt_eval_count", 0),
-                completion_tokens=data.get("eval_count", 0),
-            )
-        usage = data.get("usage", {})
-        return TokenUsage(
-            prompt_tokens=usage.get("prompt_tokens", 0),
-            completion_tokens=usage.get("completion_tokens", 0),
-        )
-
-    def call(self, prompt: str, num_ctx: int | None = None) -> str:
-        """Call the LLM with streaming and return the assistant message text."""
-        payload = self._build_payload(prompt, stream=True)
-        if num_ctx is not None and self.config.is_ollama:
-            payload["options"]["num_ctx"] = num_ctx
-        headers = {**self.config.auth_headers, "Content-Type": "application/json"}
-        with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=5.0)) as client:
-            with client.stream("POST", self.config.chat_url, json=payload, headers=headers) as response:
-                response.raise_for_status()
-                chunks = []
-                for line in response.iter_lines():
-                    if not line:
-                        continue
-                    # OpenAI SSE format: lines prefixed with "data: "
-                    if line.startswith("data: "):
-                        line = line[6:]
-                    if line.strip() == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if self.config.is_ollama:
-                        content = data.get("message", {}).get("content", "")
-                        done = data.get("done", False)
-                    else:
-                        delta = (data.get("choices", [{}])[0]
-                                 .get("delta", {}))
-                        content = delta.get("content", "")
-                        done = data.get("choices", [{}])[0].get("finish_reason") is not None
-                    if content:
-                        chunks.append(content)
-                    if done:
-                        self.usage = self.usage + self._extract_usage(data)
-                        break
-                return "".join(chunks)
-
-    def call_with_tool(self, prompt: str, tool_fn: Callable, **tool_kwargs) -> Any:
-        """Call the LLM forcing tool_fn to be called.
-
-        Parses and validates the response into the tool's args model, then calls
-        tool_fn(validated_args, **tool_kwargs) and returns its result.
-        """
-        spec = tool_fn._tool_spec
-        args_model: type[BaseModel] = tool_fn._tool_model
-        actual_prompt = prompt
-        retries = 0
-        failures = []
-        while True:
-            retries += 1
-            payload = self._build_payload(actual_prompt, tools=[spec], stream=False)
-            headers = {**self.config.auth_headers, "Content-Type": "application/json"}
-            with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
-                response = client.post(self.config.chat_url, json=payload, headers=headers)
-                response.raise_for_status()
-                data = response.json()
-            self.usage = self.usage + self._extract_usage(data)
-
-            raw_args = self._extract_tool_args(data)
-            if raw_args is None:
-                raw_args = {}
-
-            # Fix stringified nested values: some models return e.g.
-            # {"commits": "[{'subject': ...}]"} instead of a proper nested structure.
-            # Detect strings that look like Python lists/dicts and try to parse them.
-            for key, val in raw_args.items():
-                if isinstance(val, str) and val.strip().startswith(("[", "{")):
-                    try:
-                        raw_args[key] = json.loads(val)
-                    except json.JSONDecodeError:
-                        try:
-                            raw_args[key] = ast.literal_eval(val)
-                        except (ValueError, SyntaxError):
-                            pass  # leave as-is, let pydantic report the error
-
-            try:
-                validated = args_model.model_validate(raw_args).post_process()
-                return tool_fn(validated, **tool_kwargs)
-            except ValidationError as e:
-                failures.append(str(e))
-                if retries > 5:
-                    raise
-
-                failure_summary = "\n".join(set(failures))
-                actual_prompt = textwrap.dedent(f"""
-                Your previous ({len(failures)}) attempts failed with a validation error:
-                {failure_summary}
-
-                Try again following this prompt exactly:
-                {prompt}
-                """)
-
-    def agentic_loop(self, system_prompt: str, initial_user_message: str,
-                     tool_registry: dict[str, Callable],
-                     terminal_tool: Callable, max_turns: int = MAX_AGENTIC_TURNS,
-                     **kwargs) -> Any:
-        """Run a multi-turn agentic loop until the terminal tool is called.
-
-        Each turn: send messages → extract tool call → dispatch.
-        Investigation tool results are appended to history.
-        Validation errors for the terminal tool become tool-result messages.
-        On the last turn, only the terminal tool is offered.
-
-        Context management: when total message size exceeds CONTEXT_TRIM_THRESHOLD,
-        old tool-result messages are replaced with LLM-generated summaries. The
-        original full content is stored and accessible via the query_tool_result
-        tool so the model can ask targeted questions without re-fetching.
-        A countdown warning is injected when TURNS_WARN_AT turns remain.
-        """
-        # ── result storage for compressed tool results ─────────────────────────
-        result_store: dict[str, str] = {}  # result_id → original full content
-
-        def _summarize_and_store(msg_idx: int, content: str) -> str:
-            """Summarize a tool result via LLM, store the original, return summary."""
-            result_id = f"r{msg_idx}"
-            result_store[result_id] = content
-            prompt = textwrap.dedent(f"""\
-                Summarize this tool output in 2-4 sentences. Focus on filenames,
-                key changes, and any suspicious code. Preserve suspicious code verbatim.
-
-                {content[:TOOL_RESULT_SUMMARIZE_INPUT]}
-            """)
-            summary = self.call(prompt, num_ctx=HUNK_SUMMARIZE_CTX)
-            return (
-                f"[Summarized — id: '{result_id}'. "
-                f"Use query_tool_result to ask specific questions about the full output.]\n"
-                f"{summary.strip()}"
-            )
-
-        def _trim_with_summaries(messages: list[dict]) -> None:
-            """Summarize oldest large tool results until total context is under threshold."""
-            for i, msg in enumerate(messages):
-                if _total_message_chars(messages) <= CONTEXT_TRIM_THRESHOLD:
-                    break
-                if msg.get("role") != "tool":
-                    continue
-                content = msg.get("content", "")
-                if not isinstance(content, str):
-                    continue
-                if content.startswith("[Summarized"):  # already summarized
-                    continue
-                if len(content) <= TOOL_RESULT_SUMMARIZE_SKIP:
-                    continue
-                _log(f"  {_ansi('⋯', _ANSI_DIM)} compressing old result #{i} ({len(content):,} chars)")
-                messages[i] = {**msg, "content": _summarize_and_store(i, content)}
-
-        # ── query_tool_result: closure over result_store and self ───────────────
-        @tool(QueryResultArgs)
-        def query_tool_result(args: QueryResultArgs, **_: Any) -> str:
-            """Access the full (unsummarized) content of a previously summarized tool result.
-
-            When a tool result was compressed to save context, use this to ask a
-            targeted question. The answer is generated from the original full content
-            so no information is lost.
-            """
-            full = result_store.get(args.result_id)
-            if full is None:
-                available = list(result_store.keys()) or ["none"]
-                return (
-                    f"No stored result with id '{args.result_id}'. "
-                    f"Available ids: {available}"
-                )
-            prompt = textwrap.dedent(f"""\
-                The following is the full content of stored tool result '{args.result_id}':
-
-                {full[:50_000]}
-
-                Question: {args.question}
-
-                Answer concisely and directly based only on the content above.
-            """)
-            return self.call(prompt, num_ctx=HUNK_SUMMARIZE_CTX)
-
-        # ── build extended registry that includes query_tool_result ─────────────
-        extended_registry = dict(tool_registry)
-        extended_registry["query_tool_result"] = query_tool_result
-
-        messages: list[dict] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": initial_user_message},
-        ]
-
-        terminal_spec = terminal_tool._tool_spec
-        terminal_name: str = terminal_spec["function"]["name"]
-        terminal_model: type[BaseModel] = terminal_tool._tool_model
-        all_tool_specs = [fn._tool_spec for fn in extended_registry.values()] + [terminal_spec]
-
-        headers = {**self.config.auth_headers, "Content-Type": "application/json"}
-
-        for turn in range(1, max_turns + 1):
-            is_last_turn = (turn == max_turns)
-            turns_remaining = max_turns - turn
-
-            if is_last_turn:
-                tools = [terminal_spec]
-                tool_choice: str | dict | None = (
-                    None if self.config.is_ollama
-                    else {"type": "function", "function": {"name": terminal_name}}
-                )
-            else:
-                tools = all_tool_specs
-                tool_choice = None if self.config.is_ollama else "auto"
-
-            payload = self._build_payload_messages(messages, tools=tools,
-                                                   tool_choice=tool_choice, stream=False)
-
-            with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0)) as client:
-                response = client.post(self.config.chat_url, json=payload, headers=headers)
-                response.raise_for_status()
-                data = response.json()
-            self.usage = self.usage + self._extract_usage(data)
-
-            reasoning = self._extract_reasoning(data)
-            if reasoning:
-                _log_reasoning(reasoning)
-
-            tool_call = self._extract_tool_call(data)
-
-            if tool_call is None:
-                text = self._extract_text_content(data) or ""
-                _log(
-                    f"  {_ansi('⟳', _ANSI_DIM)} {_ansi(f'[{turn}/{max_turns}]', _ANSI_DIM)}"
-                    f" {_ansi('(no tool call — nudging)', _ANSI_DIM)}"
-                )
-                messages.append({"role": "assistant", "content": text})
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"Please call a tool. Use the investigation tools to gather more "
-                        f"information, or call {terminal_name} if you are ready to propose commits."
-                    ),
-                })
-                continue
-
-            _log(
-                f"  {_ansi('⟳', _ANSI_DIM)} {_ansi(f'[{turn}/{max_turns}]', _ANSI_DIM)}"
-                f" {_ansi(tool_call.name, _ANSI_CYAN)}"
-                f"({_ansi(_summarize_args(tool_call.arguments), _ANSI_DIM)})"
-            )
-            messages.append(self._format_assistant_tool_call(data))
-
-            # Coerce stringified nested values (some models return JSON-as-string)
-            raw_args = dict(tool_call.arguments)
-            for key, val in raw_args.items():
-                if isinstance(val, str) and val.strip().startswith(("[", "{")):
-                    try:
-                        raw_args[key] = json.loads(val)
-                    except json.JSONDecodeError:
-                        try:
-                            raw_args[key] = ast.literal_eval(val)
-                        except (ValueError, SyntaxError):
-                            pass
-
-            if tool_call.name == terminal_name:
-                try:
-                    validated = terminal_model.model_validate(raw_args).post_process()
-                    return terminal_tool(validated, **kwargs)
-                except ValidationError as e:
-                    messages.append(self._format_tool_result(
-                        tool_call.call_id,
-                        f"Validation error: {e}\nPlease fix the arguments and call "
-                        f"{terminal_name} again.",
-                    ))
-                    continue
-
-            tool_fn = extended_registry.get(tool_call.name)
-            if tool_fn is None:
-                result_str = (f"Unknown tool: {tool_call.name!r}. "
-                              f"Available: {list(extended_registry.keys())}")
-            else:
-                try:
-                    validated_args = tool_fn._tool_model.model_validate(raw_args).post_process()
-                    result = tool_fn(validated_args, **kwargs)
-                    result_str = result if isinstance(result, str) else json.dumps(result)
-                except Exception as e:
-                    result_str = f"Error calling {tool_call.name}: {e}"
-
-            messages.append(self._format_tool_result(tool_call.call_id, result_str))
-
-            # Context management: when messages are large, summarize old tool results
-            # with the LLM and store originals for query_tool_result access.
-            total_chars = _total_message_chars(messages)
-            if total_chars > CONTEXT_TRIM_THRESHOLD:
-                _log(f"  {_ansi('⋯', _ANSI_DIM)} context {total_chars:,} chars — compressing old results")
-                _trim_with_summaries(messages)
-
-            # Inject a countdown warning when few turns remain so the model
-            # knows it must call the terminal tool soon.
-            if 0 < turns_remaining <= TURNS_WARN_AT:
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"WARNING: Only {turns_remaining} turn(s) remaining. "
-                        f"Stop gathering context and call {terminal_name} NOW with "
-                        f"your best grouping based on what you already know."
-                    ),
-                })
-
-        raise RuntimeError(
-            f"agentic_loop exceeded {max_turns} turns without calling {terminal_name}"
-        )
 
 
 
@@ -1262,6 +628,16 @@ def run_setup_wizard(repo: Path | None) -> None:
     print()
 
 
+def _is_binary_diff(diff_text: str) -> bool:
+    """Return True if the diff text represents a binary file change."""
+    for line in diff_text.splitlines():
+        if line.startswith("Binary files ") and line.endswith(" differ"):
+            return True
+        if line.startswith("GIT binary patch"):
+            return True
+    return False
+
+
 def split_hunks(diff_text: str) -> list[str]:
     """Split a unified diff into individual hunks (each starting with @@)."""
     lines = diff_text.splitlines(keepends=True)
@@ -1301,7 +677,7 @@ class Issue(BaseModel):
 
 class Commit(BaseModel):
     subject: str = Field(description="REQUIRED. Conventional commit subject line (type(scope): desc), under 72 chars. Add '!' after the type when a breaking change is present (e.g. 'feat!(api): rename endpoint').")
-    hunks: list[str] = Field(description="REQUIRED. Hunk IDs to include in this commit, e.g. ['src/main.py#1', 'src/main.py#3']. New untracked files use 'filepath#0'.")
+    hunks: list[str] = Field(description="REQUIRED. Hunk IDs to include in this commit, e.g. ['src/main.py::1', 'src/main.py::3']. Use ONLY the exact hunk IDs from the Available hunks list.")
     body: str = Field(default="", description="4-10 line plain-text commit body, no markdown")
     breaking_change: str = Field(default="", description="If this commit removes or renames a public API, changes a function signature incompatibly, or deletes an exported symbol, describe what broke and how callers must migrate. Leave empty if there is no breaking change.")
     issues: list[Issue] = Field(default_factory=list, description="Issues noticed in the code being committed")
@@ -1319,6 +695,21 @@ class ProposeCommitsArgs(BaseModel):
         self.commits = [commit.post_process() for commit in self.commits]
         return self
 
+class EmitCommitArgs(BaseModel):
+    commit: Commit = Field(description="REQUIRED. A single logical commit to emit")
+
+    def post_process(self):
+        self.commit = self.commit.post_process()
+        return self
+
+class FinalizeCommitsArgs(BaseModel):
+    gitignore: list[str] = Field(default_factory=list, description="Suggested .gitignore patterns for junk files")
+    skipped_hunks: list[str] = Field(default_factory=list,
+        description="Hunk IDs intentionally not committed (junk files, build artifacts, etc.)")
+
+    def post_process(self):
+        return self
+
 sample_issue = Issue(
     message="Unused import 'os' on line 1",
     path="main.py"
@@ -1326,7 +717,7 @@ sample_issue = Issue(
 
 sample_commit = Commit(
     subject="refactor(main): cleanup imports",
-    hunks=["main.py#1"],
+    hunks=["main.py::1"],
     body="Removed unnecessary imports to improve load time and code cleanliness.",
     issues=[sample_issue]
 )
@@ -1338,11 +729,65 @@ SAMPLE_OUTPUT = ProposeCommitsArgs(
 
 
 @tool(ProposeCommitsArgs)
+# DEPRECATED: replaced by emit_commit + finalize_commits. Kept for Commit model and SAMPLE_OUTPUT references.
 def propose_commits(result: ProposeCommitsArgs, analyzer: "GitAnalyzer") -> tuple[list[dict], list[str]]:
     """Group working-tree changes into logical commits and suggest .gitignore patterns for junk files."""
     commits = [c.model_dump() for c in result.commits]
     if not commits:
         raise ValueError("Model returned no valid commit groups.")
+
+    # Mend unknown hunk IDs: try to match by file path, then warn/reject
+    hunk_map = getattr(analyzer, '_hunk_map', None)
+    if hunk_map is not None:
+        valid_ids = set(hunk_map.keys())
+        # Build file→hunks index for fuzzy matching
+        file_to_hunks: dict[str, list[str]] = {}
+        for hid in valid_ids:
+            fpath = hid.rsplit("::", 1)[0] if "::" in hid else hid
+            file_to_hunks.setdefault(fpath, []).append(hid)
+
+        mended: dict[str, str] = {}
+        for c in commits:
+            for hid in c.get("hunks", []):
+                if hid in valid_ids or hid in mended:
+                    continue
+                # Try to find the intended hunk by file path
+                if "::" in hid:
+                    base_path = hid.rsplit("::", 1)[0]
+                    candidates = file_to_hunks.get(base_path, [])
+                    if len(candidates) == 1:
+                        mended[hid] = candidates[0]
+                    elif candidates:
+                        # Multiple hunks for file — try closest index
+                        try:
+                            idx = int(hid.rsplit("::", 1)[1])
+                            closest = min(candidates,
+                                          key=lambda k: abs(int(k.rsplit("::", 1)[1]) - idx))
+                            mended[hid] = closest
+                        except (ValueError, IndexError):
+                            pass
+
+        # Apply corrections
+        if mended:
+            for old, new in sorted(mended.items()):
+                _log(f"  {_ansi('~', _ANSI_DIM)} mended hunk ID {old!r} → {new!r}")
+            for c in commits:
+                c["hunks"] = [mended.get(h, h) for h in c.get("hunks", [])]
+
+        # Re-check: reject only if EVERY referenced hunk is still invalid
+        all_referenced: set[str] = set()
+        for c in commits:
+            all_referenced.update(c.get("hunks", []))
+        still_unknown = all_referenced - valid_ids
+        still_valid = all_referenced & valid_ids
+        if still_unknown and not still_valid:
+            raise ValueError(
+                f"ALL hunk IDs are invalid: {sorted(still_unknown)}. "
+                f"Valid IDs are: {sorted(valid_ids)}"
+            )
+        if still_unknown:
+            _log(f"  {_ansi('!', _ANSI_DIM)} {len(still_unknown)} unknown hunk(s) "
+                 f"will be skipped: {sorted(still_unknown)}")
 
     commits = analyzer.merge_overlapping_commits(commits)
     return commits, result.gitignore
@@ -1499,15 +944,6 @@ def search_diff(result: SearchDiffArgs, analyzer: "GitAnalyzer") -> str:
     return text
 
 
-class QueryResultArgs(BaseModel):
-    result_id: str = Field(
-        description="The result_id shown in the summarized tool output (e.g. 'r5')")
-    question: str = Field(
-        description="Specific question to answer from the full stored result")
-
-    def post_process(self): return self
-
-
 MERGE_PROMPT = textwrap.dedent("""\
     You are merging multiple proposed commits that share the same diff hunks
     and therefore cannot be committed separately.
@@ -1546,6 +982,25 @@ class GitAnalyzer:
     def git(self, args: list[str]) -> str:
         return _git(args, self.repo)
 
+    def check_git_state(self) -> None:
+        """Detect in-progress merge, rebase, or cherry-pick and abort early."""
+        git_dir = self.repo / ".git"
+        checks = [
+            (git_dir / "MERGE_HEAD", "merge"),
+            (git_dir / "REBASE_HEAD", "rebase"),
+            (git_dir / "rebase-merge", "rebase"),
+            (git_dir / "rebase-apply", "rebase"),
+            (git_dir / "CHERRY_PICK_HEAD", "cherry-pick"),
+        ]
+        for path, operation in checks:
+            if path.exists():
+                print(
+                    f"Error: a {operation} is currently in progress. "
+                    f"Please complete or abort it before running git-smart-commit.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
     def get_changed_files(self) -> list[str]:
         """Return list of files with unstaged or staged changes."""
         staged = self.git(["diff", "--cached", "--name-only"]).splitlines()
@@ -1559,15 +1014,15 @@ class GitAnalyzer:
                 files.append(f)
         return files
 
-    def collect_hunks(self) -> dict[str, DiffHunk]:
+    def collect_hunks(self) -> tuple[dict[str, DiffHunk], list[str]]:
         """Collect all diff hunks from the working tree, indexed by hunk ID.
 
         Any currently staged changes are first unstaged (git reset HEAD) so that
         everything is treated uniformly as unstaged working-tree changes.  This is
         safe: working-tree content is never modified.
 
-        Returns a dict mapping hunk_id → DiffHunk.  Hunk IDs for unstaged changes
-        look like "path/file.py#1"; untracked new files use "path/file.py#0".
+        Returns a tuple of (hunk_map, staged_files) where hunk_map maps
+        hunk_id → DiffHunk and staged_files lists files that were originally staged.
         """
         hunk_map: dict[str, DiffHunk] = {}
 
@@ -1582,19 +1037,30 @@ class GitAnalyzer:
             diff = self.git(["diff", "--no-color", "--no-ext-diff", "--", fpath])
             if not diff.strip():
                 continue
+            # Detect binary files: create a single hunk with is_binary=True
+            if _is_binary_diff(diff):
+                hunk_id = f"{fpath}::1"
+                hunk_map[hunk_id] = DiffHunk(
+                    hunk_id=hunk_id,
+                    file_path=fpath,
+                    patch="",
+                    is_binary=True,
+                )
+                continue
             file_hunks = split_hunks(diff)
             for i, patch in enumerate(file_hunks, 1):
-                hunk_id = f"{fpath}#{i}"
+                hunk_id = f"{fpath}::{i}"
                 hunk_map[hunk_id] = DiffHunk(
                     hunk_id=hunk_id,
                     file_path=fpath,
                     patch=patch,
                 )
 
-        # Untracked (new) files are staged whole via git add — use #0 suffix
+        # Untracked (new) files are staged whole via git add — use #1 suffix
+        # (consistent with tracked-file 1-based indexing so LLMs don't mis-reference)
         untracked = self.git(["ls-files", "--others", "--exclude-standard"]).splitlines()
         for fpath in untracked:
-            hunk_id = f"{fpath}#0"
+            hunk_id = f"{fpath}::1"
             hunk_map[hunk_id] = DiffHunk(
                 hunk_id=hunk_id,
                 file_path=fpath,
@@ -1602,7 +1068,7 @@ class GitAnalyzer:
                 is_untracked=True,
             )
 
-        return hunk_map
+        return hunk_map, staged_files
 
     def build_hunk_context(self, hunk_map: dict[str, DiffHunk]) -> str:
         """Build the initial LLM message: hunk list with inline diff content.
@@ -1618,6 +1084,8 @@ class GitAnalyzer:
         for hunk_id, dh in hunk_map.items():
             if dh.is_untracked:
                 hunk_list_lines.append(f"  {hunk_id}  (new untracked file)")
+            elif dh.is_binary:
+                hunk_list_lines.append(f"  {hunk_id}  [binary file]")
             else:
                 adds = dh.patch.count("\n+") - dh.patch.count("\n+++")
                 dels = dh.patch.count("\n-") - dh.patch.count("\n---")
@@ -1630,6 +1098,9 @@ class GitAnalyzer:
             if dh.is_untracked:
                 diff_parts.append(f"--- {hunk_id} ---\n(new untracked file — no diff)")
                 total_chars += 50
+            elif dh.is_binary:
+                diff_parts.append(f"--- {hunk_id} ---\n[binary file]")
+                total_chars += 30
             elif len(dh.patch) <= DIFF_CHARS_PER_FILE:
                 diff_parts.append(f"--- {hunk_id} ---\n{dh.patch}")
                 total_chars += len(dh.patch)
@@ -1717,7 +1188,7 @@ class GitAnalyzer:
                 {hunk}
             """)
 
-            summary = self.client.call(prompt, num_ctx=HUNK_SUMMARIZE_CTX)
+            summary = self.client.call(prompt)
             hunk_summaries.append(summary.strip())
 
         print()
@@ -1769,8 +1240,9 @@ class GitAnalyzer:
 
     def _read_file(self, path: str) -> str:
         """Read a repo file, rejecting path traversal and truncating large files."""
+        resolved_repo = self.repo.resolve()
         target = (self.repo / path).resolve()
-        if not str(target).startswith(str(self.repo) + os.sep) and target != self.repo:
+        if target == resolved_repo or not str(target).startswith(str(resolved_repo) + os.sep):
             return f"[error: path traversal rejected for '{path}']"
         if not target.exists():
             return f"[file not found: {path}]"
@@ -1796,7 +1268,73 @@ class GitAnalyzer:
 
         Returns (commits, gitignore_patterns).
         """
+        self._hunk_map = hunk_map   # expose for validation in propose_commits
         hunk_context = self.build_hunk_context(hunk_map)
+
+        # ── Local state for incremental commit emission ────────────────────────
+        # Stored on self so partial results survive interrupts for plan persistence.
+        self._emitted_commits: list[dict] = []
+        emitted_commits = self._emitted_commits
+        emitted_hunks: set[str] = set()
+
+        # ── emit_commit: closure over emitted_commits/emitted_hunks/hunk_map ──
+        @tool(EmitCommitArgs)
+        def emit_commit(args: EmitCommitArgs, **_: Any) -> str:
+            """Emit a single logical commit. Call once per commit as you identify groupings.
+
+            Validates hunk IDs, prevents duplicates, and returns remaining
+            unassigned hunks so you can plan the next commit.
+            """
+            # Validate hunk IDs against known hunks
+            for hid in args.commit.hunks:
+                if hid not in hunk_map:
+                    return (
+                        f"Error: unknown hunk ID {hid!r}. "
+                        f"Valid IDs are: {sorted(hunk_map.keys())}"
+                    )
+
+            # Check for hunks already emitted in a previous commit
+            for hid in args.commit.hunks:
+                if hid in emitted_hunks:
+                    return (
+                        f"Error: hunk {hid!r} was already assigned to a previous commit. "
+                        f"Each hunk can only appear in one commit."
+                    )
+
+            args.post_process()
+            commit_dict = args.commit.model_dump()
+            emitted_commits.append(commit_dict)
+            emitted_hunks.update(args.commit.hunks)
+
+            remaining = set(hunk_map.keys()) - emitted_hunks
+            return f"Commit emitted: '{args.commit.subject}'. Remaining unassigned hunks: {sorted(remaining)}"
+
+        # ── finalize_commits: terminal tool closure ───────────────────────────
+        @tool(FinalizeCommitsArgs)
+        def finalize_commits(args: FinalizeCommitsArgs, **_: Any) -> tuple:
+            """Finalize all emitted commits. Call after emitting all commits via emit_commit."""
+            if not emitted_commits:
+                raise ValueError("No commits have been emitted yet. Use emit_commit first.")
+
+            # Reject invalid skip IDs before checking coverage
+            bad_skips = set(args.skipped_hunks) - all_hunk_ids
+            if bad_skips:
+                raise ValueError(
+                    f"Unknown hunk IDs in skipped_hunks: {sorted(bad_skips)}. "
+                    f"Valid IDs are: {sorted(all_hunk_ids)}"
+                )
+
+            # Validate all hunks accounted for
+            unassigned = all_hunk_ids - emitted_hunks - set(args.skipped_hunks)
+            if unassigned:
+                raise ValueError(
+                    f"{len(unassigned)} hunk(s) are neither committed nor explicitly skipped: "
+                    f"{sorted(unassigned)}. Either emit_commit them or list them in skipped_hunks."
+                )
+
+            args.post_process()
+            merged = self.merge_overlapping_commits(emitted_commits)
+            return (merged, args.gitignore)
 
         critique_section = ""
         if critique:
@@ -1813,6 +1351,8 @@ class GitAnalyzer:
             "get_diff": get_diff,
             "get_git_log": get_git_log,
             "search_diff": search_diff,
+            "emit_commit": emit_commit,
+            "propose_commits": propose_commits,
         }
 
         # Build system prompt, appending any project-specific issue patterns
@@ -1832,12 +1372,35 @@ class GitAnalyzer:
         if max_turns > MAX_AGENTIC_TURNS:
             _log(f"  {_ansi(f'[{n_hunks} hunks — up to {max_turns} turns]', _ANSI_DIM)}")
 
+        # ── countdown closure: context-aware warning based on emission state ──
+        all_hunk_ids = set(hunk_map.keys())
+
+        def _countdown_message(turns_remaining: int) -> str:
+            if not emitted_commits:
+                return (
+                    f"WARNING: Only {turns_remaining} turn(s) remaining. "
+                    f"You are running low on turns. Start emitting commits "
+                    f"with emit_commit, then call finalize_commits."
+                )
+            remaining_hunks = all_hunk_ids - emitted_hunks
+            if remaining_hunks:
+                return (
+                    f"WARNING: Only {turns_remaining} turn(s) remaining. "
+                    f"{len(remaining_hunks)} hunks still unassigned: {sorted(remaining_hunks)}. "
+                    f"Emit remaining commits or call finalize_commits with these in skipped_hunks NOW."
+                )
+            return (
+                f"WARNING: Only {turns_remaining} turn(s) remaining. "
+                f"All hunks assigned. Call finalize_commits NOW."
+            )
+
         return self.client.agentic_loop(
             system_prompt=system_prompt,
             initial_user_message=initial_message,
             tool_registry=tool_registry,
-            terminal_tool=propose_commits,
+            terminal_tool=finalize_commits,
             max_turns=max_turns,
+            countdown_message_fn=_countdown_message,
             analyzer=self,
         )
 
@@ -1944,10 +1507,14 @@ class GitAnalyzer:
 
     def execute_commits(self, commits: list[dict], hunk_map: dict[str, DiffHunk]) -> None:
         """Stage and commit each group using git apply --cached for individual hunks."""
+        anchor = self.git(["rev-parse", "HEAD"]).strip()
         for i, commit in enumerate(commits, 1):
             subject = commit["subject"]
             body = commit.get("body", "").strip()
             breaking = commit.get("breaking_change", "").strip()
+            # Strip any BREAKING CHANGE trailer the LLM baked into the body
+            # to avoid duplication with the breaking_change field.
+            body = _strip_breaking_change_trailer(body)
             parts = [subject]
             if body:
                 parts.append(body)
@@ -1964,13 +1531,29 @@ class GitAnalyzer:
             # Group hunk IDs by file path (preserving order)
             by_file: dict[str, list[DiffHunk]] = {}
             untracked_paths: list[str] = []
+            untracked_seen: set[str] = set()
+            binary_paths: list[str] = []
+            binary_seen: set[str] = set()
             for hid in hunk_ids:
                 dh = hunk_map.get(hid)
+                if dh is None and "::" in hid:
+                    # Fallback: LLM may have used wrong index for an untracked file
+                    base_path = hid.rsplit("::", 1)[0]
+                    fallback = f"{base_path}::1"
+                    if fallback in hunk_map and hunk_map[fallback].is_untracked:
+                        dh = hunk_map[fallback]
+                        print(f"  ~ Remapped {hid!r} → {fallback!r} (untracked file)", file=sys.stderr)
                 if dh is None:
                     print(f"  ! Unknown hunk {hid!r}, skipping", file=sys.stderr)
                     continue
                 if dh.is_untracked:
-                    untracked_paths.append(dh.file_path)
+                    if dh.file_path not in untracked_seen:
+                        untracked_seen.add(dh.file_path)
+                        untracked_paths.append(dh.file_path)
+                elif dh.is_binary:
+                    if dh.file_path not in binary_seen:
+                        binary_seen.add(dh.file_path)
+                        binary_paths.append(dh.file_path)
                 else:
                     by_file.setdefault(dh.file_path, []).append(dh)
 
@@ -1991,6 +1574,14 @@ class GitAnalyzer:
                 finally:
                     os.unlink(patch_file)
 
+            # Add binary files whole (can't use git apply for binary content)
+            for fpath in binary_paths:
+                try:
+                    self.git(["add", "--", fpath])
+                    print(f"  + {fpath} (binary file)")
+                except RuntimeError as e:
+                    print(f"  ! Could not add {fpath}: {e}", file=sys.stderr)
+
             # Add untracked (new) files whole
             for fpath in untracked_paths:
                 try:
@@ -2007,9 +1598,21 @@ class GitAnalyzer:
 
             try:
                 self.git(["commit", "-m", message])
-                print(f"  ✓ Committed")
+                short_hash = self.git(["rev-parse", "--short", "HEAD"]).strip()
+                print(f"  \u2192 {short_hash} {subject}", file=sys.stderr)
+                print(f"  \u2713 Committed")
             except RuntimeError as e:
                 print(f"  ! Error committing: {e}", file=sys.stderr)
+                current = self.git(["rev-parse", "HEAD"]).strip()
+                if current != anchor:
+                    done = i - 1
+                    print(
+                        f"\n*** Partial commit failure: {done} of {len(commits)} "
+                        f"commits succeeded.\n"
+                        f"*** To undo the partial commits while keeping changes staged:\n"
+                        f"***   git reset --soft {anchor}\n",
+                        file=sys.stderr,
+                    )
                 raise
 
     def update_gitignore(self, patterns: list[str], yes: bool = False) -> None:
@@ -2055,21 +1658,41 @@ class GitAnalyzer:
 
 
 # ── Terminal color helpers ──────────────────────────────────────────────────────
+# Re-exported from steropes with underscore-prefixed aliases for compatibility.
 
-_ANSI_RESET  = "\033[0m"
-_ANSI_BOLD   = "\033[1m"
-_ANSI_DIM    = "\033[2m"
-_ANSI_RED    = "\033[31m"
-_ANSI_GREEN  = "\033[32m"
-_ANSI_YELLOW = "\033[33m"
-_ANSI_CYAN   = "\033[36m"
+_ANSI_RESET  = ANSI_RESET
+_ANSI_BOLD   = ANSI_BOLD
+_ANSI_DIM    = ANSI_DIM
+_ANSI_RED    = ANSI_RED
+_ANSI_GREEN  = ANSI_GREEN
+_ANSI_YELLOW = ANSI_YELLOW
+_ANSI_CYAN   = ANSI_CYAN
 
 
-def _ansi(text: str, *codes: str) -> str:
-    """Wrap text in ANSI escape codes when stdout is a TTY (no-op otherwise)."""
-    if not sys.stdout.isatty():
-        return text
-    return "".join(codes) + text + _ANSI_RESET
+def _strip_breaking_change_trailer(body: str) -> str:
+    """Remove BREAKING CHANGE trailer blocks from a commit body.
+
+    The LLM sometimes bakes a 'BREAKING CHANGE:' trailer directly into the body
+    text in addition to populating the breaking_change field.  Stripping it here
+    prevents duplicate trailers in the final commit message.
+
+    Removes the trailer line and any continuation lines (non-blank lines
+    immediately following the trailer) until the next blank line or end of text.
+    """
+    lines = body.splitlines()
+    cleaned = []
+    in_trailer = False
+    for line in lines:
+        if re.match(r'^BREAKING[- ]CHANGE\s*:', line, re.IGNORECASE):
+            in_trailer = True
+            continue
+        if in_trailer:
+            if not line.strip():
+                in_trailer = False
+            else:
+                continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
 
 
 def _diff_stats(patch: str) -> tuple[int, int]:
@@ -2148,7 +1771,7 @@ def print_proposed_commits(commits: list[dict], gitignore: list[str],
                     dh = hunk_map[hid]
                     by_file.setdefault(dh.file_path, []).append(dh)
                 else:
-                    fpath = hid.rsplit("#", 1)[0] if "#" in hid else hid
+                    fpath = hid.rsplit("::", 1)[0] if "::" in hid else hid
                     by_file.setdefault(fpath, [])
 
             max_path = max((len(fp) for fp in by_file), default=0)
@@ -2203,6 +1826,12 @@ def print_proposed_commits(commits: list[dict], gitignore: list[str],
 
 # ── Textual TUI ────────────────────────────────────────────────────────────────
 
+@dataclass
+class _Reclassify:
+    """Signal returned by the TUI / text-mode to trigger a fresh classification."""
+    critique: str
+
+
 def _build_commit_markup(commit: dict, hunk_map: dict | None, index: int, total: int) -> str:
     """Build a Rich markup string for the commit detail panel."""
     from rich.markup import escape as esc
@@ -2227,7 +1856,7 @@ def _build_commit_markup(commit: dict, hunk_map: dict | None, index: int, total:
                 dh = hunk_map[hid]
                 by_file.setdefault(dh.file_path, []).append(dh)
             else:
-                fpath = hid.rsplit("#", 1)[0] if "#" in hid else hid
+                fpath = hid.rsplit("::", 1)[0] if "::" in hid else hid
                 by_file.setdefault(fpath, [])
 
         max_path = max((len(fp) for fp in by_file), default=0)
@@ -2269,6 +1898,171 @@ def _build_commit_markup(commit: dict, hunk_map: dict | None, index: int, total:
         lines.append("")
 
     return "\n".join(lines)
+
+
+def _get_editor() -> str:
+    """Return the preferred editor from environment variables."""
+    return (
+        os.environ.get("GIT_EDITOR")
+        or os.environ.get("VISUAL")
+        or os.environ.get("EDITOR")
+        or "vi"
+    )
+
+
+def _open_editor_for_message(msg: str) -> str | None:
+    """Open $EDITOR with *msg* and return the edited text, or None if unchanged/empty."""
+    with tempfile.NamedTemporaryFile(suffix=".txt", mode="w", encoding="utf-8", delete=False) as f:
+        f.write(msg + "\n")
+        tmpfile = f.name
+    try:
+        subprocess.run([_get_editor(), tmpfile], check=False)
+        with open(tmpfile, encoding="utf-8") as f:
+            edited = f.read().strip()
+        return edited if edited else None
+    finally:
+        try:
+            os.unlink(tmpfile)
+        except OSError:
+            pass
+
+
+def _merge_two_commits(commits: list[dict], a: int, b: int) -> list[dict]:
+    """Merge commits at indices *a* and *b* into one (keeping *a*'s subject)."""
+    if a == b or not (0 <= a < len(commits)) or not (0 <= b < len(commits)):
+        return commits
+    if a > b:
+        a, b = b, a
+    ca, cb = commits[a], commits[b]
+    bodies = [c.get("body", "") for c in (ca, cb) if c.get("body", "").strip()]
+    merged: dict = {
+        "subject": ca["subject"],
+        "body": "\n\n".join(bodies),
+        "hunks": list(ca.get("hunks", [])) + list(cb.get("hunks", [])),
+        "issues": list(ca.get("issues", [])) + list(cb.get("issues", [])),
+    }
+    bc_a = ca.get("breaking_change", "").strip()
+    bc_b = cb.get("breaking_change", "").strip()
+    if bc_a or bc_b:
+        if bc_a and bc_b and bc_a != bc_b:
+            merged["breaking_change"] = f"{bc_a}; {bc_b}"
+        else:
+            merged["breaking_change"] = bc_a or bc_b
+    result = []
+    for i, c in enumerate(commits):
+        if i == a:
+            result.append(merged)
+        elif i == b:
+            pass  # dropped — merged into a
+        else:
+            result.append(c)
+    return result
+
+
+def _apply_editor_result(commits: list[dict], idx: int, new_msg: str) -> list[dict]:
+    """Parse *new_msg* (subject + optional body) back into *commits[idx]*."""
+    if "\n\n" in new_msg:
+        subject, _, body = new_msg.partition("\n\n")
+    else:
+        subject, body = new_msg, ""
+    commits[idx]["subject"] = subject.strip()
+    commits[idx]["body"] = body.strip()
+    return commits
+
+
+def _run_text_confirmation(
+    commits: list[dict], gitignore: list[str], hunk_map: dict | None
+) -> list[dict] | None:
+    """Interactive text-mode confirmation loop (used when stdout is not a TTY)."""
+    HELP = (
+        "  y              — proceed with commits as shown\n"
+        "  n / q          — cancel\n"
+        "  e <N>          — open $EDITOR for commit N's full message\n"
+        "  m <A> <B>      — merge commits A and B (keeps A's subject)\n"
+        "  d <N>          — delete commit N (hunks remain unstaged)\n"
+        "  r <critique>   — re-classify with critique and re-show plan\n"
+        "  ?              — show this help\n"
+    )
+    while True:
+        print_proposed_commits(commits, gitignore, hunk_map)
+        print()
+        print("Commands: y=proceed  n=cancel  e <N>=edit  m <A> <B>=merge  d <N>=delete  r <critique>=re-classify  ?=help")
+        try:
+            answer = input("> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return None
+
+        if answer in ("y", "yes"):
+            return commits
+
+        if answer in ("n", "no", "q", "quit"):
+            print("Cancelled.")
+            return None
+
+        if answer in ("?", "h", "help"):
+            print(HELP)
+            continue
+
+        parts = answer.split()
+        if parts and parts[0] == "e" and len(parts) == 2:
+            try:
+                n = int(parts[1]) - 1
+            except ValueError:
+                print("Usage: e <N>  (e.g. e 1)")
+                continue
+            if not (0 <= n < len(commits)):
+                print(f"Commit {n + 1} does not exist (1–{len(commits)}).")
+                continue
+            c = commits[n]
+            msg = c["subject"]
+            if c.get("body"):
+                msg += "\n\n" + c["body"]
+            result = _open_editor_for_message(msg)
+            if result:
+                commits = _apply_editor_result(commits, n, result)
+            continue
+
+        if parts and parts[0] == "m" and len(parts) == 3:
+            try:
+                a, b = int(parts[1]) - 1, int(parts[2]) - 1
+            except ValueError:
+                print("Usage: m <A> <B>  (e.g. m 1 2)")
+                continue
+            if a == b:
+                print("Cannot merge a commit with itself.")
+                continue
+            if not (0 <= a < len(commits)) or not (0 <= b < len(commits)):
+                print(f"Commit numbers must be between 1 and {len(commits)}.")
+                continue
+            commits = _merge_two_commits(commits, a, b)
+            print(f"Merged commits {a + 1} and {b + 1}.")
+            continue
+
+        if parts and parts[0] == "d" and len(parts) == 2:
+            try:
+                n = int(parts[1]) - 1
+            except ValueError:
+                print("Usage: d <N>  (e.g. d 2)")
+                continue
+            if len(commits) <= 1:
+                print("Cannot delete the only commit.")
+                continue
+            if not (0 <= n < len(commits)):
+                print(f"Commit {n + 1} does not exist (1–{len(commits)}).")
+                continue
+            commits.pop(n)
+            print(f"Deleted commit {n + 1} (hunks remain unstaged).")
+            continue
+
+        if parts and parts[0] == "r":
+            critique = " ".join(parts[1:]).strip()
+            if not critique:
+                print("Usage: r <critique>  (e.g. r put the test changes in a separate commit)")
+                continue
+            return _Reclassify(critique=critique)
+
+        print("Unknown command — type ? for help.")
 
 
 def _run_confirm_tui(
@@ -2320,7 +2114,35 @@ def _run_confirm_tui(
         def action_dismiss_none(self) -> None:
             self.dismiss(None)
 
-    class _App(App[list[dict] | None]):
+    class _CritiqueModal(ModalScreen[str | None]):
+        """Modal dialog for entering a re-classification critique."""
+
+        DEFAULT_CSS = """
+        _CritiqueModal { align: center middle; }
+        _CritiqueModal > Vertical {
+            width: 76; height: auto;
+            border: double $warning; padding: 1 2; background: $surface;
+        }
+        """
+
+        BINDINGS = [Binding("escape", "dismiss_none", "Cancel", priority=True)]
+
+        def compose(self) -> ComposeResult:
+            with Vertical():
+                yield Label("Re-classify with critique:")
+                yield Input(placeholder="e.g. put the test changes in a separate commit", id="critique-input")
+                yield Label("[dim]Enter to submit · Esc to cancel[/dim]", markup=True)
+
+        def on_mount(self) -> None:
+            self.query_one(Input).focus()
+
+        def on_input_submitted(self, event: Input.Submitted) -> None:
+            self.dismiss(event.value.strip() or None)
+
+        def action_dismiss_none(self) -> None:
+            self.dismiss(None)
+
+    class _App(App[list[dict] | _Reclassify | None]):
         """Two-panel TUI: commit list on the left, details on the right."""
 
         TITLE = "git-smart-commit — review proposed commits"
@@ -2335,12 +2157,16 @@ def _run_confirm_tui(
         """
 
         BINDINGS = [
-            Binding("y", "confirm",      "Proceed",      priority=True),
-            Binding("n", "cancel",       "Cancel",       priority=True),
-            Binding("q", "cancel",       "Quit",         priority=True),
-            Binding("e", "edit_subject", "Edit subject"),
-            Binding("k", "cursor_up",    "",             show=False),
-            Binding("j", "cursor_down",  "",             show=False),
+            Binding("y", "confirm",        "Proceed",      priority=True),
+            Binding("n", "cancel",         "Cancel",       priority=True),
+            Binding("q", "cancel",         "Quit",         priority=True),
+            Binding("e", "edit_subject",   "Edit subject"),
+            Binding("E", "edit_message",   "Edit message ($EDITOR)"),
+            Binding("m", "merge_next",     "Merge ↓"),
+            Binding("d", "delete_commit",  "Delete"),
+            Binding("r", "reclassify",     "Re-classify"),
+            Binding("k", "cursor_up",      "",             show=False),
+            Binding("j", "cursor_down",    "",             show=False),
         ]
 
         def __init__(
@@ -2354,6 +2180,7 @@ def _run_confirm_tui(
             self._gitignore = gitignore_patterns
             self._hunk_map  = hunk_map
             self._sel       = 0          # plain int — no reactive watcher needed
+            self._list_gen  = 0          # bumped on each rebuild to avoid duplicate IDs
 
         # ── layout ───────────────────────────────────────────────────────────
 
@@ -2363,7 +2190,7 @@ def _run_confirm_tui(
                 with Vertical(id="sidebar"):
                     with ListView(id="list"):
                         for i in range(len(self._commits)):
-                            yield ListItem(Label(self._label(i)), id=f"ci-{i}")
+                            yield ListItem(Label(self._label(i)), id=f"ci-{self._list_gen}-{i}")
                 # Initialise detail with the first commit so no on_mount needed.
                 init = (
                     _build_commit_markup(
@@ -2387,7 +2214,7 @@ def _run_confirm_tui(
             old, self._sel = self._sel, idx
             for i in (old, idx):
                 try:
-                    self.query_one(f"#ci-{i}", ListItem).query_one(Label).update(
+                    self.query_one(f"#ci-{self._list_gen}-{i}", ListItem).query_one(Label).update(
                         self._label(i)
                     )
                 except Exception:
@@ -2407,7 +2234,7 @@ def _run_confirm_tui(
             if event.item is None:
                 return
             try:
-                idx = int(event.item.id.split("-", 1)[1])
+                idx = int(event.item.id.split("-")[-1])
             except Exception:
                 return
             if idx != self._sel:
@@ -2441,7 +2268,7 @@ def _run_confirm_tui(
                     return
                 self._commits[idx]["subject"] = new_subject
                 try:
-                    self.query_one(f"#ci-{idx}", ListItem).query_one(Label).update(
+                    self.query_one(f"#ci-{self._list_gen}-{idx}", ListItem).query_one(Label).update(
                         self._label(idx)
                     )
                     self.query_one("#detail", Static).update(
@@ -2454,6 +2281,84 @@ def _run_confirm_tui(
                     pass
 
             self.push_screen(_EditModal(self._commits[idx]["subject"]), _apply)
+
+        def action_edit_message(self) -> None:
+            """Open $EDITOR with the full commit message (subject + body)."""
+            idx = self._sel
+            commit = self._commits[idx]
+            msg = commit["subject"]
+            if commit.get("body"):
+                msg += "\n\n" + commit["body"]
+            with self.suspend():
+                result = _open_editor_for_message(msg)
+            if result:
+                self._commits = _apply_editor_result(self._commits, idx, result)
+                try:
+                    self.query_one(f"#ci-{self._list_gen}-{idx}", ListItem).query_one(Label).update(
+                        self._label(idx)
+                    )
+                    self.query_one("#detail", Static).update(
+                        _build_commit_markup(
+                            self._commits[idx], self._hunk_map,
+                            idx + 1, len(self._commits),
+                        )
+                    )
+                except Exception:
+                    pass
+
+        def _rebuild_list(self) -> None:
+            """Repopulate the sidebar list after the commit list changes.
+
+            lv.clear() schedules removal asynchronously, so we bump _list_gen
+            to ensure newly mounted items always get fresh unique IDs.
+            """
+            self._list_gen += 1
+            lv = self.query_one("#list", ListView)
+            lv.clear()
+            for i in range(len(self._commits)):
+                lv.mount(ListItem(Label(self._label(i)), id=f"ci-{self._list_gen}-{i}"))
+
+        def action_merge_next(self) -> None:
+            """Merge the selected commit with the next one."""
+            idx = self._sel
+            if idx >= len(self._commits) - 1:
+                self.notify("No next commit to merge with", severity="warning")
+                return
+            self._commits = _merge_two_commits(self._commits, idx, idx + 1)
+            self._sel = min(idx, len(self._commits) - 1)
+            self._rebuild_list()
+            if self._commits:
+                self.query_one("#detail", Static).update(
+                    _build_commit_markup(
+                        self._commits[self._sel], self._hunk_map,
+                        self._sel + 1, len(self._commits),
+                    )
+                )
+
+        def action_delete_commit(self) -> None:
+            """Drop the selected commit (its hunks remain unstaged)."""
+            if len(self._commits) <= 1:
+                self.notify("Cannot delete the only commit", severity="warning")
+                return
+            idx = self._sel
+            self._commits.pop(idx)
+            self._sel = min(idx, len(self._commits) - 1)
+            self._rebuild_list()
+            if self._commits:
+                self.query_one("#detail", Static).update(
+                    _build_commit_markup(
+                        self._commits[self._sel], self._hunk_map,
+                        self._sel + 1, len(self._commits),
+                    )
+                )
+            self.notify(f"Commit {idx + 1} deleted — hunks remain unstaged")
+
+        def action_reclassify(self) -> None:
+            """Prompt for a critique and re-run the LLM classifier."""
+            def _submit(critique: str | None) -> None:
+                if critique:
+                    self.exit(_Reclassify(critique=critique))
+            self.push_screen(_CritiqueModal(), _submit)
 
     return _App(commits, gitignore, hunk_map).run()
 
@@ -2499,6 +2404,10 @@ def main() -> None:
     parser.add_argument(
         "--setup", action="store_true",
         help="Run the interactive configuration wizard and exit.",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Save the full LLM conversation history and tool results to a JSON file for debugging.",
     )
 
     args = parser.parse_args()
@@ -2553,16 +2462,94 @@ def main() -> None:
             or gc.get("smart-commit.api-key")
         ),
     )
-    client = LLMClient(api_config)
+    trim_threshold = (OLLAMA_CONTEXT_TRIM_THRESHOLD if api_config.is_ollama
+                      else CONTEXT_TRIM_THRESHOLD)
+    agent_config = AgentConfig(
+        max_agentic_turns=MAX_AGENTIC_TURNS,
+        max_agentic_turns_cap=MAX_AGENTIC_TURNS_CAP,
+        read_file_limit=READ_FILE_LIMIT,
+        context_trim_threshold=trim_threshold,
+        tool_result_summarize_skip=TOOL_RESULT_SUMMARIZE_SKIP,
+        tool_result_summarize_input=TOOL_RESULT_SUMMARIZE_INPUT,
+        turns_warn_at=TURNS_WARN_AT,
+        recent_tool_result_chars=RECENT_TOOL_RESULT_CHARS,
+    )
+    client = LLMClient(api_config, agent_config=agent_config,
+                        log_fn=_log, log_reasoning_fn=_log_reasoning)
+    try:
+        _main_body(client, repo, args, issue_patterns)
+    finally:
+        client.close()
+
+
+def _main_body(client: LLMClient, repo: Path, args, issue_patterns) -> None:
+    """Core logic of main(), separated so LLMClient is always closed."""
     analyzer = GitAnalyzer(repo, client)
+    analyzer.check_git_state()
 
     # Collect hunks (unstages staged files first so everything is uniform)
     _log("Scanning for changes…")
-    hunk_map = analyzer.collect_hunks()
+    hunk_map, originally_staged = analyzer.collect_hunks()
     if not hunk_map:
+        if originally_staged:
+            _git(["add", "--"] + originally_staged, repo)
         print("No changes found.", file=sys.stderr)
         sys.exit(1)
 
+    committed = False
+    try:
+        committed = _main_body_inner(analyzer, args, issue_patterns, hunk_map,
+                                     repo)
+    finally:
+        if not committed and originally_staged:
+            try:
+                _git(["add", "--"] + originally_staged, repo)
+            except Exception:
+                print("Warning: could not re-stage originally staged files.",
+                      file=sys.stderr)
+
+
+def _dump_debug(client: LLMClient) -> None:
+    """Write the last agentic loop conversation and result store to a debug file."""
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    debug_path = Path(tempfile.gettempdir()) / f"gsc-debug-{ts}.json"
+    data = {
+        "timestamp": ts,
+        "messages": getattr(client, "_last_messages", []),
+        "result_store": getattr(client, "_last_result_store", {}),
+    }
+    debug_path.write_text(json.dumps(data, indent=2, default=str))
+    print(f"Debug conversation saved to {debug_path}", file=sys.stderr)
+
+
+def _persist_plan_to_temp(commits, gitignore, hunk_map, analyzer=None):
+    """Write plan, context, and result_store to a temp directory for debugging/replay."""
+    try:
+        plan_dir = tempfile.mkdtemp(prefix="gsc-plan-")
+        hunk_patches = {hid: dh.patch for hid, dh in hunk_map.items() if not dh.is_untracked}
+        plan_data = {
+            "commits": commits,
+            "gitignore": gitignore,
+            "hunk_patches": hunk_patches,
+        }
+        with open(os.path.join(plan_dir, "plan.json"), "w") as f:
+            json.dump(plan_data, f, indent=2, default=str)
+
+        if analyzer is not None:
+            # Persist conversation context from the agentic loop
+            with open(os.path.join(plan_dir, "context.json"), "w") as f:
+                json.dump(analyzer.client._last_messages, f, indent=2, default=str)
+            # Persist the result_store (compressed tool results)
+            with open(os.path.join(plan_dir, "result_store.json"), "w") as f:
+                json.dump(analyzer.client._last_result_store, f, indent=2, default=str)
+
+        print(f"Plan persisted to: {plan_dir}", file=sys.stderr)
+    except Exception as e:
+        print(f"Warning: could not persist plan: {e}", file=sys.stderr)
+
+
+def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
+    """Returns True if commits were executed, False otherwise."""
     # Plan replay mode: load a previously saved plan, skip classification
     if args.plan:
         try:
@@ -2577,46 +2564,60 @@ def main() -> None:
         for hunk_id, patch in plan.get("hunk_patches", {}).items():
             if hunk_id not in hunk_map:
                 # Best-effort: reconstruct a DiffHunk from the saved patch
-                fpath = hunk_id.rsplit("#", 1)[0] if "#" in hunk_id else hunk_id
+                fpath = hunk_id.rsplit("::", 1)[0] if "::" in hunk_id else hunk_id
                 hunk_map[hunk_id] = DiffHunk(
                     hunk_id=hunk_id, file_path=fpath, patch=patch
                 )
+        _persist_plan_to_temp(commits, gitignore, hunk_map)
         if args.dry_run:
             print_proposed_commits(commits, gitignore, hunk_map)
-            return
+            return False
         if args.yes:
             print_proposed_commits(commits, gitignore, hunk_map)
         elif sys.stdout.isatty():
             result = _run_confirm_tui(commits, gitignore, hunk_map)
             if result is None:
                 print("Cancelled.")
-                return
+                return False
             commits = result
         else:
             print_proposed_commits(commits, gitignore, hunk_map)
             try:
                 answer = input("Proceed with these commits? [y/N] ").strip().lower()
             except (KeyboardInterrupt, EOFError):
-                return
+                return False
             if answer not in ("y", "yes"):
                 print("Cancelled.")
-                return
+                return False
         analyzer.execute_commits(commits, hunk_map)
         analyzer.update_gitignore(gitignore, yes=args.yes)
         print("\nDone.")
-        return
+        return True
 
     n_files = len({dh.file_path for dh in hunk_map.values()})
     n_hunks = len(hunk_map)
     _log(f"Found {n_hunks} hunk(s) across {n_files} file(s). Analyzing…")
 
-    commits, gitignore = analyzer.classify_changes(
-        hunk_map, critique=args.critique, issue_patterns=issue_patterns or None
-    )
+    try:
+        commits, gitignore = analyzer.classify_changes(
+            hunk_map, critique=args.critique, issue_patterns=issue_patterns or None
+        )
+    except (KeyboardInterrupt, Exception) as exc:
+        # Persist whatever partial state exists so the user's tokens aren't wasted.
+        partial = getattr(analyzer, "_emitted_commits", [])
+        if partial or analyzer.client._last_messages:
+            _log(f"\n  {_ansi('⚠', _ANSI_YELLOW)} Interrupted — persisting partial plan…")
+            _persist_plan_to_temp(partial, [], hunk_map, analyzer=analyzer)
+        raise
+
+    if args.debug:
+        _dump_debug(analyzer.client)
 
     usage = analyzer.client.usage
     if usage.total_tokens > 0:
         _log(f"  {_ansi(str(usage), _ANSI_DIM)}")
+
+    _persist_plan_to_temp(commits, gitignore, hunk_map, analyzer=analyzer)
 
     # JSON mode: dump plan (including patches for self-contained replay) and exit
     if args.json_out:
@@ -2629,34 +2630,50 @@ def main() -> None:
         if args.save_plan:
             with open(args.save_plan, "w") as f:
                 f.write(plan_json)
-        return
+        return False
 
     if args.dry_run:
         print_proposed_commits(commits, gitignore, hunk_map)
-        return
+        return False
 
     # Interactive TUI when stdout is a terminal; plain-text fallback otherwise.
     if args.yes:
         print_proposed_commits(commits, gitignore, hunk_map)
-    elif sys.stdout.isatty():
-        result = _run_confirm_tui(commits, gitignore, hunk_map)
-        if result is None:
-            print("Cancelled.")
-            return
-        commits = result
     else:
-        print_proposed_commits(commits, gitignore, hunk_map)
-        try:
-            answer = input("Proceed with these commits? [y/N] ").strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            return
-        if answer not in ("y", "yes"):
-            print("Cancelled.")
-            return
+        while True:
+            if sys.stdout.isatty():
+                result = _run_confirm_tui(commits, gitignore, hunk_map)
+            else:
+                result = _run_text_confirmation(commits, gitignore, hunk_map)
+            if result is None:
+                print("Cancelled.")
+                return False
+            if isinstance(result, _Reclassify):
+                _log(f"Re-classifying with critique: {result.critique!r}…")
+                try:
+                    commits, gitignore = analyzer.classify_changes(
+                        hunk_map, critique=result.critique, issue_patterns=issue_patterns or None
+                    )
+                except (KeyboardInterrupt, Exception):
+                    partial = getattr(analyzer, "_emitted_commits", [])
+                    if partial or analyzer.client._last_messages:
+                        _log(f"\n  {_ansi('⚠', _ANSI_YELLOW)} Interrupted — persisting partial plan…")
+                        _persist_plan_to_temp(partial, [], hunk_map, analyzer=analyzer)
+                    raise
+                if args.debug:
+                    _dump_debug(analyzer.client)
+                usage = analyzer.client.usage
+                if usage.total_tokens > 0:
+                    _log(f"  {_ansi(str(usage), _ANSI_DIM)}")
+                _persist_plan_to_temp(commits, gitignore, hunk_map, analyzer=analyzer)
+                continue
+            commits = result
+            break
 
     analyzer.execute_commits(commits, hunk_map)
     analyzer.update_gitignore(gitignore, yes=args.yes)
     print("\nDone.")
+    return True
 
 
 if __name__ == "__main__":

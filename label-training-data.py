@@ -241,6 +241,7 @@ def inject_noise(example: dict, rng: random.Random) -> dict:
 
 # ── Prompt construction ────────────────────────────────────────────────────────
 
+
 def build_messages(example: dict) -> list[dict]:
     """Build the OpenAI messages list for one example."""
     system = SYSTEM_PROMPT + JSON_INSTRUCTION
@@ -261,6 +262,7 @@ def build_messages(example: dict) -> list[dict]:
 
 
 # ── JSON extraction ────────────────────────────────────────────────────────────
+
 
 def extract_json_object(text: str) -> str:
     """Extract the first complete JSON object from text.
@@ -303,6 +305,7 @@ def extract_json_object(text: str) -> str:
 
 
 # ── API call ──────────────────────────────────────────────────────────────────
+
 
 async def call_teacher(
     client: httpx.AsyncClient,
@@ -381,6 +384,7 @@ async def call_teacher(
 
 # ── Idempotency ───────────────────────────────────────────────────────────────
 
+
 def example_key(example: dict) -> str:
     return f"{example['repo_url']}@{example['base_commit']}..{example['head_commit']}"
 
@@ -406,6 +410,7 @@ def load_labeled_keys(output_path: str) -> set[str]:
 
 
 # ── Progress ──────────────────────────────────────────────────────────────────
+
 
 class Progress:
     def __init__(self, total: int):
@@ -434,6 +439,7 @@ class Progress:
 
 
 # ── Per-example worker ────────────────────────────────────────────────────────
+
 
 async def process_one(
     client: httpx.AsyncClient,
@@ -489,6 +495,7 @@ async def process_one(
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
 
+
 async def run(args: argparse.Namespace) -> None:
     labeled_keys = load_labeled_keys(args.output)
     print(f"Already labeled: {len(labeled_keys)} examples", file=sys.stderr)
@@ -502,7 +509,9 @@ async def run(args: argparse.Namespace) -> None:
             try:
                 examples.append(json.loads(line))
             except json.JSONDecodeError as e:
-                print(f"  Warning: skipping malformed line {lineno}: {e}", file=sys.stderr)
+                print(
+                    f"  Warning: skipping malformed line {lineno}: {e}", file=sys.stderr
+                )
 
     print(f"Total examples in input: {len(examples)}", file=sys.stderr)
 
@@ -525,8 +534,14 @@ async def run(args: argparse.Namespace) -> None:
         with open(args.output, "a") as out_f:
             tasks = [
                 process_one(
-                    client, semaphore, out_lock, out_f,
-                    ex, idx, args, progress,
+                    client,
+                    semaphore,
+                    out_lock,
+                    out_f,
+                    ex,
+                    idx,
+                    args,
+                    progress,
                 )
                 for idx, ex in enumerate(pending)
             ]
@@ -542,6 +557,7 @@ async def run(args: argparse.Namespace) -> None:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Label harvested training examples with a teacher model.",
@@ -549,51 +565,69 @@ def main() -> None:
         epilog=__doc__,
     )
     parser.add_argument(
-        "--input", default="repo-dataset.jsonl",
+        "--input",
+        default="repo-dataset.jsonl",
         help="Input JSONL from harvest-training-data (default: repo-dataset.jsonl)",
     )
     parser.add_argument(
-        "--output", default="labeled-training-data.jsonl",
+        "--output",
+        default="labeled-training-data.jsonl",
         help="Output labeled JSONL (default: labeled-training-data.jsonl)",
     )
     parser.add_argument(
-        "--model", required=True,
+        "--model",
+        required=True,
         help="Teacher model name (e.g. step-3.5-flash, deepseek-v3, qwen-plus)",
     )
     parser.add_argument(
-        "--api-url", default="http://localhost:11434/v1",
+        "--api-url",
+        default="http://localhost:11434/v1",
         help="OpenAI-compatible API base URL (default: http://localhost:11434/v1)",
     )
     parser.add_argument(
-        "--api-key", default="ollama",
+        "--api-key",
+        default="ollama",
         help="API key / bearer token (default: ollama)",
     )
     parser.add_argument(
-        "--concurrency", type=int, default=8,
+        "--concurrency",
+        type=int,
+        default=8,
         help="Max concurrent API requests (default: 8)",
     )
     parser.add_argument(
-        "--limit", type=int, default=None,
+        "--limit",
+        type=int,
+        default=None,
         help="Process at most N pending examples (default: all)",
     )
     parser.add_argument(
-        "--noise-prob", type=float, default=0.3,
+        "--noise-prob",
+        type=float,
+        default=0.3,
         help="Probability of injecting junk files into an example (default: 0.3)",
     )
     parser.add_argument(
-        "--seed", type=int, default=42,
+        "--seed",
+        type=int,
+        default=42,
         help="Base random seed for noise injection (default: 42)",
     )
     parser.add_argument(
-        "--reasoning-effort", default=None, choices=["low", "medium", "high"],
+        "--reasoning-effort",
+        default=None,
+        choices=["low", "medium", "high"],
         help="Reasoning effort for reasoning models (default: none/not set)",
     )
     parser.add_argument(
-        "--max-tokens", type=int, default=4096,
+        "--max-tokens",
+        type=int,
+        default=4096,
         help="Max output tokens per request (default: 4096)",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Show what would be labeled without calling the API",
     )
 

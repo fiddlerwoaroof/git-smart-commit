@@ -1,0 +1,15 @@
+[project]
+name = "git-smart-commit"
+version = "0.1.0"
+description = "Analyze git changes and group them into logical commits using an LLM"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv.workspace]
+members = ["src/steropes-pkg"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.4",
+]
