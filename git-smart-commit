@@ -636,6 +636,110 @@ def _is_binary_diff(diff_text: str) -> bool:
     return False
 
 
+def _structural_summary(path: str, content: str) -> str | None:
+    """Return a type-aware structural summary for a large file, or None to fall back to truncation."""
+    ext = Path(path).suffix.lower()
+    header = f"[structural summary of {path} — {len(content):,} chars; use query_tool_result to retrieve specifics]\n"
+
+    if ext == ".py":
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return None
+        imports: list[str] = []
+        seen_imports: set[str] = set()
+        defs: list[str] = []
+        seen_defs: set[str] = set()
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                imp = ast.unparse(node)
+                if imp not in seen_imports:
+                    seen_imports.add(imp)
+                    imports.append(imp)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name not in seen_defs:
+                    seen_defs.add(node.name)
+                    defs.append(f"def {node.name}({ast.unparse(node.args)}): ...")
+            elif isinstance(node, ast.ClassDef):
+                if node.name not in seen_defs:
+                    seen_defs.add(node.name)
+                    bases = ", ".join(ast.unparse(b) for b in node.bases)
+                    methods = [
+                        f"  def {n.name}(...)"
+                        for n in ast.iter_child_nodes(node)
+                        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    ]
+                    defs.append(f"class {node.name}({bases}):\n" + ("\n".join(methods[:10]) or "  ..."))
+        parts = [header]
+        if imports:
+            parts.append("Imports:\n" + "\n".join(f"  {i}" for i in imports[:30]))
+        if defs:
+            parts.append("Top-level definitions:\n" + "\n".join(f"  {d}" for d in defs[:30]))
+        return "\n\n".join(parts)
+
+    if ext in (".json", ".jsonl"):
+        try:
+            if ext == ".jsonl":
+                lines = [l for l in content.splitlines() if l.strip()]
+                data = json.loads(lines[0]) if lines else {}
+                suffix = f" ({len(lines):,} lines)"
+            else:
+                data = json.loads(content)
+                suffix = ""
+        except (json.JSONDecodeError, IndexError):
+            return None
+        if isinstance(data, dict):
+            keys = list(data.keys())
+            key_types = {k: type(v).__name__ for k, v in data.items()}
+            desc = f"Object with {len(keys)} keys{suffix}: " + ", ".join(
+                f"{k!r} ({key_types[k]})" for k in keys[:20]
+            )
+            if len(keys) > 20:
+                desc += f" … (+{len(keys) - 20} more)"
+        elif isinstance(data, list):
+            desc = f"Array of {len(data):,} items{suffix}"
+            if data:
+                desc += f" (each: {type(data[0]).__name__})"
+        else:
+            return None
+        return header + desc
+
+    if ext == ".csv":
+        import csv as _csv, io as _io
+        try:
+            reader = _csv.reader(_io.StringIO(content[:8192]))
+            rows = list(reader)
+        except Exception:
+            return None
+        if not rows:
+            return None
+        headers = rows[0]
+        total_rows = content.count("\n")
+        return (
+            header
+            + f"CSV: {len(headers)} columns, ~{total_rows:,} rows\n"
+            + "Columns: " + ", ".join(headers[:30])
+            + ("" if len(headers) <= 30 else f" … (+{len(headers) - 30} more)")
+        )
+
+    if ext in (".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"):
+        import_lines = list(dict.fromkeys(
+            re.findall(r"^(?:import|export\s+\{[^}]*\}|export\s+\*)\s+.*", content, re.MULTILINE)
+        ))[:20]
+        functions = list(dict.fromkeys(re.findall(r"^(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(", content, re.MULTILINE)))[:20]
+        classes = list(dict.fromkeys(re.findall(r"^(?:export\s+)?class\s+(\w+)", content, re.MULTILINE)))[:20]
+        arrow_fns = list(dict.fromkeys(re.findall(r"^(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?(?:\(|[\w]+\s*=>)", content, re.MULTILINE)))[:10]
+        parts = [header]
+        if import_lines:
+            parts.append("Imports:\n" + "\n".join(f"  {i}" for i in import_lines))
+        named = list(dict.fromkeys(functions + classes + arrow_fns))
+        if named:
+            parts.append("Exports/definitions: " + ", ".join(named))
+        return "\n\n".join(parts)
+
+    return None
+
+
 def _parse_hunk_oldrange(patch: str) -> tuple[int, int] | None:
     """Return (start, count) of the old-file range from the first @@ header in patch.
 
@@ -1285,6 +1389,9 @@ class GitAnalyzer:
             return f"[binary file — {len(raw):,} bytes, cannot display]"
         content = raw.decode("utf-8", errors="replace")
         if len(content) > READ_FILE_LIMIT:
+            summary = _structural_summary(path, content)
+            if summary is not None:
+                return summary
             size = target.stat().st_size
             return (
                 content[:READ_FILE_LIMIT]
