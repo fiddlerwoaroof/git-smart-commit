@@ -1918,6 +1918,30 @@ class _Reclassify:
     critique: str
 
 
+def _format_patch_markup(patch: str, max_lines: int = 120) -> list[str]:
+    """Convert a raw unified diff patch to Rich markup lines."""
+    from rich.markup import escape as esc
+
+    result = []
+    raw_lines = patch.splitlines()
+    for i, line in enumerate(raw_lines):
+        if i >= max_lines:
+            remaining = len(raw_lines) - i
+            result.append(f"    [dim]… {remaining} more line{'s' if remaining != 1 else ''} not shown …[/dim]")
+            break
+        if line.startswith("+++") or line.startswith("---"):
+            result.append(f"    [dim]{esc(line)}[/dim]")
+        elif line.startswith("@@"):
+            result.append(f"    [bold cyan]{esc(line)}[/bold cyan]")
+        elif line.startswith("+"):
+            result.append(f"    [green]{esc(line)}[/green]")
+        elif line.startswith("-"):
+            result.append(f"    [red]{esc(line)}[/red]")
+        else:
+            result.append(f"    [dim]{esc(line)}[/dim]")
+    return result
+
+
 def _build_commit_markup(commit: dict, hunk_map: dict | None, index: int, total: int) -> str:
     """Build a Rich markup string for the commit detail panel."""
     from rich.markup import escape as esc
@@ -1967,6 +1991,10 @@ def _build_commit_markup(commit: dict, hunk_map: dict | None, index: int, total:
                 lines.append(f"  [red]× {fp_esc}[/red]{padding}  [dim]{stats}[/dim]")
             else:
                 lines.append(f"  [yellow]~ {fp_esc}[/yellow]{padding}  [dim]{stats}[/dim]")
+
+            for dh in hunks:
+                if dh is not None and dh.patch and not getattr(dh, "is_binary", False):
+                    lines.extend(_format_patch_markup(dh.patch))
         lines.append("")
 
     breaking = commit.get("breaking_change", "").strip()
