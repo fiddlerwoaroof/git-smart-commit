@@ -201,7 +201,9 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     enough context — for example, to see which class a changed function belongs
     to, what imports already exist, or how unchanged surrounding code looks.
     Call read_file as many times as needed, then call propose_commits when ready.
-""").format(HUNK_GROUPING_RULES=HUNK_GROUPING_RULES, BREAKING_CHANGE_RULES=BREAKING_CHANGE_RULES)
+""").format(CODE_ISSUE_DETECTION=CODE_ISSUE_DETECTION,
+           HUNK_GROUPING_RULES=HUNK_GROUPING_RULES,
+           BREAKING_CHANGE_RULES=BREAKING_CHANGE_RULES)
 
 
 AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
@@ -293,7 +295,9 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     picture of how the changes relate, emit commits for each logical grouping. Continue
     until all hunks are assigned or remaining hunks should be ignored, then call
     finalize_commits.
-""").format(HUNK_GROUPING_RULES=HUNK_GROUPING_RULES, BREAKING_CHANGE_RULES=BREAKING_CHANGE_RULES)
+""").format(CODE_ISSUE_DETECTION=CODE_ISSUE_DETECTION,
+           HUNK_GROUPING_RULES=HUNK_GROUPING_RULES,
+           BREAKING_CHANGE_RULES=BREAKING_CHANGE_RULES)
 
 
 OLLAMA_BASE_URL = "http://localhost:11434"
