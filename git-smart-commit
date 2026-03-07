@@ -437,7 +437,7 @@ class DiffHunk:
 def _git(args: list[str], cwd: Path) -> str:
     """Run a git command and return stdout. Raises on non-zero exit."""
     result = subprocess.run(
-        ["git"] + args,
+        ["git", "-c", "core.quotePath=false"] + args,
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -1342,10 +1342,8 @@ class GitAnalyzer:
             # Validate hunk IDs against known hunks
             for hid in args.commit.hunks:
                 if hid not in hunk_map:
-                    return (
-                        f"Error: unknown hunk ID {hid!r}. "
-                        f"Valid IDs are: {sorted(hunk_map.keys())}"
-                    )
+                    valid = "\n".join(f"- {k}" for k in sorted(hunk_map.keys()))
+                    return f"Error: unknown hunk ID '{hid}'.\nValid IDs are:\n{valid}"
 
             # Check for hunks already emitted in a previous commit
             for hid in args.commit.hunks:
@@ -1361,7 +1359,8 @@ class GitAnalyzer:
             emitted_hunks.update(args.commit.hunks)
 
             remaining = set(hunk_map.keys()) - emitted_hunks
-            return f"Commit emitted: '{args.commit.subject}'. Remaining unassigned hunks: {sorted(remaining)}"
+            remaining_list = "\n".join(f"- {hid}" for hid in sorted(remaining))
+            return f"Commit emitted: '{args.commit.subject}'. Remaining unassigned hunks:\n{remaining_list}"
 
         # ── finalize_commits: terminal tool closure ───────────────────────────
         @tool(FinalizeCommitsArgs)
@@ -1373,17 +1372,20 @@ class GitAnalyzer:
             # Reject invalid skip IDs before checking coverage
             bad_skips = set(args.skipped_hunks) - all_hunk_ids
             if bad_skips:
+                bad_list = "\n".join(f"- {h}" for h in sorted(bad_skips))
+                valid_list = "\n".join(f"- {h}" for h in sorted(all_hunk_ids))
                 raise ValueError(
-                    f"Unknown hunk IDs in skipped_hunks: {sorted(bad_skips)}. "
-                    f"Valid IDs are: {sorted(all_hunk_ids)}"
+                    f"Unknown hunk IDs in skipped_hunks:\n{bad_list}\n\n"
+                    f"Valid IDs are:\n{valid_list}"
                 )
 
             # Validate all hunks accounted for
             unassigned = all_hunk_ids - emitted_hunks - set(args.skipped_hunks)
             if unassigned:
+                unassigned_list = "\n".join(f"- {h}" for h in sorted(unassigned))
                 raise ValueError(
-                    f"{len(unassigned)} hunk(s) are neither committed nor explicitly skipped: "
-                    f"{sorted(unassigned)}. Either emit_commit them or list them in skipped_hunks."
+                    f"{len(unassigned)} hunk(s) are neither committed nor explicitly skipped:\n"
+                    f"{unassigned_list}\nEither emit_commit them or list them in skipped_hunks."
                 )
 
             args.post_process()
