@@ -111,20 +111,7 @@ BREAKING_CHANGE_RULES = textwrap.dedent("""\
       Leave breaking_change empty for purely additive or internal changes.\
 """)
 
-SYSTEM_PROMPT = textwrap.dedent("""\
-    You are a senior software engineer helping organize messy working-tree changes
-    into clean, logical git commits.
-
-    Given a list of changed files and their diffs, your job is to group them into
-    one or more commits. Each commit should represent a single logical change
-    (e.g. "add feature X", "fix bug in Y", "update dependencies",
-    "refactor Z").
-
-    You do not need to commit every file. Skip junk files (editor backups,
-    build artifacts, OS metadata). Collect .gitignore patterns in the gitignore
-    argument, and list skipped hunk IDs in the skipped_hunks argument of
-    finalize_commits.
-
+CODE_ISSUE_DETECTION = textwrap.dedent("""\
     You also actively look for common coding issues that a linter
     would catch and code smells such as using conditionals where
     polymorphism is more appropriate or violations of the Law of
@@ -157,7 +144,23 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     ```
 
     Any detected issues should be added to the list of issues in a
-    particular commit.
+    particular commit.""")
+
+SYSTEM_PROMPT = textwrap.dedent("""\
+    You are a senior software engineer helping organize messy working-tree changes
+    into clean, logical git commits.
+
+    Given a list of changed files and their diffs, your job is to group them into
+    one or more commits. Each commit should represent a single logical change
+    (e.g. "add feature X", "fix bug in Y", "update dependencies",
+    "refactor Z").
+
+    You do not need to commit every file. Skip junk files (editor backups,
+    build artifacts, OS metadata). Collect .gitignore patterns in the gitignore
+    argument, and list skipped hunk IDs in the skipped_hunks argument of
+    finalize_commits.
+
+    {CODE_ISSUE_DETECTION}
 
     Rules:
     - CRITICAL: Tool calls must use JSON for arguments. Other formats will result in failure. In particular, strings must be surrounded by double-quotes (") and if one occurs literally, escape with backslashes.
@@ -194,7 +197,8 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     enough context — for example, to see which class a changed function belongs
     to, what imports already exist, or how unchanged surrounding code looks.
     Call read_file as many times as needed, then call propose_commits when ready.
-""").format(BREAKING_CHANGE_RULES=BREAKING_CHANGE_RULES)
+""").format(CODE_ISSUE_DETECTION=CODE_ISSUE_DETECTION,
+           BREAKING_CHANGE_RULES=BREAKING_CHANGE_RULES)
 
 
 AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
@@ -258,39 +262,7 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     argument, and list skipped hunk IDs in the skipped_hunks argument of
     finalize_commits.
 
-    You also actively look for common coding issues that a linter
-    would catch and code smells such as using conditionals where
-    polymorphism is more appropriate or violations of the Law of
-    Demeter: misused APIs, suspicious code patterns, etc. For example:
-
-    ```java
-    // missing if braces
-    if (a == 1) # wrong, add an issue "missing braces for if statement"
-       b;
-       c;
-    d;
-    ```
-
-    ```c
-    // incorrect arguments for well-known functions and Constructors
-    printf(1); # wrong, add an issue "printf called with invalid arguments"
-    ```
-
-    ```python
-    // Wrong keyword for the programming language
-    if True:
-        throw new Exception("foo") # wrong, add an issue "invalid keywords for python"
-
-    ```
-
-    ```python
-    # Using exceptions for control flow instead of sys.exit
-    if answer == "no":
-        raise Exception("Cancelled.")  # wrong: should be sys.exit(0) or return
-    ```
-
-    Any detected issues should be added to the list of issues in a
-    particular commit.
+    {CODE_ISSUE_DETECTION}
 
     Rules:
     - CRITICAL: Tool calls must use JSON for arguments. Other formats will result in failure. In particular, strings must be surrounded by double-quotes (") and if one occurs literally, escape with backslashes.
@@ -327,7 +299,8 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     picture of how the changes relate, emit commits for each logical grouping. Continue
     until all hunks are assigned or remaining hunks should be ignored, then call
     finalize_commits.
-""").format(BREAKING_CHANGE_RULES=BREAKING_CHANGE_RULES)
+""").format(CODE_ISSUE_DETECTION=CODE_ISSUE_DETECTION,
+           BREAKING_CHANGE_RULES=BREAKING_CHANGE_RULES)
 
 
 OLLAMA_BASE_URL = "http://localhost:11434"
