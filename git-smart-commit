@@ -210,7 +210,7 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
       have — the initial diff context uses id 'r1' when summarized.
     - emit_commit(commit): Emit a single logical commit. It validates hunk IDs, rejects
       duplicates, and returns the remaining unassigned hunks so you can plan the next commit.
-      You do NOT need to emit immediately — investigate first to build a holistic picture.
+      Emit each group as soon as it is clear — do not wait until all files are investigated.
     - finalize_commits(gitignore, skipped_hunks): Finalize all emitted commits. Call this
       once after you have emitted all commits via emit_commit. Pass any suggested .gitignore
       patterns in gitignore. Any unassigned hunks must be listed in skipped_hunks — the tool
@@ -331,10 +331,10 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
       must update. Also add '!' after the type in the subject (e.g. 'feat!(api):').
       Leave breaking_change empty for purely additive or internal changes.
 
-    Investigate the changes thoroughly before emitting commits. Once you have a clear
-    picture of how the changes relate, emit commits for each logical grouping. Continue
-    until all hunks are assigned or remaining hunks should be ignored, then call
-    finalize_commits.
+    Emit commits progressively as each logical group becomes clear — do not front-load
+    all investigation before emitting. Investigate only what is needed for the next
+    commit, emit it, then move on. Continue until all hunks are assigned or should be
+    ignored, then call finalize_commits.
 """)
 
 
