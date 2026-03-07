@@ -422,7 +422,7 @@ class LLMClient:
         headers = {**self.config.auth_headers, "Content-Type": "application/json"}
 
         consecutive_no_tool_calls = 0
-        _extended_for_terminal_validation = False  # allow at most one extra turn on last-turn failure
+        terminal_validation_error: Exception | None = None
 
         for turn in range(1, max_turns + 1):
             is_last_turn = (turn == max_turns) or (consecutive_no_tool_calls >= 3)
@@ -499,23 +499,11 @@ class LLMClient:
                     self._last_messages = list(messages)
                     self._last_result_store = dict(result_store)
                     return terminal_tool(validated, **kwargs)
-                except ValidationError as e:
+                except (ValidationError, ValueError) as e:
+                    terminal_validation_error = e
+                    prefix = "Validation error" if isinstance(e, ValidationError) else "Error"
                     err_str = (
-                        f"Validation error: {e}\nPlease fix the arguments and call "
-                        f"{terminal_name} again."
-                    )
-                    if is_last_turn and not _extended_for_terminal_validation:
-                        max_turns += 1
-                        _extended_for_terminal_validation = True
-                    if len(err_str) > ac.tool_result_summarize_skip:
-                        err_str = _summarize_and_store(len(messages), err_str)
-                    messages.append(self._format_tool_result(
-                        tool_call.call_id, err_str,
-                    ))
-                    continue
-                except ValueError as e:
-                    err_str = (
-                        f"Error: {e}\nPlease fix the arguments and call "
+                        f"{prefix}: {e}\nPlease fix the arguments and call "
                         f"{terminal_name} again."
                     )
                     if is_last_turn and not _extended_for_terminal_validation:
@@ -569,11 +557,57 @@ class LLMClient:
 
         self._last_messages = list(messages)
         self._last_result_store = dict(result_store)
-        if _extended_for_terminal_validation:
-            raise RuntimeError(
-                f"agentic_loop: {terminal_name} was called but failed validation on the "
-                f"final turn and could not be corrected within {max_turns} turns"
+
+        if terminal_validation_error is not None:
+            # The terminal tool was called on the last turn but failed validation.
+            # Grant one bonus turn so the model can fix its arguments.
+            self._log(
+                f"  {ansi('↻', ANSI_DIM)} {terminal_name} failed validation on last turn"
+                f" — granting one bonus turn"
             )
+            bonus_tools = [terminal_spec]
+            bonus_tool_choice: str | dict | None = (
+                None if self.config.is_ollama
+                else {"type": "function", "function": {"name": terminal_name}}
+            )
+            bonus_payload = self._build_payload_messages(
+                messages, tools=bonus_tools, tool_choice=bonus_tool_choice, stream=False
+            )
+
+            def _do_bonus_post() -> dict:
+                response = self._http.post(self.config.chat_url, json=bonus_payload, headers=headers)
+                response.raise_for_status()
+                return response.json()
+
+            try:
+                bonus_data = self._retry_request(_do_bonus_post)
+                self.usage = self.usage + self._extract_usage(bonus_data)
+                bonus_call = self._extract_tool_call(bonus_data)
+                if bonus_call is not None and bonus_call.name == terminal_name:
+                    bonus_raw = dict(bonus_call.arguments)
+                    for key, val in bonus_raw.items():
+                        if isinstance(val, str) and val.strip().startswith(("[", "{")):
+                            try:
+                                bonus_raw[key] = json.loads(val)
+                            except json.JSONDecodeError:
+                                try:
+                                    bonus_raw[key] = ast.literal_eval(val)
+                                except (ValueError, SyntaxError):
+                                    pass
+                    messages.append(self._format_assistant_tool_call(bonus_data))
+                    validated = terminal_model.model_validate(bonus_raw).post_process()
+                    self._last_messages = list(messages)
+                    self._last_result_store = dict(result_store)
+                    return terminal_tool(validated, **kwargs)
+            except Exception:
+                pass
+
+            raise RuntimeError(
+                f"agentic_loop: {terminal_name} was called on the last turn but failed "
+                f"validation; bonus retry also failed. "
+                f"Last error: {terminal_validation_error}"
+            )
+
         raise RuntimeError(
             f"agentic_loop exceeded {max_turns} turns without calling {terminal_name}"
         )
