@@ -38,6 +38,11 @@ class ApiConfig:
         return "/v1" not in self.base_url
 
     @property
+    def is_anthropic(self) -> bool:
+        """True when targeting Anthropic's API (enables cache_control on system prompt)."""
+        return "anthropic.com" in self.base_url
+
+    @property
     def chat_url(self) -> str:
         if self.is_ollama:
             return f"{self.base_url}/api/chat"

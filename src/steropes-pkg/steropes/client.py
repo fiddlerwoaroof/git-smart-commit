@@ -401,8 +401,16 @@ class LLMClient:
         extended_registry = dict(tool_registry)
         extended_registry["query_tool_result"] = query_tool_result
 
+        # For Anthropic, use structured content blocks with cache_control so the
+        # static system prompt is prefix-cached across all turns in the agentic loop.
+        if self.config.is_anthropic:
+            system_content: str | list = [{"type": "text", "text": system_prompt,
+                                           "cache_control": {"type": "ephemeral"}}]
+        else:
+            system_content = system_prompt
+
         messages: list[dict] = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": initial_user_message},
         ]
 
