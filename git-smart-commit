@@ -346,6 +346,30 @@ DIFF_TOTAL_CHARS   = 120000   # hard cap on total context sent to classifier
 PRIOR_HUNK_WINDOW  = 4        # how many previous hunk summaries to include as context
 HUNK_SUMMARIZE_CTX = 8192    # smaller context window for hunk summarization calls (speed)
 
+# Files matching these glob patterns are machine-generated; skip LLM summarization
+# and instead emit a fixed stat-based description.
+SKIP_SUMMARIZATION_PATTERNS: list[str] = [
+    # Lockfiles
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Cargo.lock",
+    "poetry.lock",
+    "uv.lock",
+    "Gemfile.lock",
+    "composer.lock",
+    "Pipfile.lock",
+    "go.sum",
+    "flake.lock",
+    # Minified / generated assets
+    "*.min.js",
+    "*.min.css",
+    "*.bundle.js",
+    # Build manifests / checksums
+    "*.tfstate",
+    "*.tfstate.backup",
+]
+
 MAX_AGENTIC_TURNS     = 20    # base safeguard for the agentic investigation loop
 MAX_AGENTIC_TURNS_CAP = 50    # absolute ceiling when scaling with hunk count
 READ_FILE_LIMIT    = 50_000   # max chars returned by the read_file tool
@@ -1110,6 +1134,10 @@ class GitAnalyzer:
             elif dh.is_binary:
                 diff_parts.append(f"--- {hunk_id} ---\n[binary file]")
                 total_chars += 30
+            elif self._is_skip_summarization(dh.file_path):
+                summary = self._stat_only_summary(dh.patch)
+                diff_parts.append(f"--- {hunk_id} ---\n{summary}")
+                total_chars += len(summary)
             elif len(dh.patch) <= DIFF_CHARS_PER_FILE:
                 diff_parts.append(f"--- {hunk_id} ---\n{dh.patch}")
                 total_chars += len(dh.patch)
@@ -1141,6 +1169,18 @@ class GitAnalyzer:
         if untracked:
             parts.append("Untracked (new files):\n" + "\n".join(f"  {f}" for f in untracked))
         return "\n\n".join(parts)
+
+    def _is_skip_summarization(self, fname: str) -> bool:
+        """Return True if fname matches a known machine-generated file pattern."""
+        import fnmatch
+        basename = Path(fname).name
+        return any(fnmatch.fnmatch(basename, pat) for pat in SKIP_SUMMARIZATION_PATTERNS)
+
+    def _stat_only_summary(self, diff_text: str) -> str:
+        """Return a concise stat-only description from a unified diff without calling the LLM."""
+        adds = diff_text.count("\n+") - diff_text.count("\n+++")
+        dels = diff_text.count("\n-") - diff_text.count("\n---")
+        return f"[skipped — machine-generated file] +{adds}/-{dels} lines"
 
     def _summarize_file_diff(self, fname: str, diff_text: str, remaining_budget: int | None = None) -> str:
         """Ask the model to summarize each hunk, passing the last N summaries as context.
@@ -1224,7 +1264,9 @@ class GitAnalyzer:
             for fname in changed:
                 file_diff = self.git(["diff"] + extra_args + ["--no-color", "--no-ext-diff", "--", fname])
 
-                if len(file_diff) <= DIFF_CHARS_PER_FILE:
+                if self._is_skip_summarization(fname):
+                    content = self._stat_only_summary(file_diff)
+                elif len(file_diff) <= DIFF_CHARS_PER_FILE:
                     content = file_diff
                 else:
                     _log(f"  {_ansi('⋯', _ANSI_DIM)} summarizing large diff: {fname} ({len(file_diff):,} chars)")
