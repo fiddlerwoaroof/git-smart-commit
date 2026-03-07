@@ -1354,6 +1354,17 @@ class GitAnalyzer:
             )
 
         initial_message = hunk_context + critique_section
+        # Append project-specific patterns to the user message (not the system prompt)
+        # so the system prompt stays identical across all projects, enabling prefix caching.
+        if issue_patterns:
+            bullet_list = "\n".join(f"- {p}" for p in issue_patterns)
+            initial_message = (
+                initial_message
+                + f"\n\nProject-specific patterns to watch for (flag as issues if found):\n"
+                + bullet_list
+            )
+
+        system_prompt = AGENTIC_SYSTEM_PROMPT
 
         tool_registry = {
             "read_file": read_file,
@@ -1363,16 +1374,6 @@ class GitAnalyzer:
             "emit_commit": emit_commit,
             "propose_commits": propose_commits,
         }
-
-        # Build system prompt, appending any project-specific issue patterns
-        system_prompt = AGENTIC_SYSTEM_PROMPT
-        if issue_patterns:
-            bullet_list = "\n".join(f"    - {p}" for p in issue_patterns)
-            system_prompt = (
-                system_prompt
-                + f"\n\n    Project-specific patterns to watch for (flag as issues if found):\n"
-                + bullet_list
-            )
 
         # Scale turn limit with changeset size: allow ~2 extra turns per 5 hunks,
         # capped at MAX_AGENTIC_TURNS_CAP to avoid runaway loops.
