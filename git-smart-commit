@@ -95,6 +95,22 @@ from steropes.ui import (
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
+BREAKING_CHANGE_RULES = textwrap.dedent("""\
+    - In the issues field, call out any bugs, incorrect API usage, or suspicious
+      patterns you observe in the diff. Examples: wrong number of arguments,
+      misused stdlib functions, unreachable code, obvious logic errors. Be specific:
+      include the file, the offending line or pattern, and why it's wrong.
+      Leave issues empty only if you find nothing suspicious.
+    - Watch specifically for arguments passed to constructors or functions that
+      don't accept them (e.g. Exception() does not accept a file= keyword argument).
+    - BREAKING CHANGE detection: if a commit removes or renames a public function,
+      class, or module; deletes an exported symbol; or changes a function/method
+      signature incompatibly (added required param, removed param, changed type),
+      set breaking_change to a concise description of what broke and how callers
+      must update. Also add '!' after the type in the subject (e.g. 'feat!(api):').
+      Leave breaking_change empty for purely additive or internal changes.\
+""")
+
 SYSTEM_PROMPT = textwrap.dedent("""\
     You are a senior software engineer helping organize messy working-tree changes
     into clean, logical git commits.
@@ -172,25 +188,13 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     - Do not repeat the commit type in the subject description (e.g., avoid "refactor(tools): refactor the parser").
     - Write body content based only on what you observe in the diff.
       Do not reference issue numbers or details not visible in the changes.
-    - In the issues field, call out any bugs, incorrect API usage, or suspicious
-      patterns you observe in the diff. Examples: wrong number of arguments,
-      misused stdlib functions, unreachable code, obvious logic errors. Be specific:
-      include the file, the offending line or pattern, and why it's wrong.
-      Leave issues empty only if you find nothing suspicious.
-    - Watch specifically for arguments passed to constructors or functions that
-      don't accept them (e.g. Exception() does not accept a file= keyword argument).
-    - BREAKING CHANGE detection: if a commit removes or renames a public function,
-      class, or module; deletes an exported symbol; or changes a function/method
-      signature incompatibly (added required param, removed param, changed type),
-      set breaking_change to a concise description of what broke and how callers
-      must update. Also add '!' after the type in the subject (e.g. 'feat!(api):').
-      Leave breaking_change empty for purely additive or internal changes.
+    {BREAKING_CHANGE_RULES}
 
     You have access to a read_file tool. Use it when the diff alone is not
     enough context — for example, to see which class a changed function belongs
     to, what imports already exist, or how unchanged surrounding code looks.
     Call read_file as many times as needed, then call propose_commits when ready.
-""")
+""").format(BREAKING_CHANGE_RULES=BREAKING_CHANGE_RULES)
 
 
 AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
@@ -317,25 +321,13 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
     - Do not repeat the commit type in the subject description (e.g., avoid "refactor(tools): refactor the parser").
     - Write body content based only on what you observe in the diff.
       Do not reference issue numbers or details not visible in the changes.
-    - In the issues field, call out any bugs, incorrect API usage, or suspicious
-      patterns you observe in the diff. Examples: wrong number of arguments,
-      misused stdlib functions, unreachable code, obvious logic errors. Be specific:
-      include the file, the offending line or pattern, and why it's wrong.
-      Leave issues empty only if you find nothing suspicious.
-    - Watch specifically for arguments passed to constructors or functions that
-      don't accept them (e.g. Exception() does not accept a file= keyword argument).
-    - BREAKING CHANGE detection: if a commit removes or renames a public function,
-      class, or module; deletes an exported symbol; or changes a function/method
-      signature incompatibly (added required param, removed param, changed type),
-      set breaking_change to a concise description of what broke and how callers
-      must update. Also add '!' after the type in the subject (e.g. 'feat!(api):').
-      Leave breaking_change empty for purely additive or internal changes.
+    {BREAKING_CHANGE_RULES}
 
     Investigate the changes thoroughly before emitting commits. Once you have a clear
     picture of how the changes relate, emit commits for each logical grouping. Continue
     until all hunks are assigned or remaining hunks should be ignored, then call
     finalize_commits.
-""")
+""").format(BREAKING_CHANGE_RULES=BREAKING_CHANGE_RULES)
 
 
 OLLAMA_BASE_URL = "http://localhost:11434"
