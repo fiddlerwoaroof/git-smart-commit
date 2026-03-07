@@ -277,6 +277,7 @@ class LLMClient:
                      tool_registry: dict[str, Callable],
                      terminal_tool: Callable, max_turns: int | None = None,
                      countdown_message_fn: Callable | None = None,
+                     nudge_message_fn: Callable[[int], str] | None = None,
                      context_trim_threshold: int | None = None,
                      **kwargs) -> Any:
         """Run a multi-turn agentic loop until the terminal tool is called.
@@ -412,8 +413,10 @@ class LLMClient:
 
         headers = {**self.config.auth_headers, "Content-Type": "application/json"}
 
+        consecutive_no_tool_calls = 0
+
         for turn in range(1, max_turns + 1):
-            is_last_turn = (turn == max_turns)
+            is_last_turn = (turn == max_turns) or (consecutive_no_tool_calls >= 3)
             turns_remaining = max_turns - turn
 
             if is_last_turn:
@@ -445,20 +448,23 @@ class LLMClient:
 
             if tool_call is None:
                 text = self._extract_text_content(data) or ""
+                consecutive_no_tool_calls += 1
                 self._log(
                     f"  {ansi('⟳', ANSI_DIM)} {ansi(f'[{turn}/{max_turns}]', ANSI_DIM)}"
-                    f" {ansi('(no tool call — nudging)', ANSI_DIM)}"
+                    f" {ansi(f'(no tool call — nudging #{consecutive_no_tool_calls})', ANSI_DIM)}"
                 )
                 messages.append({"role": "assistant", "content": text})
-                messages.append({
-                    "role": "user",
-                    "content": (
+                if nudge_message_fn is not None:
+                    nudge_text = nudge_message_fn(consecutive_no_tool_calls)
+                else:
+                    nudge_text = (
                         f"Please call a tool. Use the investigation tools to gather more "
                         f"information, or call {terminal_name} if you are ready to propose commits."
-                    ),
-                })
+                    )
+                messages.append({"role": "user", "content": nudge_text})
                 continue
 
+            consecutive_no_tool_calls = 0
             self._log(
                 f"  {ansi('⟳', ANSI_DIM)} {ansi(f'[{turn}/{max_turns}]', ANSI_DIM)}"
                 f" {ansi(tool_call.name, ANSI_CYAN)}"

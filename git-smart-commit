@@ -1360,6 +1360,40 @@ class GitAnalyzer:
                 f"All hunks assigned. Call finalize_commits NOW."
             )
 
+        def _nudge_message(consecutive: int) -> str:
+            remaining_hunks = all_hunk_ids - emitted_hunks
+            if consecutive >= 3:
+                # Hard escalation: tell the model exactly what to do
+                if not emitted_commits:
+                    return (
+                        f"You have not called any tool {consecutive} times in a row. "
+                        f"You MUST call a tool now. Call emit_commit to start grouping hunks. "
+                        f"Available hunk IDs: {sorted(all_hunk_ids)}."
+                    )
+                if remaining_hunks:
+                    return (
+                        f"You have not called any tool {consecutive} times in a row. "
+                        f"You MUST call finalize_commits NOW. "
+                        f"These hunks are still unassigned: {sorted(remaining_hunks)}. "
+                        f"Include them in skipped_hunks if you do not want to commit them."
+                    )
+                return (
+                    f"You have not called any tool {consecutive} times in a row. "
+                    f"All hunks are assigned. You MUST call finalize_commits NOW."
+                )
+            # Gentle nudge with context
+            if not emitted_commits:
+                return (
+                    f"Please call a tool. Use investigation tools or call emit_commit "
+                    f"to start grouping hunks. Available hunk IDs: {sorted(all_hunk_ids)}."
+                )
+            if remaining_hunks:
+                return (
+                    f"Please call a tool. {len(remaining_hunks)} hunk(s) still unassigned: "
+                    f"{sorted(remaining_hunks)}. Emit more commits or call finalize_commits."
+                )
+            return "Please call finalize_commits — all hunks have been assigned."
+
         return self.client.agentic_loop(
             system_prompt=system_prompt,
             initial_user_message=initial_message,
@@ -1367,6 +1401,7 @@ class GitAnalyzer:
             terminal_tool=finalize_commits,
             max_turns=max_turns,
             countdown_message_fn=_countdown_message,
+            nudge_message_fn=_nudge_message,
             analyzer=self,
         )
 
