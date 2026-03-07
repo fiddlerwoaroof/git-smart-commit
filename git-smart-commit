@@ -211,6 +211,8 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
       (staged=true for staged only, staged=false for unstaged only, omit for both)
     - get_git_log(n): Get the last n commit subjects to learn this project's conventions
     - search_diff(pattern, context_lines): Search all diffs for a regex pattern
+    - list_symbols(path): List classes, functions, and methods in a file with line numbers.
+      Use this to understand a file's structure without reading the whole file.
     - query_tool_result(result_id, question): When any prior content (the initial diff
       context or a tool result) was summarized to save context, use this to ask a targeted
       question about the original full output. The result_id is shown in the summary text
@@ -937,6 +939,74 @@ def search_diff(result: SearchDiffArgs, analyzer: "GitAnalyzer") -> str:
     return text
 
 
+class ListSymbolsArgs(BaseModel):
+    path: str = Field(description="Repository-relative path to the file to list symbols for")
+
+    def post_process(self): return self
+
+
+@tool(ListSymbolsArgs)
+def list_symbols(args: ListSymbolsArgs, analyzer: "GitAnalyzer") -> str:
+    """List top-level symbols (classes, functions, methods) in a file with line numbers.
+
+    Uses universal-ctags to extract the symbol structure without reading the whole file.
+    Useful for understanding a file's layout and grouping related changes.
+    Requires universal-ctags (nix shell nixpkgs#universal-ctags or brew install universal-ctags).
+    """
+    resolved_repo = analyzer.repo.resolve()
+    target = (analyzer.repo / args.path).resolve()
+    if target == resolved_repo or not str(target).startswith(str(resolved_repo) + os.sep):
+        return f"[error: path traversal rejected for '{args.path}']"
+    if not target.exists():
+        return f"[file not found: {args.path}]"
+
+    try:
+        proc = subprocess.run(
+            ["ctags", "--output-format=json", "--fields=+nKS", "-f", "-", str(target)],
+            capture_output=True, text=True, timeout=10,
+        )
+    except FileNotFoundError:
+        return "[error: ctags not found — install universal-ctags (nix shell nixpkgs#universal-ctags)]"
+    except subprocess.TimeoutExpired:
+        return "[error: ctags timed out]"
+
+    if proc.returncode != 0 and not proc.stdout.strip():
+        return f"[error running ctags: {proc.stderr.strip() or 'no output'}]"
+
+    tags: list[dict] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            tag = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if tag.get("_type") == "tag":
+            tags.append(tag)
+
+    if not tags:
+        first = next((l for l in proc.stdout.splitlines() if l.strip()), "")
+        if first and not first.startswith("{"):
+            return "[error: ctags output is not JSON — install universal-ctags (nix shell nixpkgs#universal-ctags)]"
+        return f"No symbols found in {args.path}"
+
+    tags.sort(key=lambda t: t.get("line", 0))
+
+    out = [f"Symbols in {args.path}:"]
+    for tag in tags:
+        name = tag.get("name", "?")
+        kind = tag.get("kind", "?")
+        lineno = tag.get("line", "?")
+        scope = tag.get("scope", "")
+        sig = tag.get("signature", "")
+        if scope:
+            out.append(f"  {lineno:>5}  {kind} {name}{sig}  [{scope}]")
+        else:
+            out.append(f"  {lineno:>5}  {kind} {name}{sig}")
+    return "\n".join(out)
+
+
 MERGE_PROMPT = textwrap.dedent("""\
     You are merging multiple proposed commits that share the same diff hunks
     and therefore cannot be committed separately.
@@ -1344,6 +1414,7 @@ class GitAnalyzer:
             "get_diff": get_diff,
             "get_git_log": get_git_log,
             "search_diff": search_diff,
+            "list_symbols": list_symbols,
             "emit_commit": emit_commit,
             "propose_commits": propose_commits,
         }
