@@ -229,17 +229,25 @@ AGENTIC_SYSTEM_PROMPT = textwrap.dedent("""\
 
     Investigation strategy:
     - Start with the file list and stats you receive
-    - Use get_git_log early to learn this project's commit style conventions
+    - Bias toward action: once you can articulate a logical grouping, emit it — do not
+      seek additional confirmation or investigate further unless genuinely uncertain.
+    - Many changesets need little or no investigation. Skip straight to emit_commit if:
+        * All changes are documentation (.md, .rst, .txt, docs/)
+        * All changes are tests only (test/, spec/, *_test.*, *.spec.*)
+        * All changes are configuration only (.json, .yaml, .toml, .env, config/)
+        * Changes are in a single directory with an obvious shared purpose
+        * The diff stats alone make grouping clear (e.g., one feature file + its test)
+    - Use get_git_log ONLY if you genuinely need to learn this project's commit style
+      and it wasn't already apparent from the initial context. Do NOT call it reflexively.
     - Use get_diff on files whose grouping is unclear from stats alone
     - Use read_file when you need full file context (imports, class structure, etc.)
     - Use search_diff to find patterns across all changes (debug prints, TODOs, etc.)
     - If the initial diff context or a prior tool result was summarized, use
-      query_tool_result with the id shown in the summary before re-fetching it
-    - Investigate before committing: explore the changes to understand the full picture
-      before emitting any commits. It is fine to delay emit_commit until you have a
-      clear mental model of how the changes relate to each other.
-    - When you are confident in a grouping, call emit_commit. Check the remaining
-      unassigned hunks in the response and continue until done, then call finalize_commits.
+      query_tool_result with the id shown in the summary before re-fetching it.
+      Do NOT call query_tool_result to re-read content you already have in context.
+    - When you are confident in a grouping, call emit_commit immediately. Check the
+      remaining unassigned hunks in the response and continue until done, then call
+      finalize_commits.
 
     You do not need to commit every file. Skip junk files (editor backups,
     build artifacts, OS metadata). Collect .gitignore patterns in the gitignore
