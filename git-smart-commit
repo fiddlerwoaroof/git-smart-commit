@@ -671,6 +671,21 @@ def _is_binary_diff(diff_text: str) -> bool:
     return False
 
 
+def _parse_hunk_oldrange(patch: str) -> tuple[int, int] | None:
+    """Return (start, count) of the old-file range from the first @@ header in patch.
+
+    Returns None if no @@ line is found or the format is unexpected.
+    """
+    for line in patch.splitlines():
+        if line.startswith("@@"):
+            m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+", line)
+            if m:
+                start = int(m.group(1))
+                count = int(m.group(2)) if m.group(2) is not None else 1
+                return (start, count)
+    return None
+
+
 def split_hunks(diff_text: str) -> list[str]:
     """Split a unified diff into individual hunks (each starting with @@)."""
     lines = diff_text.splitlines(keepends=True)
@@ -1597,8 +1612,52 @@ class GitAnalyzer:
 
         return "".join(result)
 
+    def _warn_dependent_splits(self, commits: list[dict], hunk_map: dict[str, DiffHunk]) -> None:
+        """Warn when the same file has hunks in multiple commits with overlapping/adjacent ranges.
+
+        Such splits are likely to fail during git apply --cached because applying
+        the first commit's hunks shifts line numbers, invalidating the context of later hunks.
+        Hunks separated by more than GIT_CONTEXT_LINES lines are independent and safe.
+        """
+        GIT_CONTEXT_LINES = 3  # git diff default context window
+
+        # Build: file_path → list of (commit_idx, start, end) for old-file ranges
+        file_commit_ranges: dict[str, list[tuple[int, int, int]]] = {}
+        for ci, commit in enumerate(commits):
+            for hid in commit.get("hunks", []):
+                dh = hunk_map.get(hid)
+                if dh is None or dh.is_untracked or dh.is_binary or not dh.patch:
+                    continue
+                r = _parse_hunk_oldrange(dh.patch)
+                if r is None:
+                    continue
+                start, count = r
+                end = start + max(count - 1, 0)
+                file_commit_ranges.setdefault(dh.file_path, []).append((ci, start, end))
+
+        for fpath, ranges in file_commit_ranges.items():
+            # Only check files that appear in more than one commit
+            commit_indices = {ci for ci, _, _ in ranges}
+            if len(commit_indices) < 2:
+                continue
+            # Check all pairs for overlap or adjacency
+            for i, (ci_a, s_a, e_a) in enumerate(ranges):
+                for ci_b, s_b, e_b in ranges[i + 1:]:
+                    if ci_a == ci_b:
+                        continue
+                    # Ranges overlap or are within the context window of each other
+                    gap = max(s_b - e_a, s_a - e_b)
+                    if gap <= GIT_CONTEXT_LINES:
+                        print(
+                            f"  ⚠ {fpath}: hunks in commits {ci_a + 1} and {ci_b + 1} are "
+                            f"adjacent or overlapping (gap={gap} lines) — git apply may fail. "
+                            f"Consider grouping them into a single commit.",
+                            file=sys.stderr,
+                        )
+
     def execute_commits(self, commits: list[dict], hunk_map: dict[str, DiffHunk]) -> None:
         """Stage and commit each group using git apply --cached for individual hunks."""
+        self._warn_dependent_splits(commits, hunk_map)
         anchor = self.git(["rev-parse", "HEAD"]).strip()
         for i, commit in enumerate(commits, 1):
             subject = commit["subject"]
@@ -1651,6 +1710,8 @@ class GitAnalyzer:
 
             # Apply hunks per file via git apply --cached
             for fpath, file_hunks in by_file.items():
+                # Sort hunks by start line so earlier hunks don't shift context for later ones
+                file_hunks.sort(key=lambda dh: (_parse_hunk_oldrange(dh.patch) or (0, 0))[0])
                 patch_text = self._build_combined_patch([dh.patch for dh in file_hunks])
                 with tempfile.NamedTemporaryFile(
                     mode="w", suffix=".patch", delete=False, encoding="utf-8"
