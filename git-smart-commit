@@ -1100,7 +1100,19 @@ class GitAnalyzer:
         return _git(args, self.repo)
 
     def check_git_state(self) -> None:
-        """Detect in-progress merge, rebase, or cherry-pick and abort early."""
+        """Detect detached HEAD, in-progress merge, rebase, or cherry-pick and abort early."""
+        # Detached HEAD: symbolic-ref exits non-zero when HEAD points to a commit, not a branch
+        try:
+            self.git(["symbolic-ref", "--quiet", "HEAD"])
+        except RuntimeError:
+            print(
+                "Error: git-smart-commit requires a branch to commit to, "
+                "but HEAD is detached (not on any branch).\n"
+                "Tip: run 'git checkout -b <branch>' to create a branch first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         git_dir = self.repo / ".git"
         checks = [
             (git_dir / "MERGE_HEAD", "merge"),
