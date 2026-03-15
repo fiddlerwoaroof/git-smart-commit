@@ -39,13 +39,15 @@ def _load_pure_functions() -> types.ModuleType:
     fn_names = ["split_hunks", "_parse_hunk_oldrange", "_is_binary_diff"]
     stubs = "\n\n".join(_extract_function(src, n) for n in fn_names)
 
-    minimal_src = "\n".join([
-        "import re",
-        "import textwrap",
-        "from pathlib import Path",
-        "",
-        stubs,
-    ])
+    minimal_src = "\n".join(
+        [
+            "import re",
+            "import textwrap",
+            "from pathlib import Path",
+            "",
+            stubs,
+        ]
+    )
 
     mod = types.ModuleType("gsc_pure")
     mod.__file__ = str(_SCRIPT)
