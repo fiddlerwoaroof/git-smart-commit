@@ -1119,22 +1119,21 @@ MERGE_PROMPT = textwrap.dedent("""\
     and therefore cannot be committed separately.
 
     Combine them into a SINGLE commit that:
-    - Has one conventional commit subject line (type(scope): desc), under 72 chars
-    - Has a body (4-10 lines) summarizing ALL the changes coherently
+    - Has one conventional commit subject line and body per the format rules below
     - Lists ALL affected hunks (deduped)
     - Collects ALL issues (deduped)
-    - Follow type priority from standard rules: feat > fix > refactor > chore.
-      feat takes priority if any input commit is a feat; chore only if nothing else applies.
-    - If any input commit has a non-empty breaking_change, set breaking_change on the merged
-      commit to a combined description and add '!' to the type.
+    - If any input commit has a non-empty breaking_change, set breaking_change on the
+      merged commit to a combined description (and add '!' to the type per the rules below).
 
     Do NOT just concatenate the subjects. Write a new, coherent subject and body
     that covers the full set of changes as a single logical unit.
 
+    {COMMIT_FORMAT_RULES}
+
     Call the merge_commits tool with your answer.
 
     Here are the commits to merge:
-""")
+""").format(COMMIT_FORMAT_RULES=COMMIT_FORMAT_RULES)
 
 
 # ── GitAnalyzer ────────────────────────────────────────────────────────────────
