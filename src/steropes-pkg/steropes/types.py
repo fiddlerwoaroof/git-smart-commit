@@ -6,6 +6,7 @@ from dataclasses import dataclass
 @dataclass
 class ToolCall:
     """Represents a tool call extracted from an LLM response."""
+
     name: str
     arguments: dict
     call_id: str | None = None
@@ -14,6 +15,7 @@ class ToolCall:
 @dataclass
 class TokenUsage:
     """Accumulated token usage across all API calls in a session."""
+
     prompt_tokens: int = 0
     completion_tokens: int = 0
 
@@ -28,5 +30,7 @@ class TokenUsage:
         return self.prompt_tokens + self.completion_tokens
 
     def __str__(self) -> str:
-        return (f"{self.total_tokens:,} tokens "
-                f"({self.prompt_tokens:,} in / {self.completion_tokens:,} out)")
+        return (
+            f"{self.total_tokens:,} tokens "
+            f"({self.prompt_tokens:,} in / {self.completion_tokens:,} out)"
+        )

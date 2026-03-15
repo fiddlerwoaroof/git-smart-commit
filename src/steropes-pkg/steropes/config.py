@@ -10,6 +10,7 @@ class AgentConfig:
     All values have sensible defaults matching the original git-smart-commit
     behavior. Applications can override individual fields as needed.
     """
+
     max_agentic_turns: int = 20
     max_agentic_turns_cap: int = 50
     read_file_limit: int = 50_000
@@ -27,6 +28,7 @@ class ApiConfig:
 
     No hardcoded defaults — the application must provide base_url and model.
     """
+
     base_url: str
     model: str
     api_key: str | None = None

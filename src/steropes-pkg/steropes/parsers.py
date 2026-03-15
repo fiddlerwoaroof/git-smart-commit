@@ -34,8 +34,9 @@ class ResponseParser:
             tc = tool_calls[0]
             raw = tc["function"]["arguments"]
             args = json.loads(raw) if isinstance(raw, str) else raw
-            return ToolCall(name=tc["function"]["name"], arguments=args,
-                            call_id=tc.get("id"))
+            return ToolCall(
+                name=tc["function"]["name"], arguments=args, call_id=tc.get("id")
+            )
         return None
 
     def extract_tool_args(self, data: dict) -> dict | None:
@@ -45,7 +46,13 @@ class ResponseParser:
             return tc.arguments
         content = self.get_message(data).get("content", "").strip()
         if content:
-            content = content.removeprefix("```json").removeprefix("```").strip().removesuffix("```").strip()
+            content = (
+                content.removeprefix("```json")
+                .removeprefix("```")
+                .strip()
+                .removesuffix("```")
+                .strip()
+            )
             return json.loads(content)
         return None
 

@@ -2,13 +2,13 @@
 
 import sys
 
-ANSI_RESET  = "\033[0m"
-ANSI_BOLD   = "\033[1m"
-ANSI_DIM    = "\033[2m"
-ANSI_RED    = "\033[31m"
-ANSI_GREEN  = "\033[32m"
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_DIM = "\033[2m"
+ANSI_RED = "\033[31m"
+ANSI_GREEN = "\033[32m"
 ANSI_YELLOW = "\033[33m"
-ANSI_CYAN   = "\033[36m"
+ANSI_CYAN = "\033[36m"
 
 
 def ansi(text: str, *codes: str) -> str:
