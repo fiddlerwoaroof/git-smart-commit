@@ -18,31 +18,41 @@ from .ui import ANSI_CYAN, ANSI_DIM, ansi, log, log_reasoning
 
 class QueryResultArgs(BaseModel):
     result_id: str = Field(
-        description="The result_id shown in the summarized tool output (e.g. 'r5')")
+        description="The result_id shown in the summarized tool output (e.g. 'r5')"
+    )
     question: str = Field(
-        description="Specific question to answer from the full stored result")
+        description="Specific question to answer from the full stored result"
+    )
 
-    def post_process(self): return self
+    def post_process(self):
+        return self
 
 
 class LLMClient:
     """Encapsulates all communication with the LLM API (Ollama or OpenAI-compatible)."""
 
-    def __init__(self, config: ApiConfig,
-                 agent_config: AgentConfig | None = None,
-                 log_fn: Callable[[str], None] | None = None,
-                 log_reasoning_fn: Callable[[str], None] | None = None):
+    def __init__(
+        self,
+        config: ApiConfig,
+        agent_config: AgentConfig | None = None,
+        log_fn: Callable[[str], None] | None = None,
+        log_reasoning_fn: Callable[[str], None] | None = None,
+    ):
         self.config = config
         self.agent_config = agent_config or AgentConfig()
         self.usage = TokenUsage()
-        self.parser: ResponseParser = OllamaParser() if config.is_ollama else OpenAIParser()
+        self.parser: ResponseParser = (
+            OllamaParser() if config.is_ollama else OpenAIParser()
+        )
         self._http = httpx.Client(
             timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0),
         )
         self._last_result_store: dict[str, str] = {}
         self._last_messages: list[dict] = []
         self._log = log_fn if log_fn is not None else log
-        self._log_reasoning = log_reasoning_fn if log_reasoning_fn is not None else log_reasoning
+        self._log_reasoning = (
+            log_reasoning_fn if log_reasoning_fn is not None else log_reasoning
+        )
 
     # -- resource management ---------------------------------------------------
 
@@ -56,8 +66,9 @@ class LLMClient:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def _build_payload(self, prompt: str, tools: list[dict] | None = None,
-                       stream: bool = False) -> dict:
+    def _build_payload(
+        self, prompt: str, tools: list[dict] | None = None, stream: bool = False
+    ) -> dict:
         """Build an API request payload, adapting to Ollama or OpenAI format."""
         if self.config.is_ollama:
             payload: dict[str, Any] = {
@@ -92,10 +103,13 @@ class LLMClient:
         """Extract tool-call arguments from a response, handling both API formats."""
         return self.parser.extract_tool_args(data)
 
-    def _build_payload_messages(self, messages: list[dict],
-                                tools: list[dict] | None = None,
-                                tool_choice: str | dict | None = None,
-                                stream: bool = False) -> dict:
+    def _build_payload_messages(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
+        stream: bool = False,
+    ) -> dict:
         """Build a payload from a full conversation history (messages list)."""
         if self.config.is_ollama:
             payload: dict[str, Any] = {
@@ -148,22 +162,34 @@ class LLMClient:
         """Extract token usage from an API response (Ollama or OpenAI format)."""
         return self.parser.extract_usage(data)
 
-    def _retry_request(self, fn: Callable, max_retries: int = 3, initial_delay: float = 1.0) -> Any:
+    def _retry_request(
+        self, fn: Callable, max_retries: int = 3, initial_delay: float = 1.0
+    ) -> Any:
         """Execute fn with exponential backoff on transient errors."""
         for attempt in range(max_retries + 1):
             try:
                 return fn()
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout,
-                    httpx.PoolTimeout, httpx.ConnectTimeout) as e:
+            except (
+                httpx.ConnectError,
+                httpx.ReadTimeout,
+                httpx.WriteTimeout,
+                httpx.PoolTimeout,
+                httpx.ConnectTimeout,
+            ) as e:
                 if attempt == max_retries:
                     raise
-                delay = initial_delay * (2 ** attempt)
-                self._log(f"  {ansi('↻', ANSI_DIM)} retry {attempt + 1}/{max_retries} after {delay:.1f}s: {type(e).__name__}")
+                delay = initial_delay * (2**attempt)
+                self._log(
+                    f"  {ansi('↻', ANSI_DIM)} retry {attempt + 1}/{max_retries} after {delay:.1f}s: {type(e).__name__}"
+                )
                 time.sleep(delay)
             except httpx.HTTPStatusError as e:
                 # Retry on 429 (rate limit) and 5xx (server errors)
-                if e.response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
-                    delay = initial_delay * (2 ** attempt)
+                if (
+                    e.response.status_code in (429, 500, 502, 503, 504)
+                    and attempt < max_retries
+                ):
+                    delay = initial_delay * (2**attempt)
                     # Honor Retry-After header if present
                     retry_after = e.response.headers.get("retry-after")
                     if retry_after:
@@ -171,7 +197,9 @@ class LLMClient:
                             delay = max(delay, float(retry_after))
                         except ValueError:
                             pass
-                    self._log(f"  {ansi('↻', ANSI_DIM)} retry {attempt + 1}/{max_retries} after {delay:.1f}s: HTTP {e.response.status_code}")
+                    self._log(
+                        f"  {ansi('↻', ANSI_DIM)} retry {attempt + 1}/{max_retries} after {delay:.1f}s: HTTP {e.response.status_code}"
+                    )
                     time.sleep(delay)
                 else:
                     raise
@@ -184,7 +212,9 @@ class LLMClient:
         headers = {**self.config.auth_headers, "Content-Type": "application/json"}
 
         def _do_stream() -> str:
-            with self._http.stream("POST", self.config.chat_url, json=payload, headers=headers) as response:
+            with self._http.stream(
+                "POST", self.config.chat_url, json=payload, headers=headers
+            ) as response:
                 response.raise_for_status()
                 chunks: list[str] = []
                 for line in response.iter_lines():
@@ -203,10 +233,12 @@ class LLMClient:
                         content = data.get("message", {}).get("content", "")
                         done = data.get("done", False)
                     else:
-                        delta = (data.get("choices", [{}])[0]
-                                 .get("delta", {}))
+                        delta = data.get("choices", [{}])[0].get("delta", {})
                         content = delta.get("content", "")
-                        done = data.get("choices", [{}])[0].get("finish_reason") is not None
+                        done = (
+                            data.get("choices", [{}])[0].get("finish_reason")
+                            is not None
+                        )
                     if content:
                         chunks.append(content)
                     if done:
@@ -233,7 +265,9 @@ class LLMClient:
             headers = {**self.config.auth_headers, "Content-Type": "application/json"}
 
             def _do_tool_post() -> dict:
-                response = self._http.post(self.config.chat_url, json=payload, headers=headers)
+                response = self._http.post(
+                    self.config.chat_url, json=payload, headers=headers
+                )
                 response.raise_for_status()
                 return response.json()
 
@@ -273,13 +307,18 @@ class LLMClient:
                 {prompt}
                 """)
 
-    def agentic_loop(self, system_prompt: str, initial_user_message: str,
-                     tool_registry: dict[str, Callable],
-                     terminal_tool: Callable, max_turns: int | None = None,
-                     countdown_message_fn: Callable | None = None,
-                     nudge_message_fn: Callable[[int], str] | None = None,
-                     context_trim_threshold: int | None = None,
-                     **kwargs) -> Any:
+    def agentic_loop(
+        self,
+        system_prompt: str,
+        initial_user_message: str,
+        tool_registry: dict[str, Callable],
+        terminal_tool: Callable,
+        max_turns: int | None = None,
+        countdown_message_fn: Callable | None = None,
+        nudge_message_fn: Callable[[int], str] | None = None,
+        context_trim_threshold: int | None = None,
+        **kwargs,
+    ) -> Any:
         """Run a multi-turn agentic loop until the terminal tool is called.
 
         Each turn: send messages -> extract tool call -> dispatch.
@@ -296,7 +335,11 @@ class LLMClient:
         ac = self.agent_config
         if max_turns is None:
             max_turns = ac.max_agentic_turns
-        trim_threshold = context_trim_threshold if context_trim_threshold is not None else ac.context_trim_threshold
+        trim_threshold = (
+            context_trim_threshold
+            if context_trim_threshold is not None
+            else ac.context_trim_threshold
+        )
 
         # ── result storage for compressed tool results ─────────────────────────
         result_store: dict[str, str] = {}  # result_id -> original full content
@@ -309,7 +352,7 @@ class LLMClient:
                 f"[Summarized — id: '{result_id}'. "
                 f"Use query_tool_result to ask specific questions about the full output.]\n"
             )
-            input_snippet = content[:ac.tool_result_summarize_input]
+            input_snippet = content[: ac.tool_result_summarize_input]
 
             # Level 1 — Normal summary
             prompt_l1 = textwrap.dedent(f"""\
@@ -320,7 +363,9 @@ class LLMClient:
             """)
             summary_l1 = self.call(prompt_l1).strip()
             if len(summary_l1) < len(content):
-                self._log(f"  {ansi('⋯', ANSI_DIM)} summarization level 1 (normal) succeeded for #{msg_idx}")
+                self._log(
+                    f"  {ansi('⋯', ANSI_DIM)} summarization level 1 (normal) succeeded for #{msg_idx}"
+                )
                 return header + summary_l1
 
             # Level 2 — Aggressive bullet points (target half the tokens)
@@ -332,12 +377,18 @@ class LLMClient:
             """)
             summary_l2 = self.call(prompt_l2).strip()
             if len(summary_l2) < len(content):
-                self._log(f"  {ansi('⋯', ANSI_DIM)} summarization level 2 (aggressive) succeeded for #{msg_idx}")
+                self._log(
+                    f"  {ansi('⋯', ANSI_DIM)} summarization level 2 (aggressive) succeeded for #{msg_idx}"
+                )
                 return header + summary_l2
 
             # Level 3 — Deterministic truncate (always reduces size)
-            self._log(f"  {ansi('⋯', ANSI_DIM)} summarization level 3 (deterministic truncate) for #{msg_idx}")
-            truncated = content[:512] + "\n[Truncated — use query_tool_result for full content]"
+            self._log(
+                f"  {ansi('⋯', ANSI_DIM)} summarization level 3 (deterministic truncate) for #{msg_idx}"
+            )
+            truncated = (
+                content[:512] + "\n[Truncated — use query_tool_result for full content]"
+            )
             return header + truncated
 
         def _trim_with_summaries(messages: list[dict]) -> None:
@@ -357,17 +408,24 @@ class LLMClient:
                     continue
 
                 if role == "tool":
-                    if i == last_tool_idx and len(content) <= ac.recent_tool_result_chars:
+                    if (
+                        i == last_tool_idx
+                        and len(content) <= ac.recent_tool_result_chars
+                    ):
                         continue
                     if len(content) <= ac.tool_result_summarize_skip:
                         continue
-                    self._log(f"  {ansi('⋯', ANSI_DIM)} compressing tool result #{i} ({len(content):,} chars)")
+                    self._log(
+                        f"  {ansi('⋯', ANSI_DIM)} compressing tool result #{i} ({len(content):,} chars)"
+                    )
                     messages[i] = {**msg, "content": _summarize_and_store(i, content)}
 
                 elif role == "user" and i == 1:
                     if len(content) <= ac.tool_result_summarize_skip:
                         continue
-                    self._log(f"  {ansi('⋯', ANSI_DIM)} compressing initial diff context ({len(content):,} chars)")
+                    self._log(
+                        f"  {ansi('⋯', ANSI_DIM)} compressing initial diff context ({len(content):,} chars)"
+                    )
                     messages[i] = {**msg, "content": _summarize_and_store(i, content)}
 
         # ── query_tool_result: closure over result_store and self ───────────────
@@ -404,8 +462,13 @@ class LLMClient:
         # For Anthropic, use structured content blocks with cache_control so the
         # static system prompt is prefix-cached across all turns in the agentic loop.
         if self.config.is_anthropic:
-            system_content: str | list = [{"type": "text", "text": system_prompt,
-                                           "cache_control": {"type": "ephemeral"}}]
+            system_content: str | list = [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
         else:
             system_content = system_prompt
 
@@ -417,7 +480,9 @@ class LLMClient:
         terminal_spec = terminal_tool._tool_spec
         terminal_name: str = terminal_spec["function"]["name"]
         terminal_model: type[BaseModel] = terminal_tool._tool_model
-        all_tool_specs = [fn._tool_spec for fn in extended_registry.values()] + [terminal_spec]
+        all_tool_specs = [fn._tool_spec for fn in extended_registry.values()] + [
+            terminal_spec
+        ]
 
         headers = {**self.config.auth_headers, "Content-Type": "application/json"}
 
@@ -431,18 +496,22 @@ class LLMClient:
             if is_last_turn:
                 tools = [terminal_spec]
                 tool_choice: str | dict | None = (
-                    None if self.config.is_ollama
+                    None
+                    if self.config.is_ollama
                     else {"type": "function", "function": {"name": terminal_name}}
                 )
             else:
                 tools = all_tool_specs
                 tool_choice = None if self.config.is_ollama else "auto"
 
-            payload = self._build_payload_messages(messages, tools=tools,
-                                                   tool_choice=tool_choice, stream=False)
+            payload = self._build_payload_messages(
+                messages, tools=tools, tool_choice=tool_choice, stream=False
+            )
 
             def _do_agentic_post() -> dict:
-                response = self._http.post(self.config.chat_url, json=payload, headers=headers)
+                response = self._http.post(
+                    self.config.chat_url, json=payload, headers=headers
+                )
                 response.raise_for_status()
                 return response.json()
 
@@ -501,7 +570,11 @@ class LLMClient:
                     return terminal_tool(validated, **kwargs)
                 except (ValidationError, ValueError) as e:
                     terminal_validation_error = e
-                    prefix = "Validation error" if isinstance(e, ValidationError) else "Error"
+                    prefix = (
+                        "Validation error"
+                        if isinstance(e, ValidationError)
+                        else "Error"
+                    )
                     err_str = (
                         f"{prefix}: {e}\nPlease fix the arguments and call "
                         f"{terminal_name} again."
@@ -511,20 +584,29 @@ class LLMClient:
                         _extended_for_terminal_validation = True
                     if len(err_str) > ac.tool_result_summarize_skip:
                         err_str = _summarize_and_store(len(messages), err_str)
-                    messages.append(self._format_tool_result(
-                        tool_call.call_id, err_str,
-                    ))
+                    messages.append(
+                        self._format_tool_result(
+                            tool_call.call_id,
+                            err_str,
+                        )
+                    )
                     continue
 
             tool_fn = extended_registry.get(tool_call.name)
             if tool_fn is None:
-                result_str = (f"Unknown tool: {tool_call.name!r}. "
-                              f"Available: {list(extended_registry.keys())}")
+                result_str = (
+                    f"Unknown tool: {tool_call.name!r}. "
+                    f"Available: {list(extended_registry.keys())}"
+                )
             else:
                 try:
-                    validated_args = tool_fn._tool_model.model_validate(raw_args).post_process()
+                    validated_args = tool_fn._tool_model.model_validate(
+                        raw_args
+                    ).post_process()
                     result = tool_fn(validated_args, **kwargs)
-                    result_str = result if isinstance(result, str) else json.dumps(result)
+                    result_str = (
+                        result if isinstance(result, str) else json.dumps(result)
+                    )
                 except Exception as e:
                     result_str = f"Error calling {tool_call.name}: {e}"
 
@@ -537,7 +619,9 @@ class LLMClient:
             # Context management: when messages are large, summarize old content
             total_chars = _total_message_chars(messages)
             if total_chars > trim_threshold:
-                self._log(f"  {ansi('⋯', ANSI_DIM)} context {total_chars:,} chars — compressing old results")
+                self._log(
+                    f"  {ansi('⋯', ANSI_DIM)} context {total_chars:,} chars — compressing old results"
+                )
                 _trim_with_summaries(messages)
 
             # Inject a countdown warning when few turns remain
@@ -550,10 +634,12 @@ class LLMClient:
                         f"Stop gathering context and call {terminal_name} NOW with "
                         f"your best grouping based on what you already know."
                     )
-                messages.append({
-                    "role": "user",
-                    "content": warning_text,
-                })
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": warning_text,
+                    }
+                )
 
         self._last_messages = list(messages)
         self._last_result_store = dict(result_store)
@@ -567,7 +653,8 @@ class LLMClient:
             )
             bonus_tools = [terminal_spec]
             bonus_tool_choice: str | dict | None = (
-                None if self.config.is_ollama
+                None
+                if self.config.is_ollama
                 else {"type": "function", "function": {"name": terminal_name}}
             )
             bonus_payload = self._build_payload_messages(
@@ -575,7 +662,9 @@ class LLMClient:
             )
 
             def _do_bonus_post() -> dict:
-                response = self._http.post(self.config.chat_url, json=bonus_payload, headers=headers)
+                response = self._http.post(
+                    self.config.chat_url, json=bonus_payload, headers=headers
+                )
                 response.raise_for_status()
                 return response.json()
 

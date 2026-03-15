@@ -25,3 +25,6 @@ __pycache__/
 dolt-monitor.pid
 dolt-server.port
 .beads/dolt-server.activity
+.beads/dolt-monitor.pid.lock
+.enbrc.local
+.envrc.local
