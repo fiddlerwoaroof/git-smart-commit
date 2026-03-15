@@ -44,6 +44,30 @@
 
 All tool functions accept `**kwargs` forwarded from the loop, with `analyzer: GitAnalyzer` being the primary context object passed through.
 
+## Prompt Constant Extraction (gsc-952, gsc-zd7, and others)
+
+**Decision:** Extract duplicated prompt content into named Python constants interpolated via `.format()`.
+
+**Hierarchy (current state):**
+- `BREAKING_CHANGE_RULES` — issue detection rules + breaking-change detection rules
+- `CODE_ISSUE_DETECTION` — code-smell examples block (Java/C/Python) [gsc-952]
+- `HUNK_GROUPING_RULES` — hunk ID format, split/cohesion rules [extracted by separate WT]
+- `COMMIT_FORMAT_RULES` — conventional commit format + type defs (= dedented text + BREAKING_CHANGE_RULES) [gsc-zd7]
+
+Both `SYSTEM_PROMPT` and `AGENTIC_SYSTEM_PROMPT` use `{HUNK_GROUPING_RULES}` and `{COMMIT_FORMAT_RULES}`.
+`MERGE_PROMPT` uses consistent type-priority language aligned with `COMMIT_FORMAT_RULES`.
+
+Remaining: opening sentence + junk-file paragraph still duplicated (gsc-1bd, gsc-c3z).
+
+## Unit Tests
+
+**Decision:** Pure functions tested via regex extraction into a minimal module (no full script import).
+
+`tests/test_core.py` covers `split_hunks`, `_parse_hunk_oldrange`, `_is_binary_diff`.
+Loader: `_extract_function(src, name)` extracts top-level function bodies using regex,
+compiles them with only `re`, `textwrap`, `Path` as stdlib imports — avoids httpx/pydantic/textual.
+Run with: `uv run --group dev pytest`
+
 ## steropes Extraction (gsc-2fj, gsc-7eo, gsc-03f, gsc-bx8)
 
 **Decision:** Extract the general-purpose LLM agent framework from `git-smart-commit` into a separate package called `steropes`.
