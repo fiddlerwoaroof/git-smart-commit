@@ -1199,69 +1199,64 @@ class GitAnalyzer:
         return files
 
     def collect_hunks(self, staged_only: bool = False) -> tuple[dict[str, DiffHunk], list[str]]:
-        """Collect all diff hunks from the working tree, indexed by hunk ID.
+        """Collect all diff hunks indexed by hunk ID.
 
-        Any currently staged changes are first unstaged (git reset HEAD) so that
-        everything is treated uniformly as unstaged working-tree changes.  This is
-        safe: working-tree content is never modified.
+        Normal mode: staged files are first unstaged (git reset HEAD) so that
+        everything is treated uniformly as unstaged working-tree changes, then
+        re-staged per-commit via git apply --cached during execution. Safe:
+        working-tree content is never modified.
 
-        If staged_only=True, only the originally-staged files are processed;
-        unstaged changes and untracked files are excluded.
+        staged_only mode: reads git diff --cached directly WITHOUT touching the
+        index. Execution goes through git commit rather than git apply --cached.
+        Returns (hunk_map, []) — the empty list signals no re-staging is needed.
 
-        Returns a tuple of (hunk_map, staged_files) where hunk_map maps
-        hunk_id → DiffHunk and staged_files lists files that were originally staged.
+        Returns a tuple of (hunk_map, staged_files) where staged_files lists
+        files that were unstaged and need to be re-staged on abort.
         """
         hunk_map: dict[str, DiffHunk] = {}
 
-        # Unstage any staged files so we work uniformly with unstaged diffs
+        if staged_only:
+            # Read the staged diff without disturbing the index
+            changed = self.git(["diff", "--cached", "--name-only"]).splitlines()
+            for fpath in changed:
+                diff = self.git(["diff", "--cached", "--no-color", "--no-ext-diff", "--", fpath])
+                if not diff.strip():
+                    continue
+                if _is_binary_diff(diff):
+                    hunk_id = f"{fpath}::1"
+                    hunk_map[hunk_id] = DiffHunk(
+                        hunk_id=hunk_id, file_path=fpath, patch="", is_binary=True,
+                    )
+                    continue
+                for i, patch in enumerate(split_hunks(diff), 1):
+                    hunk_id = f"{fpath}::{i}"
+                    hunk_map[hunk_id] = DiffHunk(hunk_id=hunk_id, file_path=fpath, patch=patch)
+            return hunk_map, []
+
+        # Normal mode: unstage any staged files so we work uniformly with unstaged diffs
         staged_files = self.git(["diff", "--cached", "--name-only"]).splitlines()
         if staged_files:
             self.git(["reset", "HEAD", "--"] + staged_files)
 
-        # In staged_only mode, restrict to originally-staged files; otherwise all changed files
-        if staged_only:
-            changed = staged_files
-        else:
-            changed = self.git(["diff", "--name-only", "--no-ext-diff"]).splitlines()
-
-        # Split each file's diff into individual hunks
-        for fpath in changed:
+        for fpath in self.git(["diff", "--name-only", "--no-ext-diff"]).splitlines():
             diff = self.git(["diff", "--no-color", "--no-ext-diff", "--", fpath])
             if not diff.strip():
                 continue
-            # Detect binary files: create a single hunk with is_binary=True
             if _is_binary_diff(diff):
                 hunk_id = f"{fpath}::1"
                 hunk_map[hunk_id] = DiffHunk(
-                    hunk_id=hunk_id,
-                    file_path=fpath,
-                    patch="",
-                    is_binary=True,
+                    hunk_id=hunk_id, file_path=fpath, patch="", is_binary=True,
                 )
                 continue
-            file_hunks = split_hunks(diff)
-            for i, patch in enumerate(file_hunks, 1):
+            for i, patch in enumerate(split_hunks(diff), 1):
                 hunk_id = f"{fpath}::{i}"
-                hunk_map[hunk_id] = DiffHunk(
-                    hunk_id=hunk_id,
-                    file_path=fpath,
-                    patch=patch,
-                )
+                hunk_map[hunk_id] = DiffHunk(hunk_id=hunk_id, file_path=fpath, patch=patch)
 
         # Untracked (new) files are staged whole via git add — use #1 suffix
-        # (consistent with tracked-file 1-based indexing so LLMs don't mis-reference)
-        # In staged_only mode, untracked files are excluded (user didn't git add them).
-        untracked = (
-            [] if staged_only
-            else self.git(["ls-files", "--others", "--exclude-standard"]).splitlines()
-        )
-        for fpath in untracked:
+        for fpath in self.git(["ls-files", "--others", "--exclude-standard"]).splitlines():
             hunk_id = f"{fpath}::1"
             hunk_map[hunk_id] = DiffHunk(
-                hunk_id=hunk_id,
-                file_path=fpath,
-                patch="",
-                is_untracked=True,
+                hunk_id=hunk_id, file_path=fpath, patch="", is_untracked=True,
             )
 
         return hunk_map, staged_files
@@ -1787,6 +1782,26 @@ class GitAnalyzer:
                 commits[0].setdefault("hunks", [])
                 commits[0]["hunks"] = list(commits[0]["hunks"]) + missing
         return commits, result.gitignore if hasattr(result, "gitignore") else []
+
+    def commit_staged(self, commit: dict) -> None:
+        """Commit all currently staged changes using the given commit description.
+
+        Used by --staged mode: the index is already correct, so we just commit.
+        """
+        subject = commit["subject"]
+        body = _strip_breaking_change_trailer(commit.get("body", "").strip())
+        breaking = commit.get("breaking_change", "").strip()
+        trailers = []
+        if breaking:
+            trailers.append(f"BREAKING CHANGE: {breaking}")
+        trailers.append(f"Co-Authored-By: fiddlerwoaroof/git-smart-commit ({self.config.model})")
+        parts = [subject]
+        if body:
+            parts.append(body)
+        parts.append("\n".join(trailers))
+        message = "\n\n".join(parts)
+        print(f"\n{subject}")
+        self.git(["commit", "-m", message])
 
     def _build_combined_patch(self, hunks: list[str]) -> str:
         """Combine multiple hunks for the same file into a single valid patch.
@@ -3062,7 +3077,11 @@ def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
             commits = result
             break
 
-    analyzer.execute_commits(commits, hunk_map)
+    if getattr(args, "staged", False):
+        # Index is already correct — just commit without touching the staging area
+        analyzer.commit_staged(commits[0])
+    else:
+        analyzer.execute_commits(commits, hunk_map)
     analyzer.update_gitignore(gitignore, yes=args.yes)
     print("\nDone.")
     return True
