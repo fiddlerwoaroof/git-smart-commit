@@ -8,7 +8,7 @@
 # ]
 # ///
 """
-git-smart-commit: Analyze unstaged changes, group into logical commits, execute them.
+git-smart-commit: Analyze changes, group into logical commits, execute them.
 
 Uses an LLM for classification. Supports Ollama (default) and any OpenAI-compatible
 API (OpenRouter, Anthropic, Together, etc.) via --api-base.
@@ -20,6 +20,7 @@ Usage:
 
 Options:
     --repo PATH     Path to git repository (default: current directory)
+    --staged        Describe only staged changes (ignores unstaged/untracked)
     --dry-run       Print proposed commits without executing
     --model MODEL   Model name (default: qwen3-coder:30b-a3b-q8_0)
     --yes           Skip confirmation prompt and commit immediately
@@ -1197,12 +1198,15 @@ class GitAnalyzer:
                 files.append(f)
         return files
 
-    def collect_hunks(self) -> tuple[dict[str, DiffHunk], list[str]]:
+    def collect_hunks(self, staged_only: bool = False) -> tuple[dict[str, DiffHunk], list[str]]:
         """Collect all diff hunks from the working tree, indexed by hunk ID.
 
         Any currently staged changes are first unstaged (git reset HEAD) so that
         everything is treated uniformly as unstaged working-tree changes.  This is
         safe: working-tree content is never modified.
+
+        If staged_only=True, only the originally-staged files are processed;
+        unstaged changes and untracked files are excluded.
 
         Returns a tuple of (hunk_map, staged_files) where hunk_map maps
         hunk_id → DiffHunk and staged_files lists files that were originally staged.
@@ -1214,8 +1218,13 @@ class GitAnalyzer:
         if staged_files:
             self.git(["reset", "HEAD", "--"] + staged_files)
 
-        # Split each unstaged file's diff into individual hunks
-        changed = self.git(["diff", "--name-only", "--no-ext-diff"]).splitlines()
+        # In staged_only mode, restrict to originally-staged files; otherwise all changed files
+        if staged_only:
+            changed = staged_files
+        else:
+            changed = self.git(["diff", "--name-only", "--no-ext-diff"]).splitlines()
+
+        # Split each file's diff into individual hunks
         for fpath in changed:
             diff = self.git(["diff", "--no-color", "--no-ext-diff", "--", fpath])
             if not diff.strip():
@@ -1241,7 +1250,11 @@ class GitAnalyzer:
 
         # Untracked (new) files are staged whole via git add — use #1 suffix
         # (consistent with tracked-file 1-based indexing so LLMs don't mis-reference)
-        untracked = self.git(["ls-files", "--others", "--exclude-standard"]).splitlines()
+        # In staged_only mode, untracked files are excluded (user didn't git add them).
+        untracked = (
+            [] if staged_only
+            else self.git(["ls-files", "--others", "--exclude-standard"]).splitlines()
+        )
         for fpath in untracked:
             hunk_id = f"{fpath}::1"
             hunk_map[hunk_id] = DiffHunk(
@@ -1722,6 +1735,58 @@ class GitAnalyzer:
             ))
 
         return merged
+
+    def describe_staged(
+        self,
+        hunk_map: dict[str, DiffHunk],
+        issue_patterns: list[str] | None = None,
+    ) -> tuple[list[dict], list[str]]:
+        """Generate a single commit message for already-grouped staged changes.
+
+        Used with --staged: the user has already decided what belongs together,
+        so we just need the LLM to write a good commit message, not group hunks.
+        Returns (commits, gitignore_patterns) in the same format as classify_changes.
+        """
+        self._hunk_map = hunk_map
+        hunk_context = self.build_hunk_context(hunk_map)
+        all_hunk_ids = sorted(hunk_map.keys())
+
+        issue_instruction = ""
+        if issue_patterns:
+            bullet_list = "\n".join(f"    - {p}" for p in issue_patterns)
+            issue_instruction = (
+                f"\n\nProject-specific patterns to watch for (flag as issues if found):\n"
+                + bullet_list
+            )
+
+        prompt = textwrap.dedent(f"""\
+            {SYSTEM_PROMPT}
+            {issue_instruction}
+            The user has already staged exactly the changes they want in this commit.
+            Write a single conventional commit message for ALL of the following staged hunks.
+            Assign every hunk ID to this one commit — do not split into multiple commits.
+
+            Staged hunks: {all_hunk_ids}
+
+            {hunk_context}
+        """)
+
+        result: ProposeCommitsArgs = self.client.call_with_tool(
+            prompt, propose_commits, analyzer=self
+        )
+        commits = [c.model_dump() for c in result.commits] if result.commits else []
+        if not commits:
+            # Fallback: build a minimal commit with all hunks if LLM returned nothing
+            commits = [{"subject": "chore: staged changes", "hunks": all_hunk_ids,
+                        "body": "", "breaking_change": "", "issues": []}]
+        else:
+            # Ensure all hunks are assigned (LLM may have split despite instructions)
+            assigned = {h for c in commits for h in c.get("hunks", [])}
+            missing = [h for h in all_hunk_ids if h not in assigned]
+            if missing:
+                commits[0].setdefault("hunks", [])
+                commits[0]["hunks"] = list(commits[0]["hunks"]) + missing
+        return commits, result.gitignore if hasattr(result, "gitignore") else []
 
     def _build_combined_patch(self, hunks: list[str]) -> str:
         """Combine multiple hunks for the same file into a single valid patch.
@@ -2692,6 +2757,8 @@ def main() -> None:
         epilog=__doc__,
     )
     parser.add_argument("--repo", default=".", help="Path to git repository")
+    parser.add_argument("--staged", action="store_true",
+                        help="Describe only staged changes (ignores unstaged changes and untracked files)")
     parser.add_argument("--dry-run", action="store_true", help="Show proposed commits without executing")
     parser.add_argument("--model", default=None, help=f"Model name (default: {DEFAULT_MODEL}, or smart-commit.model in git config)")
     parser.add_argument("--yes", "-y", action="store_true", help="Commit without confirmation")
@@ -2809,7 +2876,7 @@ def _main_body(client: LLMClient, repo: Path, args, issue_patterns) -> None:
 
     # Collect hunks (unstages staged files first so everything is uniform)
     _log("Scanning for changes…")
-    hunk_map, originally_staged = analyzer.collect_hunks()
+    hunk_map, originally_staged = analyzer.collect_hunks(staged_only=getattr(args, "staged", False))
     if not hunk_map:
         if originally_staged:
             _git(["add", "--"] + originally_staged, repo)
@@ -2919,9 +2986,14 @@ def _main_body_inner(analyzer, args, issue_patterns, hunk_map, repo) -> bool:
     _log(f"Found {n_hunks} hunk(s) across {n_files} file(s). Analyzing…")
 
     try:
-        commits, gitignore = analyzer.classify_changes(
-            hunk_map, critique=args.critique, issue_patterns=issue_patterns or None
-        )
+        if getattr(args, "staged", False):
+            commits, gitignore = analyzer.describe_staged(
+                hunk_map, issue_patterns=issue_patterns or None
+            )
+        else:
+            commits, gitignore = analyzer.classify_changes(
+                hunk_map, critique=args.critique, issue_patterns=issue_patterns or None
+            )
     except (KeyboardInterrupt, Exception) as exc:
         # Persist whatever partial state exists so the user's tokens aren't wasted.
         partial = getattr(analyzer, "_emitted_commits", [])
