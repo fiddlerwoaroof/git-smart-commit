@@ -1,3 +1,7 @@
+- keep context/repo-map.md up to date and refer to it to understand repo layout
+- use context/decisions.md to keep a log of decisions made in a brief format
+- use the context/ directory to store useful information about the program as a kind of improvised wiki
+
 ## Issue Tracking
 
 This project uses **bd (beads)** for issue tracking.
