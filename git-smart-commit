@@ -4,6 +4,7 @@
 # dependencies = [
 #   "httpx",
 #   "pydantic",
+#   "mistletoe",
 #   "textual>=0.50.0",
 # ]
 # ///

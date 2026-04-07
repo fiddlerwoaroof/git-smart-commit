@@ -5,6 +5,7 @@ description = "A lightweight LLM agent framework with tool calling and context m
 requires-python = ">=3.11"
 dependencies = [
     "httpx",
+    "mistletoe>=1.5.1",
     "pydantic",
 ]
 

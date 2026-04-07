@@ -1,138 +1,189 @@
-"""Text wrapping utilities that preserve markdown structure."""
+"""Text wrapping utilities that preserve markdown structure via AST."""
+
+from __future__ import annotations
 
 import re
+from typing import Optional
+
+from mistletoe import Document
+from mistletoe.block_token import Paragraph, Quote, ListItem
+from mistletoe.markdown_renderer import MarkdownRenderer
+from mistletoe.span_token import InlineCode, LineBreak, RawText
 
 
-def wrap_markdown(text: str, width: int = 80) -> str:
-    """Wrap text at width, preserving markdown structure.
+def wrap_markdown(
+    text: str,
+    width: int = 80,
+    *,
+    soft_width: Optional[int] = None,
+) -> str:
+    """Wrap prose in *text* at *width*, preserving markdown structure.
 
-    - Code blocks (```) are not wrapped
-    - Inline code (`...`) within a line is preserved
-    - List items wrap with a hanging indent; continuation lines (indented to
-      at least the marker end) are wrapped with the same indent
-    - Blockquotes are preserved with the correct continuation prefix
-    - Regular paragraphs preserve their leading indent on continuation lines
+    Parses the text into a markdown AST (via mistletoe), rewraps only
+    ``Paragraph`` nodes, and serializes back.  Structural elements — code
+    blocks, lists, headings, blockquotes — are preserved exactly.
+
+    *soft_width* (default ``width - 5``) is the preferred break point;
+    lines break at or before *width* (hard limit) but prefer *soft_width*
+    to reduce ragged-right edges.
     """
     if not text:
         return text
 
-    lines = text.split("\n")
-    result = []
-    in_code_block = False
-    # Number of leading spaces that mark a list continuation line; None when
-    # we are not inside a list item.
-    list_continuation_indent: int | None = None
+    if soft_width is None:
+        soft_width = max(width - 5, width * 3 // 4)
 
-    for line in lines:
-        stripped = line.lstrip()
-        indent = len(line) - len(stripped)
+    with MarkdownRenderer() as renderer:
+        doc = Document(text)
+        _rewrap_tree(doc, renderer, width, soft_width, prefix_len=0)
+        result = renderer.render(doc)
 
-        # Code block fence toggles verbatim mode
-        if stripped.startswith("```"):
-            in_code_block = not in_code_block
-            list_continuation_indent = None
-            result.append(line)
-            continue
+    # mistletoe always adds a trailing newline; match original
+    if not text.endswith("\n") and result.endswith("\n"):
+        result = result[:-1]
 
-        if in_code_block:
-            result.append(line)
-            continue
-
-        # Blank line resets list state
-        if not stripped:
-            list_continuation_indent = None
-            result.append(line)
-            continue
-
-        # New list item
-        list_match = re.match(r"^(\s*)([-*+]|\d+\.)\s+", line)
-        if list_match:
-            marker_end = list_match.end()
-            list_continuation_indent = marker_end
-            content = line[marker_end:]
-            wrapped_content = _wrap_line_preserving_inline(content, width - marker_end)
-            wrapped_lines = wrapped_content.split("\n")
-            result.append(line[:marker_end] + wrapped_lines[0])
-            for wrapped_line in wrapped_lines[1:]:
-                result.append(" " * marker_end + wrapped_line)
-            continue
-
-        # List continuation line: indented to at least the marker position
-        if list_continuation_indent is not None and indent >= list_continuation_indent:
-            cont_prefix = " " * indent
-            wrapped_content = _wrap_line_preserving_inline(stripped, width - indent)
-            wrapped_lines = wrapped_content.split("\n")
-            result.append(cont_prefix + wrapped_lines[0])
-            for wrapped_line in wrapped_lines[1:]:
-                result.append(cont_prefix + wrapped_line)
-            continue
-
-        # Not a list continuation — reset list state
-        list_continuation_indent = None
-
-        # Blockquote
-        if stripped.startswith(">"):
-            quote_match = re.match(r"^(\s*)(>+\s?)", line)
-            if quote_match:
-                full_prefix = quote_match.group(1) + quote_match.group(2)
-                content = line[len(full_prefix) :]
-                wrapped_content = _wrap_line_preserving_inline(
-                    content, width - len(full_prefix)
-                )
-                wrapped_lines = wrapped_content.split("\n")
-                result.append(full_prefix + wrapped_lines[0])
-                for wrapped_line in wrapped_lines[1:]:
-                    result.append(full_prefix + wrapped_line)
-                continue
-
-        # Regular paragraph — preserve leading indent on all continuation lines
-        cont_prefix = " " * indent
-        wrapped_content = _wrap_line_preserving_inline(stripped, width - indent)
-        wrapped_lines = wrapped_content.split("\n")
-        result.append(cont_prefix + wrapped_lines[0])
-        for wrapped_line in wrapped_lines[1:]:
-            result.append(cont_prefix + wrapped_line)
-
-    return "\n".join(result)
+    return result
 
 
-def _wrap_line_preserving_inline(text: str, width: int) -> str:
-    """Wrap a line while preserving inline code spans."""
-    if len(text) <= width:
-        return text
+def _rewrap_tree(
+    node, renderer: MarkdownRenderer, width: int, soft_width: int, prefix_len: int
+) -> None:
+    """Recursively walk the AST and rewrap Paragraph nodes in place."""
+    if not hasattr(node, "children") or node.children is None:
+        return
 
-    # Split on inline code to preserve it
-    parts = re.split(r"(`[^`]+`)", text)
-    lines = []
-    current_line = ""
-
-    for part in parts:
-        if not part:
-            continue
-        if part.startswith("`") and part.endswith("`"):
-            # Inline code - add to current line if it fits, else start new line
-            if current_line and len(current_line) + 1 + len(part) > width:
-                lines.append(current_line.rstrip())
-                current_line = part
-            else:
-                if current_line:
-                    current_line += " "
-                current_line += part
+    for child in node.children:
+        if isinstance(child, Paragraph):
+            _rewrap_paragraph(child, renderer, width, soft_width, prefix_len)
+        elif isinstance(child, Quote):
+            # Blockquote adds "> " (2 chars) per nesting level
+            _rewrap_tree(child, renderer, width, soft_width, prefix_len + 2)
+        elif isinstance(child, ListItem):
+            # List items have a marker + space; estimate ~2-4 chars
+            _rewrap_tree(child, renderer, width, soft_width, prefix_len + 2)
         else:
-            # Regular text - wrap it
-            words = part.split(" ")
-            for word in words:
-                if not word:
-                    continue
-                if current_line and len(current_line) + 1 + len(word) > width:
-                    lines.append(current_line.rstrip())
-                    current_line = word
-                else:
-                    if current_line:
-                        current_line += " "
-                    current_line += word
+            _rewrap_tree(child, renderer, width, soft_width, prefix_len)
 
-    if current_line:
-        lines.append(current_line.rstrip())
 
-    return "\n".join(lines)
+def _rewrap_paragraph(
+    para: Paragraph,
+    renderer: MarkdownRenderer,
+    width: int,
+    soft_width: int,
+    prefix_len: int,
+) -> None:
+    """Flatten a Paragraph's inline children, rewrap, and replace children."""
+    # Render each inline token to its markdown representation, collecting
+    # them as atomic "tokens" for the wrapping algorithm.
+    tokens: list[tuple[str, bool]] = []  # (text, is_atomic)
+
+    for child in para.children:
+        if isinstance(child, LineBreak) and child.soft:
+            # Soft break = space (we're reflowing)
+            tokens.append((" ", False))
+        elif isinstance(child, LineBreak):
+            # Hard break — preserve
+            tokens.append(("\\\n", True))
+        elif isinstance(child, RawText):
+            tokens.append((child.content, False))
+        else:
+            # Inline code, emphasis, links, etc. — render to markdown and
+            # treat as an atomic token that must not be split.
+            rendered = renderer.render(child).rstrip("\n")
+            tokens.append((rendered, True))
+
+    # Join into a flat string, then split into word-level tokens
+    word_tokens = _tokenize_for_wrap(tokens)
+
+    if not word_tokens:
+        return
+
+    # Wrap
+    avail_hard = max(width - prefix_len, 20)
+    avail_soft = max(soft_width - prefix_len, 15)
+    lines = _wrap_tokens(word_tokens, avail_hard, avail_soft)
+
+    # Rebuild paragraph children from wrapped lines
+    new_children: list[RawText | LineBreak] = []
+    for i, line in enumerate(lines):
+        if i > 0:
+            new_children.append(_make_soft_linebreak())
+        new_children.append(RawText(line))
+
+    para.children = new_children
+
+
+def _tokenize_for_wrap(
+    tokens: list[tuple[str, bool]],
+) -> list[str]:
+    """Convert inline token pairs into a flat list of word-level strings.
+
+    Atomic tokens (inline code, emphasis, etc.) are kept whole.
+    Non-atomic text is split on whitespace into individual words.
+    """
+    result: list[str] = []
+    for text, is_atomic in tokens:
+        if is_atomic:
+            if text == "\\\n":
+                # Hard line break — emit as-is
+                result.append(text)
+            else:
+                result.append(text)
+        else:
+            for word in text.split():
+                result.append(word)
+    return result
+
+
+def _wrap_tokens(
+    tokens: list[str], hard_width: int, soft_width: int
+) -> list[str]:
+    """Distribute *tokens* across lines respecting soft/hard width limits.
+
+    Returns a list of lines (strings).  Each line is at most *hard_width*
+    characters.  Lines are preferentially broken at *soft_width* to
+    reduce ragged-right edges.
+    """
+    lines: list[str] = []
+    current = ""
+
+    for token in tokens:
+        # Hard line break
+        if token == "\\\n":
+            lines.append(current)
+            current = ""
+            continue
+
+        if not current:
+            current = token
+            continue
+
+        candidate = current + " " + token
+        cand_len = len(candidate)
+
+        if cand_len <= soft_width:
+            current = candidate
+        elif cand_len <= hard_width:
+            # Between soft and hard — break if current line is already
+            # reasonably full (reduces ragged right)
+            if len(current) >= soft_width * 2 // 3:
+                lines.append(current)
+                current = token
+            else:
+                current = candidate
+        else:
+            # Exceeds hard width — must break
+            lines.append(current)
+            current = token
+
+    if current:
+        lines.append(current)
+
+    return lines
+
+
+def _make_soft_linebreak() -> LineBreak:
+    """Create a soft ``LineBreak`` token."""
+    m = re.match(r"( *|\\)\n", "\n")
+    assert m is not None
+    return LineBreak(m)
