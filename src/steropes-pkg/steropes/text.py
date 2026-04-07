@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from typing import Optional
 
 from mistletoe import Document
@@ -135,9 +134,7 @@ def _tokenize_for_wrap(
     return result
 
 
-def _wrap_tokens(
-    tokens: list[str], hard_width: int, soft_width: int
-) -> list[str]:
+def _wrap_tokens(tokens: list[str], hard_width: int, soft_width: int) -> list[str]:
     """Distribute *tokens* across lines respecting soft/hard width limits.
 
     Returns a list of lines (strings).  Each line is at most *hard_width*
@@ -184,6 +181,7 @@ def _wrap_tokens(
 
 def _make_soft_linebreak() -> LineBreak:
     """Create a soft ``LineBreak`` token."""
-    m = re.match(r"( *|\\)\n", "\n")
-    assert m is not None
-    return LineBreak(m)
+    lb = object.__new__(LineBreak)
+    lb.content = ""
+    lb.soft = True
+    return lb
