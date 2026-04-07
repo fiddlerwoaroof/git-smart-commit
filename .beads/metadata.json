@@ -1,6 +1,7 @@
 {
   "database": "dolt",
   "backend": "dolt",
-  "dolt_mode": "server",
-  "dolt_database": "gsc"
+  "dolt_mode": "embedded",
+  "dolt_database": "gsc",
+  "project_id": "e9c1b501-885b-4b4a-b071-6477b1cfda67"
 }

@@ -28,3 +28,6 @@ dolt-server.port
 .beads/dolt-monitor.pid.lock
 .enbrc.local
 .envrc.local
+
+# Beads / Dolt files (added by bd init)
+.beads-credential-key
