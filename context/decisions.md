@@ -19,7 +19,7 @@
 **Design:**
 - `run_agentic_loop(messages, intermediate_tools, terminal_tool, **kwargs)` drives the conversation
 - Intermediate tools (e.g. `read_file`) are executed immediately; results are appended to the message history
-- The loop terminates when the terminal tool (`propose_commits`) is called
+- The loop terminates when the terminal tool (`finalize_commits`) is called
 - `call_with_tool` is kept for single-shot cases (e.g. `merge_commits` during overlap resolution)
 
 ## ToolCall Dataclass (gsc-67t)

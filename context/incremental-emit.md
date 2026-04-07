@@ -2,12 +2,15 @@
 
 ## Context
 
-Currently, the LLM investigates changes in a multi-turn agentic loop, then produces ALL commits in a single `propose_commits` call at the end. This is problematic because:
-- The final tool call is the largest structured output, most likely to hit Ollama timeouts
-- The LLM must hold the entire commit plan in memory for one big output
-- No feedback about remaining work between investigation and final proposal
+**Status: COMPLETED** — `propose_commits` has been fully removed. The agentic loop
+now uses `emit_commit` (per-commit) + `finalize_commits` (terminal). The `--staged`
+path also delegates to `classify_changes` with emit/finalize.
 
-The fix: replace the single `propose_commits` terminal tool with an `emit_commit` investigation tool (called per-commit) + a lightweight `finalize_commits` terminal tool.
+Previously, the LLM produced ALL commits in a single `propose_commits` call at the end.
+This was problematic because:
+- The final tool call was the largest structured output, most likely to hit Ollama timeouts
+- The LLM had to hold the entire commit plan in memory for one big output
+- No feedback about remaining work between investigation and final proposal
 
 ## Issues
 
@@ -15,7 +18,7 @@ The fix: replace the single `propose_commits` terminal tool with an `emit_commit
 - **gsc-np1** — Add `emit_commit` and `finalize_commits` closures in `classify_changes`
 - **gsc-i55** — Add `countdown_message_fn` callback to `agentic_loop`
 - **gsc-59q** — Update `AGENTIC_SYSTEM_PROMPT` for incremental emit workflow
-- **gsc-mvz** — Bump `TURNS_WARN_AT` and mark `propose_commits` as deprecated
+- **gsc-mvz** — Bump `TURNS_WARN_AT` and remove `propose_commits`
 
 ## Design
 
@@ -75,7 +78,8 @@ Update `AGENTIC_SYSTEM_PROMPT` (lines 290-393):
 ### 5. Tuning and cleanup (gsc-mvz)
 
 - Increase `TURNS_WARN_AT` from 4 to 6 (incremental emit needs more tool calls)
-- Add deprecation comment to `propose_commits` (keep code — `Commit` model, `SAMPLE_OUTPUT`, `MergeCommitsArgs` still reference it)
+- Remove `propose_commits`, `ProposeCommitsArgs`, and `SAMPLE_OUTPUT` entirely
+- Refactor `describe_staged` to delegate to `classify_changes` with emit/finalize
 
 ## What stays unchanged
 

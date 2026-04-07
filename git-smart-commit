@@ -204,7 +204,8 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     You have access to a read_file tool. Use it when the diff alone is not
     enough context — for example, to see which class a changed function belongs
     to, what imports already exist, or how unchanged surrounding code looks.
-    Call read_file as many times as needed, then call propose_commits when ready.
+    Call read_file as many times as needed, then call emit_commit for each logical
+    commit and finalize_commits when done.
 """).format(CODE_ISSUE_DETECTION=CODE_ISSUE_DETECTION,
            HUNK_GROUPING_RULES=HUNK_GROUPING_RULES,
            COMMIT_FORMAT_RULES=COMMIT_FORMAT_RULES)
@@ -790,14 +791,6 @@ class Commit(BaseModel):
         self.breaking_change = wrap_markdown(self.breaking_change, 80)
         return self
 
-class ProposeCommitsArgs(BaseModel):
-    commits: list[Commit] = Field(description="REQUIRED. Logical commit groups")
-    gitignore: list[str] = Field(default_factory=list, description="Suggested .gitignore patterns for junk files")
-
-    def post_process(self):
-        self.commits = [commit.post_process() for commit in self.commits]
-        return self
-
 class EmitCommitArgs(BaseModel):
     commit: Commit = Field(description="REQUIRED. A single logical commit to emit")
 
@@ -813,87 +806,6 @@ class FinalizeCommitsArgs(BaseModel):
     def post_process(self):
         return self
 
-sample_issue = Issue(
-    message="Unused import 'os' on line 1",
-    path="main.py"
-)
-
-sample_commit = Commit(
-    subject="refactor(main): cleanup imports",
-    hunks=["main.py::1"],
-    body="Removed unnecessary imports to improve load time and code cleanliness.",
-    issues=[sample_issue]
-)
-
-SAMPLE_OUTPUT = ProposeCommitsArgs(
-    commits=[sample_commit],
-    gitignore=["*.pyc", "__pycache__/"]
-)
-
-
-@tool(ProposeCommitsArgs)
-# DEPRECATED: replaced by emit_commit + finalize_commits. Kept for Commit model and SAMPLE_OUTPUT references.
-def propose_commits(result: ProposeCommitsArgs, analyzer: "GitAnalyzer") -> tuple[list[dict], list[str]]:
-    """Group working-tree changes into logical commits and suggest .gitignore patterns for junk files."""
-    commits = [c.model_dump() for c in result.commits]
-    if not commits:
-        raise ValueError("Model returned no valid commit groups.")
-
-    # Mend unknown hunk IDs: try to match by file path, then warn/reject
-    hunk_map = getattr(analyzer, '_hunk_map', None)
-    if hunk_map is not None:
-        valid_ids = set(hunk_map.keys())
-        # Build file→hunks index for fuzzy matching
-        file_to_hunks: dict[str, list[str]] = {}
-        for hid in valid_ids:
-            fpath = hid.rsplit("::", 1)[0] if "::" in hid else hid
-            file_to_hunks.setdefault(fpath, []).append(hid)
-
-        mended: dict[str, str] = {}
-        for c in commits:
-            for hid in c.get("hunks", []):
-                if hid in valid_ids or hid in mended:
-                    continue
-                # Try to find the intended hunk by file path
-                if "::" in hid:
-                    base_path = hid.rsplit("::", 1)[0]
-                    candidates = file_to_hunks.get(base_path, [])
-                    if len(candidates) == 1:
-                        mended[hid] = candidates[0]
-                    elif candidates:
-                        # Multiple hunks for file — try closest index
-                        try:
-                            idx = int(hid.rsplit("::", 1)[1])
-                            closest = min(candidates,
-                                          key=lambda k: abs(int(k.rsplit("::", 1)[1]) - idx))
-                            mended[hid] = closest
-                        except (ValueError, IndexError):
-                            pass
-
-        # Apply corrections
-        if mended:
-            for old, new in sorted(mended.items()):
-                _log(f"  {_ansi('~', _ANSI_DIM)} mended hunk ID {old!r} → {new!r}")
-            for c in commits:
-                c["hunks"] = [mended.get(h, h) for h in c.get("hunks", [])]
-
-        # Re-check: reject only if EVERY referenced hunk is still invalid
-        all_referenced: set[str] = set()
-        for c in commits:
-            all_referenced.update(c.get("hunks", []))
-        still_unknown = all_referenced - valid_ids
-        still_valid = all_referenced & valid_ids
-        if still_unknown and not still_valid:
-            raise ValueError(
-                f"ALL hunk IDs are invalid: {sorted(still_unknown)}. "
-                f"Valid IDs are: {sorted(valid_ids)}"
-            )
-        if still_unknown:
-            _log(f"  {_ansi('!', _ANSI_DIM)} {len(still_unknown)} unknown hunk(s) "
-                 f"will be skipped: {sorted(still_unknown)}")
-
-    commits = analyzer.merge_overlapping_commits(commits)
-    return commits, result.gitignore
 
 
 class MergeCommitsArgs(BaseModel):
@@ -1482,7 +1394,7 @@ class GitAnalyzer:
 
         Returns (commits, gitignore_patterns).
         """
-        self._hunk_map = hunk_map   # expose for validation in propose_commits
+        self._hunk_map = hunk_map   # expose for validation in emit_commit
         hunk_context = self.build_hunk_context(hunk_map)
 
         # ── Local state for incremental commit emission ────────────────────────
@@ -1580,7 +1492,6 @@ class GitAnalyzer:
             "search_diff": search_diff,
             "list_symbols": list_symbols,
             "emit_commit": emit_commit,
-            "propose_commits": propose_commits,
         }
 
         # Scale turn limit with changeset size: allow ~2 extra turns per 5 hunks,
@@ -1741,46 +1652,16 @@ class GitAnalyzer:
         so we just need the LLM to write a good commit message, not group hunks.
         Returns (commits, gitignore_patterns) in the same format as classify_changes.
         """
-        self._hunk_map = hunk_map
-        hunk_context = self.build_hunk_context(hunk_map)
-        all_hunk_ids = sorted(hunk_map.keys())
-
-        issue_instruction = ""
-        if issue_patterns:
-            bullet_list = "\n".join(f"    - {p}" for p in issue_patterns)
-            issue_instruction = (
-                f"\n\nProject-specific patterns to watch for (flag as issues if found):\n"
-                + bullet_list
-            )
-
-        prompt = textwrap.dedent(f"""\
-            {SYSTEM_PROMPT}
-            {issue_instruction}
-            The user has already staged exactly the changes they want in this commit.
-            Write a single conventional commit message for ALL of the following staged hunks.
-            Assign every hunk ID to this one commit — do not split into multiple commits.
-
-            Staged hunks: {all_hunk_ids}
-
-            {hunk_context}
-        """)
-
-        result: ProposeCommitsArgs = self.client.call_with_tool(
-            prompt, propose_commits, analyzer=self
+        staged_instruction = (
+            "\n\nThe user has already staged exactly the changes they want in this commit. "
+            "Write a single conventional commit message for ALL hunks. "
+            "Assign every hunk ID to this one commit — do not split into multiple commits."
         )
-        commits = [c.model_dump() for c in result.commits] if result.commits else []
-        if not commits:
-            # Fallback: build a minimal commit with all hunks if LLM returned nothing
-            commits = [{"subject": "chore: staged changes", "hunks": all_hunk_ids,
-                        "body": "", "breaking_change": "", "issues": []}]
-        else:
-            # Ensure all hunks are assigned (LLM may have split despite instructions)
-            assigned = {h for c in commits for h in c.get("hunks", [])}
-            missing = [h for h in all_hunk_ids if h not in assigned]
-            if missing:
-                commits[0].setdefault("hunks", [])
-                commits[0]["hunks"] = list(commits[0]["hunks"]) + missing
-        return commits, result.gitignore if hasattr(result, "gitignore") else []
+        return self.classify_changes(
+            hunk_map,
+            critique=staged_instruction,
+            issue_patterns=issue_patterns,
+        )
 
     def commit_staged(self, commit: dict) -> None:
         """Commit all currently staged changes using the given commit description.

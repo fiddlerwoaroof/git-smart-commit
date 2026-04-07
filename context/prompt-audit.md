@@ -29,7 +29,7 @@ Exact duplicate:
 | SYSTEM_PROMPT | 107–110 |
 | AGENTIC_SYSTEM_PROMPT | 252–255 |
 
-Note: SYSTEM_PROMPT refers to `finalize_commits` here even though its own mode uses `propose_commits` — minor inconsistency.
+Both prompts now use `emit_commit`/`finalize_commits`.
 
 ### 1c. Code-issue detection examples (~40 lines)
 Four example blocks (Java missing braces, C printf args, Python wrong keyword, Python exceptions-for-control-flow) plus the "Any detected issues should be added..." sentence:
@@ -65,7 +65,7 @@ Every rule bullet is verbatim-identical between the two prompts:
 ## 2. Semantically-Equivalent but Differently-Worded
 
 ### 2a. Closing instruction
-- **SYSTEM_PROMPT** (189–192): "You have access to a read_file tool. Use it when the diff alone is not enough context... Call read_file as many times as needed, then call `propose_commits` when ready."
+- **SYSTEM_PROMPT** (189–192): "You have access to a read_file tool. Use it when the diff alone is not enough context... Call read_file as many times as needed, then call emit_commit for each logical commit and finalize_commits when done."
 - **AGENTIC_SYSTEM_PROMPT** (334–337): "Investigate the changes thoroughly before emitting commits. Once you have a clear picture of how the changes relate, emit commits for each logical grouping. Continue until all hunks are assigned or remaining hunks should be ignored, then call finalize_commits."
 
 Same intent (investigate then finalize), different API names and different framing.
@@ -83,7 +83,7 @@ Same semantics, different wording.
 ### SYSTEM_PROMPT only
 - Task framing paragraph (L102–106): "Given a list of changed files and their diffs, your job is to group them into one or more commits..."
 - read_file availability note at end (L189–192)
-- Uses `propose_commits` API (not `emit_commit`/`finalize_commits`)
+- Uses `emit_commit`/`finalize_commits` API (same as AGENTIC_SYSTEM_PROMPT)
 
 ### AGENTIC_SYSTEM_PROMPT only
 - Tool list with descriptions: read_file, get_diff, get_git_log, search_diff, query_tool_result, emit_commit, finalize_commits (L200–217)
