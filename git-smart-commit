@@ -110,7 +110,21 @@ HUNK_GROUPING_RULES = textwrap.dedent("""\
       logical change. For example, renaming a delimiter across 10 call sites
       is one refactor commit, not 10.
     - Dependency/lockfile changes belong with the commit that caused them.
-    - Test files belong with the code they test.\
+    - Symbol-dependency rule: if one hunk changes a function signature, class
+      definition, or exported symbol, and another hunk updates a call site,
+      import, or reference to that symbol, they MUST be in the same commit.
+      A commit that changes a signature without updating its callers — or
+      vice versa — creates a broken intermediate state.
+    - Test files that exercise code added or changed in a commit MUST be in
+      the same commit as that code. The `test` type is reserved for commits
+      that ONLY add or modify tests with no corresponding code change (e.g.
+      adding coverage for existing untested code). Splitting a feature from
+      its tests produces a commit with untested code and a follow-up commit
+      with orphaned tests that may not even compile.
+    - Documentation changes (README, comments, docstrings) that are
+      thematically related to a code change but not causally dependent on it
+      should be a separate `docs` commit. Only bundle docs with code when the
+      docs change would be wrong or misleading without the code change.\
 """)
 
 BREAKING_CHANGE_RULES = textwrap.dedent("""\
@@ -168,6 +182,9 @@ COMMIT_FORMAT_RULES = textwrap.dedent("""\
     - Use strict conventional commit format:
         subject: type(scope): short description  (under 72 chars)
         body: 4-10 lines, plain text, wrapped at 80 chars, no markdown
+    - The 72-char subject limit is a summarization constraint, NOT a reason
+      to split a commit. If a commit's changes are too complex for a short
+      subject, write a broader summary and put details in the body.
     - Type Definitions:
         * feat: Adds a net-new capability, flag, or behavior (e.g., adding .venv support, new CLI flags). Use this even for personal tools/dotfiles!
         * fix: Resolves a bug, crash, or incorrect behavior.
