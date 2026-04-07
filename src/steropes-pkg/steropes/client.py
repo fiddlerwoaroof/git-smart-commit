@@ -3,6 +3,7 @@
 import ast
 import json
 import textwrap
+import threading
 import time
 from typing import Any, Callable
 
@@ -335,11 +336,16 @@ class LLMClient:
         ac = self.agent_config
         if max_turns is None:
             max_turns = ac.max_agentic_turns
-        trim_threshold = (
-            context_trim_threshold
-            if context_trim_threshold is not None
-            else ac.context_trim_threshold
-        )
+
+        # ── dual-threshold setup (LCM §2.4) ──────────────────────────────────
+        # If explicit soft/hard thresholds are configured, use them.
+        # Otherwise fall back to the legacy single threshold for both.
+        if context_trim_threshold is not None:
+            _legacy = context_trim_threshold
+        else:
+            _legacy = ac.context_trim_threshold
+        soft_threshold = ac.context_soft_threshold if ac.context_soft_threshold is not None else _legacy
+        hard_threshold = ac.context_hard_threshold if ac.context_hard_threshold is not None else _legacy
 
         # ── result storage for compressed tool results ─────────────────────────
         result_store: dict[str, str] = {}  # result_id -> original full content
@@ -391,20 +397,28 @@ class LLMClient:
             )
             return header + truncated
 
-        def _trim_with_summaries(messages: list[dict]) -> None:
-            """Summarize oldest large messages until total context is under threshold."""
+        def _compactable_candidates(messages: list[dict], target: int) -> list[int]:
+            """Return indices of messages eligible for compaction, oldest first.
+
+            Stops collecting once compacting the candidates would bring the
+            total below *target* (optimistic estimate: each candidate shrinks
+            to tool_result_summarize_skip size).
+            """
             last_tool_idx = max(
                 (i for i, m in enumerate(messages) if m.get("role") == "tool"),
                 default=-1,
             )
+            candidates: list[int] = []
+            savings = 0
+            total = _total_message_chars(messages)
             for i, msg in enumerate(messages):
-                if _total_message_chars(messages) <= trim_threshold:
+                if total - savings <= target:
                     break
                 role = msg.get("role")
                 content = msg.get("content", "")
                 if not isinstance(content, str):
                     continue
-                if content.startswith("[Summarized"):  # already compressed
+                if content.startswith("[Summarized"):
                     continue
 
                 if role == "tool":
@@ -415,18 +429,108 @@ class LLMClient:
                         continue
                     if len(content) <= ac.tool_result_summarize_skip:
                         continue
-                    self._log(
-                        f"  {ansi('⋯', ANSI_DIM)} compressing tool result #{i} ({len(content):,} chars)"
-                    )
-                    messages[i] = {**msg, "content": _summarize_and_store(i, content)}
-
+                    candidates.append(i)
+                    savings += len(content) - ac.tool_result_summarize_skip
                 elif role == "user" and i == 1:
                     if len(content) <= ac.tool_result_summarize_skip:
                         continue
-                    self._log(
-                        f"  {ansi('⋯', ANSI_DIM)} compressing initial diff context ({len(content):,} chars)"
-                    )
-                    messages[i] = {**msg, "content": _summarize_and_store(i, content)}
+                    candidates.append(i)
+                    savings += len(content) - ac.tool_result_summarize_skip
+            return candidates
+
+        def _compact_indices(messages: list[dict], indices: list[int]) -> None:
+            """Synchronously summarize messages at the given indices in place."""
+            for i in indices:
+                msg = messages[i]
+                content = msg.get("content", "")
+                if not isinstance(content, str) or content.startswith("[Summarized"):
+                    continue
+                self._log(
+                    f"  {ansi('⋯', ANSI_DIM)} compressing message #{i} ({len(content):,} chars)"
+                )
+                messages[i] = {**msg, "content": _summarize_and_store(i, content)}
+
+        # ── async compaction state (LCM §2.4: between-turn atomic swap) ───────
+        _compaction_lock = threading.Lock()
+        _compaction_thread: threading.Thread | None = None
+        # Pending replacements produced by the background thread:
+        #   list of (msg_index, new_content_string)
+        _pending_swaps: list[tuple[int, str]] = []
+
+        def _run_background_compaction(
+            candidates: list[tuple[int, str]],
+        ) -> None:
+            """Run in a background thread: summarize candidates, store results.
+
+            *candidates* is a list of (msg_index, original_content) snapshots
+            taken from the message list at spawn time.  Results are written to
+            _pending_swaps and applied atomically by the main loop.
+            """
+            swaps: list[tuple[int, str]] = []
+            for idx, content in candidates:
+                summarized = _summarize_and_store(idx, content)
+                swaps.append((idx, summarized))
+            with _compaction_lock:
+                _pending_swaps.extend(swaps)
+
+        def _apply_pending_swaps(messages: list[dict]) -> int:
+            """Apply pending background compaction results to messages.
+
+            Returns the number of swaps applied.
+            """
+            with _compaction_lock:
+                swaps = list(_pending_swaps)
+                _pending_swaps.clear()
+            applied = 0
+            for idx, new_content in swaps:
+                if idx < len(messages):
+                    old = messages[idx].get("content", "")
+                    if isinstance(old, str) and not old.startswith("[Summarized"):
+                        messages[idx] = {**messages[idx], "content": new_content}
+                        applied += 1
+            return applied
+
+        def _maybe_start_async_compaction(messages: list[dict]) -> None:
+            """If no compaction is running and context exceeds τ_soft, spawn one."""
+            nonlocal _compaction_thread
+            if _compaction_thread is not None and _compaction_thread.is_alive():
+                return  # already running
+            indices = _compactable_candidates(messages, soft_threshold)
+            if not indices:
+                return
+            # Snapshot content so the thread doesn't touch the live list
+            snapshots = [
+                (i, messages[i].get("content", "")) for i in indices
+            ]
+            self._log(
+                f"  {ansi('⋯', ANSI_DIM)} τ_soft exceeded — async compaction "
+                f"of {len(snapshots)} message(s) in background"
+            )
+            _compaction_thread = threading.Thread(
+                target=_run_background_compaction,
+                args=(snapshots,),
+                daemon=True,
+            )
+            _compaction_thread.start()
+
+        def _blocking_compaction(messages: list[dict]) -> None:
+            """Block until context is under τ_hard (safety net)."""
+            nonlocal _compaction_thread
+            # First, wait for any in-flight async compaction to finish
+            if _compaction_thread is not None and _compaction_thread.is_alive():
+                self._log(
+                    f"  {ansi('⋯', ANSI_DIM)} τ_hard exceeded — waiting for async compaction"
+                )
+                _compaction_thread.join()
+            _apply_pending_swaps(messages)
+
+            # If still over hard threshold, compact synchronously
+            if _total_message_chars(messages) > hard_threshold:
+                self._log(
+                    f"  {ansi('⋯', ANSI_DIM)} τ_hard still exceeded — blocking compaction"
+                )
+                indices = _compactable_candidates(messages, hard_threshold)
+                _compact_indices(messages, indices)
 
         # ── query_tool_result: closure over result_store and self ───────────────
         @tool(QueryResultArgs)
@@ -616,13 +720,28 @@ class LLMClient:
 
             messages.append(self._format_tool_result(tool_call.call_id, result_str))
 
-            # Context management: when messages are large, summarize old content
-            total_chars = _total_message_chars(messages)
-            if total_chars > trim_threshold:
+            # ── between-turn context management (LCM dual-threshold) ──────────
+            # Step 1: apply any completed async compaction results
+            n_swapped = _apply_pending_swaps(messages)
+            if n_swapped:
                 self._log(
-                    f"  {ansi('⋯', ANSI_DIM)} context {total_chars:,} chars — compressing old results"
+                    f"  {ansi('⋯', ANSI_DIM)} applied {n_swapped} async compaction result(s)"
                 )
-                _trim_with_summaries(messages)
+
+            total_chars = _total_message_chars(messages)
+
+            # Step 2: if over τ_hard, block until under threshold
+            if total_chars > hard_threshold:
+                self._log(
+                    f"  {ansi('⋯', ANSI_DIM)} context {total_chars:,} chars > τ_hard ({hard_threshold:,}) — blocking"
+                )
+                _blocking_compaction(messages)
+            # Step 3: if over τ_soft, trigger async compaction for next turn
+            elif total_chars > soft_threshold:
+                self._log(
+                    f"  {ansi('⋯', ANSI_DIM)} context {total_chars:,} chars > τ_soft ({soft_threshold:,})"
+                )
+                _maybe_start_async_compaction(messages)
 
             # Inject a countdown warning when few turns remain
             if 0 < turns_remaining <= ac.turns_warn_at:

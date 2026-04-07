@@ -15,7 +15,9 @@ class AgentConfig:
     max_agentic_turns_cap: int = 50
     read_file_limit: int = 50_000
 
-    context_trim_threshold: int = 300_000
+    context_trim_threshold: int = 300_000  # legacy: used if soft/hard not set
+    context_soft_threshold: int | None = None  # τ_soft: async compaction trigger
+    context_hard_threshold: int | None = None  # τ_hard: blocking compaction trigger
     tool_result_summarize_skip: int = 500
     tool_result_summarize_input: int = 20_000
     turns_warn_at: int = 6
