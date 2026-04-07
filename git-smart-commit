@@ -8,6 +8,12 @@
 #   "textual>=0.50.0",
 # ]
 # ///
+import os as _os, sys as _sys  # noqa: E401,E702
+# Ensure steropes is importable whether run from repo or via symlink
+_script_dir = _os.path.dirname(_os.path.realpath(__file__))
+_steropes_pkg = _os.path.join(_script_dir, "src", "steropes-pkg")
+if _os.path.isdir(_steropes_pkg) and _steropes_pkg not in _sys.path:
+    _sys.path.insert(0, _steropes_pkg)
 """
 git-smart-commit: Analyze changes, group into logical commits, execute them.
 
@@ -344,7 +350,9 @@ MAX_AGENTIC_TURNS     = 20    # base safeguard for the agentic investigation loo
 MAX_AGENTIC_TURNS_CAP = 50    # absolute ceiling when scaling with hunk count
 READ_FILE_LIMIT    = 50_000   # max chars returned by the read_file tool
 
-CONTEXT_TRIM_THRESHOLD        = 300_000  # total message chars before summarizing old results
+CONTEXT_TRIM_THRESHOLD        = 300_000  # legacy: used if soft/hard not set
+CONTEXT_SOFT_THRESHOLD        = 200_000  # τ_soft: async compaction trigger
+CONTEXT_HARD_THRESHOLD        = 300_000  # τ_hard: blocking compaction trigger
 TOOL_RESULT_SUMMARIZE_SKIP    = 500      # results shorter than this are never summarized
 TOOL_RESULT_SUMMARIZE_INPUT   = 20_000   # max chars fed to the summarizer model
 TURNS_WARN_AT                 = 6        # remaining turns at which to inject a commit warning
@@ -353,8 +361,10 @@ TURNS_WARN_AT                 = 6        # remaining turns at which to inject a 
 # exceeds this size — the model is likely still working with it and losing detail hurts quality.
 RECENT_TOOL_RESULT_CHARS      = 10_000
 
-# Ollama runs locally; a much lower trim threshold prevents timeouts from huge prompts.
+# Ollama runs locally; much lower thresholds prevent timeouts from huge prompts.
 OLLAMA_CONTEXT_TRIM_THRESHOLD = 20_000
+OLLAMA_SOFT_THRESHOLD         = 14_000   # ~70% of hard
+OLLAMA_HARD_THRESHOLD         = 20_000
 
 # Preset backends for the setup wizard
 SETUP_BACKENDS = [
@@ -2762,13 +2772,18 @@ def main() -> None:
             or gc.get("smart-commit.api-key")
         ),
     )
-    trim_threshold = (OLLAMA_CONTEXT_TRIM_THRESHOLD if api_config.is_ollama
-                      else CONTEXT_TRIM_THRESHOLD)
+    if api_config.is_ollama:
+        soft_thresh = OLLAMA_SOFT_THRESHOLD
+        hard_thresh = OLLAMA_HARD_THRESHOLD
+    else:
+        soft_thresh = CONTEXT_SOFT_THRESHOLD
+        hard_thresh = CONTEXT_HARD_THRESHOLD
     agent_config = AgentConfig(
         max_agentic_turns=MAX_AGENTIC_TURNS,
         max_agentic_turns_cap=MAX_AGENTIC_TURNS_CAP,
         read_file_limit=READ_FILE_LIMIT,
-        context_trim_threshold=trim_threshold,
+        context_soft_threshold=soft_thresh,
+        context_hard_threshold=hard_thresh,
         tool_result_summarize_skip=TOOL_RESULT_SUMMARIZE_SKIP,
         tool_result_summarize_input=TOOL_RESULT_SUMMARIZE_INPUT,
         turns_warn_at=TURNS_WARN_AT,
