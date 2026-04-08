@@ -12,21 +12,26 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .config import AgentConfig, ApiConfig
 from .parsers import OllamaParser, OpenAIParser, ResponseParser
+from .store import MessageStore
 from .tools import _summarize_args, _total_message_chars, tool
 from .types import TokenUsage, ToolCall
 from .ui import ANSI_CYAN, ANSI_DIM, ansi, log, log_reasoning
 
 
-class QueryResultArgs(BaseModel):
-    result_id: str = Field(
-        description="The result_id shown in the summarized tool output (e.g. 'r5')"
+class QueryMessageArgs(BaseModel):
+    msg_id: str = Field(
+        description="The message ID shown in summarized output (e.g. 'm5')"
     )
     question: str = Field(
-        description="Specific question to answer from the full stored result"
+        description="Specific question to answer from the full stored message"
     )
 
     def post_process(self):
         return self
+
+
+# Backward compatibility alias
+QueryResultArgs = QueryMessageArgs
 
 
 class LLMClient:
@@ -48,7 +53,7 @@ class LLMClient:
         self._http = httpx.Client(
             timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=5.0),
         )
-        self._last_result_store: dict[str, str] = {}
+        self._last_message_store: MessageStore | None = None
         self._last_messages: list[dict] = []
         self._log = log_fn if log_fn is not None else log
         self._log_reasoning = (
@@ -66,6 +71,18 @@ class LLMClient:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+    @property
+    def _last_result_store(self) -> dict[str, str]:
+        """Backward-compatible view: msg_id -> content for tool-role originals."""
+        if self._last_message_store is None:
+            return {}
+        store = self._last_message_store
+        return {
+            r.msg_id: str(r.content)
+            for r in store._log
+            if r.kind == "original" and r.role == "tool"
+        }
 
     def _build_payload(
         self, prompt: str, tools: list[dict] | None = None, stream: bool = False
@@ -347,16 +364,26 @@ class LLMClient:
         soft_threshold = ac.context_soft_threshold if ac.context_soft_threshold is not None else _legacy
         hard_threshold = ac.context_hard_threshold if ac.context_hard_threshold is not None else _legacy
 
-        # ── result storage for compressed tool results ─────────────────────────
-        result_store: dict[str, str] = {}  # result_id -> original full content
+        # ── immutable message store (LCM §2.1) ─────────────────────────────────
+        store = MessageStore()
+        msg_ids: list[str] = []  # parallel to messages; maps position -> store ID
 
-        def _summarize_and_store(msg_idx: int, content: str) -> str:
-            """Summarize a tool result via LLM with three-level escalation."""
-            result_id = f"r{msg_idx}"
-            result_store[result_id] = content
+        def _persist_and_append(msg: dict, *, _turn: int = 0) -> str:
+            """Persist to immutable store, then append to active context."""
+            mid = store.append(msg, turn=_turn)
+            messages.append(msg)
+            msg_ids.append(mid)
+            return mid
+
+        def _summarize_and_store(original_msg_id: str, content: str) -> str:
+            """Summarize content via LLM with three-level escalation.
+
+            The original is already in the store (persisted on append).
+            The summary is stored as a new record linked via parent_id.
+            """
             header = (
-                f"[Summarized — id: '{result_id}'. "
-                f"Use query_tool_result to ask specific questions about the full output.]\n"
+                f"[Summarized — id: '{original_msg_id}'. "
+                f"Use query_message to ask specific questions about the full output.]\n"
             )
             input_snippet = content[: ac.tool_result_summarize_input]
 
@@ -370,9 +397,14 @@ class LLMClient:
             summary_l1 = self.call(prompt_l1).strip()
             if len(summary_l1) < len(content):
                 self._log(
-                    f"  {ansi('⋯', ANSI_DIM)} summarization level 1 (normal) succeeded for #{msg_idx}"
+                    f"  {ansi('⋯', ANSI_DIM)} summarization level 1 (normal) succeeded for {original_msg_id}"
                 )
-                return header + summary_l1
+                summary_text = header + summary_l1
+                store.append(
+                    {"role": "meta", "content": summary_text},
+                    parent_id=original_msg_id, kind="summary",
+                )
+                return summary_text
 
             # Level 2 — Aggressive bullet points (target half the tokens)
             prompt_l2 = textwrap.dedent(f"""\
@@ -384,18 +416,25 @@ class LLMClient:
             summary_l2 = self.call(prompt_l2).strip()
             if len(summary_l2) < len(content):
                 self._log(
-                    f"  {ansi('⋯', ANSI_DIM)} summarization level 2 (aggressive) succeeded for #{msg_idx}"
+                    f"  {ansi('⋯', ANSI_DIM)} summarization level 2 (aggressive) succeeded for {original_msg_id}"
                 )
-                return header + summary_l2
+                summary_text = header + summary_l2
+                store.append(
+                    {"role": "meta", "content": summary_text},
+                    parent_id=original_msg_id, kind="summary",
+                )
+                return summary_text
 
             # Level 3 — Deterministic truncate (always reduces size)
             self._log(
-                f"  {ansi('⋯', ANSI_DIM)} summarization level 3 (deterministic truncate) for #{msg_idx}"
+                f"  {ansi('⋯', ANSI_DIM)} summarization level 3 (deterministic truncate) for {original_msg_id}"
             )
-            truncated = (
-                content[:512] + "\n[Truncated — use query_tool_result for full content]"
+            summary_text = header + content[:512] + "\n[Truncated — use query_message for full content]"
+            store.append(
+                {"role": "meta", "content": summary_text},
+                parent_id=original_msg_id, kind="summary",
             )
-            return header + truncated
+            return summary_text
 
         def _compactable_candidates(messages: list[dict], target: int) -> list[int]:
             """Return indices of messages eligible for compaction, oldest first.
@@ -448,7 +487,7 @@ class LLMClient:
                 self._log(
                     f"  {ansi('⋯', ANSI_DIM)} compressing message #{i} ({len(content):,} chars)"
                 )
-                messages[i] = {**msg, "content": _summarize_and_store(i, content)}
+                messages[i] = {**msg, "content": _summarize_and_store(msg_ids[i], content)}
 
         # ── async compaction state (LCM §2.4: between-turn atomic swap) ───────
         _compaction_lock = threading.Lock()
@@ -458,17 +497,17 @@ class LLMClient:
         _pending_swaps: list[tuple[int, str]] = []
 
         def _run_background_compaction(
-            candidates: list[tuple[int, str]],
+            candidates: list[tuple[int, str, str]],
         ) -> None:
             """Run in a background thread: summarize candidates, store results.
 
-            *candidates* is a list of (msg_index, original_content) snapshots
-            taken from the message list at spawn time.  Results are written to
-            _pending_swaps and applied atomically by the main loop.
+            *candidates* is a list of (msg_index, msg_id, original_content)
+            snapshots taken from the message list at spawn time.  Results are
+            written to _pending_swaps and applied atomically by the main loop.
             """
             swaps: list[tuple[int, str]] = []
-            for idx, content in candidates:
-                summarized = _summarize_and_store(idx, content)
+            for idx, mid, content in candidates:
+                summarized = _summarize_and_store(mid, content)
                 swaps.append((idx, summarized))
             with _compaction_lock:
                 _pending_swaps.extend(swaps)
@@ -500,7 +539,7 @@ class LLMClient:
                 return
             # Snapshot content so the thread doesn't touch the live list
             snapshots = [
-                (i, messages[i].get("content", "")) for i in indices
+                (i, msg_ids[i], messages[i].get("content", "")) for i in indices
             ]
             self._log(
                 f"  {ansi('⋯', ANSI_DIM)} τ_soft exceeded — async compaction "
@@ -532,26 +571,29 @@ class LLMClient:
                 indices = _compactable_candidates(messages, hard_threshold)
                 _compact_indices(messages, indices)
 
-        # ── query_tool_result: closure over result_store and self ───────────────
-        @tool(QueryResultArgs)
-        def query_tool_result(args: QueryResultArgs, **_: Any) -> str:
-            """Access the full (unsummarized) content of a previously summarized tool result.
+        # ── query_message: closure over store and self ─────────────────────────
+        @tool(QueryMessageArgs)
+        def query_message(args: QueryMessageArgs, **_: Any) -> str:
+            """Access the full content of any stored message by ID.
 
-            When a tool result was compressed to save context, use this to ask a
-            targeted question. The answer is generated from the original full content
-            so no information is lost.
+            When a message was compressed to save context, use this to ask a
+            targeted question. The answer is generated from the original full
+            content so no information is lost.
             """
-            full = result_store.get(args.result_id)
-            if full is None:
-                available = list(result_store.keys()) or ["none"]
+            rec = store.get_original(args.msg_id)
+            if rec is None:
+                available = store.list_ids()[-20:]
                 return (
-                    f"No stored result with id '{args.result_id}'. "
-                    f"Available ids: {available}"
+                    f"No stored message with id '{args.msg_id}'. "
+                    f"Recent ids: {available}"
                 )
+            content = rec.content
+            if not isinstance(content, str):
+                content = str(content)
             prompt = textwrap.dedent(f"""\
-                The following is the full content of stored tool result '{args.result_id}':
+                The following is the full content of stored message '{rec.msg_id}':
 
-                {full[:50_000]}
+                {content[:50_000]}
 
                 Question: {args.question}
 
@@ -559,9 +601,9 @@ class LLMClient:
             """)
             return self.call(prompt)
 
-        # ── build extended registry that includes query_tool_result ─────────────
+        # ── build extended registry that includes query_message ────────────────
         extended_registry = dict(tool_registry)
-        extended_registry["query_tool_result"] = query_tool_result
+        extended_registry["query_message"] = query_message
 
         # For Anthropic, use structured content blocks with cache_control so the
         # static system prompt is prefix-cached across all turns in the agentic loop.
@@ -576,10 +618,9 @@ class LLMClient:
         else:
             system_content = system_prompt
 
-        messages: list[dict] = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": initial_user_message},
-        ]
+        messages: list[dict] = []
+        _persist_and_append({"role": "system", "content": system_content})
+        _persist_and_append({"role": "user", "content": initial_user_message})
 
         terminal_spec = terminal_tool._tool_spec
         terminal_name: str = terminal_spec["function"]["name"]
@@ -635,7 +676,7 @@ class LLMClient:
                     f"  {ansi('⟳', ANSI_DIM)} {ansi(f'[{turn}/{max_turns}]', ANSI_DIM)}"
                     f" {ansi(f'(no tool call — nudging #{consecutive_no_tool_calls})', ANSI_DIM)}"
                 )
-                messages.append({"role": "assistant", "content": text})
+                _persist_and_append({"role": "assistant", "content": text}, _turn=turn)
                 if nudge_message_fn is not None:
                     nudge_text = nudge_message_fn(consecutive_no_tool_calls)
                 else:
@@ -643,7 +684,7 @@ class LLMClient:
                         f"Please call a tool. Use the investigation tools to gather more "
                         f"information, or call {terminal_name} if you are ready to propose commits."
                     )
-                messages.append({"role": "user", "content": nudge_text})
+                _persist_and_append({"role": "user", "content": nudge_text}, _turn=turn)
                 continue
 
             consecutive_no_tool_calls = 0
@@ -652,7 +693,7 @@ class LLMClient:
                 f" {ansi(tool_call.name, ANSI_CYAN)}"
                 f"({ansi(_summarize_args(tool_call.arguments), ANSI_DIM)})"
             )
-            messages.append(self._format_assistant_tool_call(data))
+            _persist_and_append(self._format_assistant_tool_call(data), _turn=turn)
 
             # Coerce stringified nested values (some models return JSON-as-string)
             raw_args = dict(tool_call.arguments)
@@ -670,7 +711,7 @@ class LLMClient:
                 try:
                     validated = terminal_model.model_validate(raw_args).post_process()
                     self._last_messages = list(messages)
-                    self._last_result_store = dict(result_store)
+                    self._last_message_store = store
                     return terminal_tool(validated, **kwargs)
                 except (ValidationError, ValueError) as e:
                     terminal_validation_error = e
@@ -687,13 +728,18 @@ class LLMClient:
                         max_turns += 1
                         _extended_for_terminal_validation = True
                     if len(err_str) > ac.tool_result_summarize_skip:
-                        err_str = _summarize_and_store(len(messages), err_str)
-                    messages.append(
-                        self._format_tool_result(
-                            tool_call.call_id,
-                            err_str,
+                        # Store original before summarizing
+                        orig_msg = self._format_tool_result(tool_call.call_id, err_str)
+                        orig_id = store.append(orig_msg, turn=turn)
+                        err_str = _summarize_and_store(orig_id, err_str)
+                        # Append summarized version (don't re-persist — original already stored)
+                        messages.append(self._format_tool_result(tool_call.call_id, err_str))
+                        msg_ids.append(orig_id)
+                    else:
+                        _persist_and_append(
+                            self._format_tool_result(tool_call.call_id, err_str),
+                            _turn=turn,
                         )
-                    )
                     continue
 
             tool_fn = extended_registry.get(tool_call.name)
@@ -716,9 +762,18 @@ class LLMClient:
 
             # Proactive summarization: summarize large tool results immediately
             if len(result_str) > ac.tool_result_summarize_skip:
-                result_str = _summarize_and_store(len(messages), result_str)
-
-            messages.append(self._format_tool_result(tool_call.call_id, result_str))
+                # Store original before summarizing
+                orig_msg = self._format_tool_result(tool_call.call_id, result_str)
+                orig_id = store.append(orig_msg, turn=turn)
+                result_str = _summarize_and_store(orig_id, result_str)
+                # Append summarized version (original already in store)
+                messages.append(self._format_tool_result(tool_call.call_id, result_str))
+                msg_ids.append(orig_id)
+            else:
+                _persist_and_append(
+                    self._format_tool_result(tool_call.call_id, result_str),
+                    _turn=turn,
+                )
 
             # ── between-turn context management (LCM dual-threshold) ──────────
             # Step 1: apply any completed async compaction results
@@ -753,15 +808,13 @@ class LLMClient:
                         f"Stop gathering context and call {terminal_name} NOW with "
                         f"your best grouping based on what you already know."
                     )
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": warning_text,
-                    }
+                _persist_and_append(
+                    {"role": "user", "content": warning_text},
+                    _turn=turn,
                 )
 
         self._last_messages = list(messages)
-        self._last_result_store = dict(result_store)
+        self._last_message_store = store
 
         if terminal_validation_error is not None:
             # The terminal tool was called on the last turn but failed validation.
@@ -802,10 +855,10 @@ class LLMClient:
                                     bonus_raw[key] = ast.literal_eval(val)
                                 except (ValueError, SyntaxError):
                                     pass
-                    messages.append(self._format_assistant_tool_call(bonus_data))
+                    _persist_and_append(self._format_assistant_tool_call(bonus_data), _turn=max_turns + 1)
                     validated = terminal_model.model_validate(bonus_raw).post_process()
                     self._last_messages = list(messages)
-                    self._last_result_store = dict(result_store)
+                    self._last_message_store = store
                     return terminal_tool(validated, **kwargs)
             except Exception:
                 pass

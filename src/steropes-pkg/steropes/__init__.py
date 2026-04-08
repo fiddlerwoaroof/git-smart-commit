@@ -5,7 +5,8 @@ Public API re-exports for convenient single-import usage.
 
 __version__ = "0.1.0"
 
-from .client import LLMClient, QueryResultArgs
+from .client import LLMClient, QueryMessageArgs, QueryResultArgs
+from .store import MessageStore, StoredMessage
 from .config import AgentConfig, ApiConfig
 from .parsers import OllamaParser, OpenAIParser, ResponseParser
 from .text import wrap_markdown
@@ -27,7 +28,11 @@ from .ui import (
 __all__ = [
     # client
     "LLMClient",
+    "QueryMessageArgs",
     "QueryResultArgs",
+    # store
+    "MessageStore",
+    "StoredMessage",
     # config
     "AgentConfig",
     "ApiConfig",
