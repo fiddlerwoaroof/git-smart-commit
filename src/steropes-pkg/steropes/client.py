@@ -773,7 +773,9 @@ class LLMClient:
                     result_str = f"Error calling {tool_call.name}: {e}"
 
             # Proactive summarization: summarize large tool results immediately
-            if len(result_str) > ac.tool_result_summarize_skip:
+            # Tools can opt out by setting _skip_summarization = True
+            skip_proactive = getattr(tool_fn, "_skip_summarization", False) if tool_fn else False
+            if not skip_proactive and len(result_str) > ac.tool_result_summarize_skip:
                 # Store original before summarizing
                 orig_msg = self._format_tool_result(tool_call.call_id, result_str)
                 orig_id = store.append(orig_msg, turn=turn)

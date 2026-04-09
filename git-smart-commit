@@ -1469,6 +1469,10 @@ class GitAnalyzer:
             remaining_list = "\n".join(f"- {hid}" for hid in sorted(remaining))
             return f"Commit emitted: '{args.commit.subject}'. Remaining unassigned hunks:\n{remaining_list}"
 
+        # emit_commit responses contain literal hunk IDs the model needs verbatim;
+        # never proactively summarize them.
+        emit_commit._skip_summarization = True
+
         # ── finalize_commits: terminal tool closure ───────────────────────────
         @tool(FinalizeCommitsArgs)
         def finalize_commits(args: FinalizeCommitsArgs, **_: Any) -> tuple:
