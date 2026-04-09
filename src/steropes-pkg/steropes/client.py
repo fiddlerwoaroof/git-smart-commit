@@ -66,6 +66,58 @@ class LLMClient:
         """Close the underlying HTTP connection pool."""
         self._http.close()
 
+    def resolve_model_name(self) -> str | None:
+        """Query the server to discover the actual loaded model name.
+
+        Returns the real model name, or None if the server doesn't expose it.
+        Works with llama-server (/props), Ollama (/api/tags), and
+        OpenAI-compatible (/v1/models) endpoints.
+        """
+        try:
+            if self.config.is_ollama:
+                # Native Ollama — try /api/tags to list loaded models
+                resp = self._http.get(
+                    f"{self.config.base_url}/api/tags",
+                    timeout=5.0,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    models = data.get("models", [])
+                    if models:
+                        return models[0].get("name")
+            else:
+                # llama-server or OpenAI-compatible — try /props first
+                base = self.config.base_url.rstrip("/")
+                # Strip /v1 suffix if present to get the server root
+                server_root = base.removesuffix("/v1")
+                try:
+                    resp = self._http.get(
+                        f"{server_root}/props",
+                        timeout=5.0,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        alias = data.get("model_alias")
+                        if alias:
+                            return alias
+                except Exception:
+                    pass
+
+                # Fallback: /v1/models
+                resp = self._http.get(
+                    f"{base}/models",
+                    headers=self.config.auth_headers,
+                    timeout=5.0,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    models = data.get("data", [])
+                    if models:
+                        return models[0].get("id")
+        except Exception:
+            pass
+        return None
+
     def __enter__(self) -> "LLMClient":
         return self
 
