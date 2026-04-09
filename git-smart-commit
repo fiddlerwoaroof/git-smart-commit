@@ -1204,16 +1204,19 @@ class GitAnalyzer:
 
         return hunk_map, staged_files
 
-    def build_hunk_context(self, hunk_map: dict[str, DiffHunk]) -> str:
-        """Build the initial LLM message: hunk list with inline diff content.
+    def build_hunk_context(self, hunk_map: dict[str, DiffHunk]) -> tuple[str, str]:
+        """Build the initial LLM messages: hunk list + diff content.
+
+        Returns (hunk_list, diff_content) as separate strings.  The hunk
+        list is small and should never be summarized; the diff content is
+        large and may be compacted by the context manager.
 
         Small hunks are included verbatim; very large ones are summarized.
         Total output is capped at DIFF_TOTAL_CHARS.
         """
-        parts: list[str] = []
         total_chars = 0
 
-        # Header: compact hunk list
+        # Header: compact hunk list (MUST survive compaction)
         hunk_list_lines = []
         for hunk_id, dh in hunk_map.items():
             if dh.is_untracked:
@@ -1224,7 +1227,7 @@ class GitAnalyzer:
                 adds = dh.patch.count("\n+") - dh.patch.count("\n+++")
                 dels = dh.patch.count("\n-") - dh.patch.count("\n---")
                 hunk_list_lines.append(f"  {hunk_id}  (+{adds}/-{dels})")
-        parts.append("Available hunks:\n" + "\n".join(hunk_list_lines))
+        hunk_list = "Available hunks:\n" + "\n".join(hunk_list_lines)
 
         # Inline diff content for each hunk
         diff_parts: list[str] = []
@@ -1253,8 +1256,8 @@ class GitAnalyzer:
                 diff_parts.append("\n... (remaining hunks omitted — total size limit reached)")
                 break
 
-        parts.append("\nDiff content:\n" + "\n\n".join(diff_parts))
-        return "\n\n".join(parts)
+        diff_content = "Diff content:\n" + "\n\n".join(diff_parts)
+        return hunk_list, diff_content
 
     def build_file_metadata(self) -> str:
         """Return a compact stats-only summary: diff --stat for staged/unstaged + untracked list.
@@ -1427,7 +1430,7 @@ class GitAnalyzer:
         Returns (commits, gitignore_patterns).
         """
         self._hunk_map = hunk_map   # expose for validation in emit_commit
-        hunk_context = self.build_hunk_context(hunk_map)
+        hunk_list, diff_context = self.build_hunk_context(hunk_map)
 
         # ── Local state for incremental commit emission ────────────────────────
         # Stored on self so partial results survive interrupts for plan persistence.
@@ -1504,9 +1507,10 @@ class GitAnalyzer:
                 f"Revise your commit groupings to address this feedback."
             )
 
-        initial_message = hunk_context + critique_section
-        # Append project-specific patterns to the user message (not the system prompt)
-        # so the system prompt stays identical across all projects, enabling prefix caching.
+        # The diff content goes as the initial user message (index 1) — compactable.
+        # The hunk list is prepended so it's always visible even after compaction.
+        # Project patterns appended to the diff context.
+        initial_message = diff_context + critique_section
         if issue_patterns:
             bullet_list = "\n".join(f"- {p}" for p in issue_patterns)
             initial_message = (
@@ -1514,6 +1518,10 @@ class GitAnalyzer:
                 + f"\n\nProject-specific patterns to watch for (flag as issues if found):\n"
                 + bullet_list
             )
+        # Hunk list is pinned: prepended to diff content but separated by a
+        # marker so compaction can preserve it.  We prepend it so the model
+        # always sees valid hunk IDs even if the diff body gets summarized.
+        initial_message = hunk_list + "\n\n" + initial_message
 
         system_prompt = AGENTIC_SYSTEM_PROMPT
 
