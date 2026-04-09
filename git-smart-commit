@@ -130,7 +130,11 @@ HUNK_GROUPING_RULES = textwrap.dedent("""\
     - Documentation changes (README, comments, docstrings) that are
       thematically related to a code change but not causally dependent on it
       should be a separate `docs` commit. Only bundle docs with code when the
-      docs change would be wrong or misleading without the code change.\
+      docs change would be wrong or misleading without the code change.
+    - File renames: when git detects a rename (diff header shows
+      "rename from ... rename to ..."), the deletion of the old path and
+      addition of the new path MUST be in the same commit. Never split a
+      rename across separate delete and add commits.\
 """)
 
 BREAKING_CHANGE_RULES = textwrap.dedent("""\
@@ -889,7 +893,7 @@ def get_diff(result: GetDiffArgs, analyzer: "GitAnalyzer") -> str:
 
     def _fetch(extra_args: list[str], label: str) -> None:
         try:
-            diff = analyzer.git(["diff"] + extra_args + ["--no-color", "--no-ext-diff", "--", result.path])
+            diff = analyzer.git(["diff"] + extra_args + ["-M", "--no-color", "--no-ext-diff", "--", result.path])
             if diff.strip():
                 parts.append(f"=== {label} ===\n{diff}" if result.staged is None else diff)
         except RuntimeError as e:
@@ -957,7 +961,7 @@ def search_diff(result: SearchDiffArgs, analyzer: "GitAnalyzer") -> str:
                 if len(matches) >= MAX_MATCHES:
                     break
                 diff = analyzer.git(
-                    ["diff"] + extra_args + ["--no-color", "--no-ext-diff", "--", fname]
+                    ["diff"] + extra_args + ["-M", "--no-color", "--no-ext-diff", "--", fname]
                 )
                 lines = diff.splitlines()
                 for i, line in enumerate(lines):
@@ -1158,7 +1162,7 @@ class GitAnalyzer:
             # Read the staged diff without disturbing the index
             changed = self.git(["diff", "--cached", "--name-only"]).splitlines()
             for fpath in changed:
-                diff = self.git(["diff", "--cached", "--no-color", "--no-ext-diff", "--", fpath])
+                diff = self.git(["diff", "--cached", "-M", "--no-color", "--no-ext-diff", "--", fpath])
                 if not diff.strip():
                     continue
                 if _is_binary_diff(diff):
@@ -1178,7 +1182,7 @@ class GitAnalyzer:
             self.git(["reset", "HEAD", "--"] + staged_files)
 
         for fpath in self.git(["diff", "--name-only", "--no-ext-diff"]).splitlines():
-            diff = self.git(["diff", "--no-color", "--no-ext-diff", "--", fpath])
+            diff = self.git(["diff", "-M", "--no-color", "--no-ext-diff", "--", fpath])
             if not diff.strip():
                 continue
             if _is_binary_diff(diff):
@@ -1259,7 +1263,7 @@ class GitAnalyzer:
         """
         parts: list[str] = []
         for label, extra_args in [("Staged", ["--cached"]), ("Unstaged", [])]:
-            stat = self.git(["diff"] + extra_args + ["--stat", "--no-color"]).strip()
+            stat = self.git(["diff"] + extra_args + ["-M", "--stat", "--no-color"]).strip()
             if stat:
                 parts.append(f"{label}:\n{stat}")
         untracked = self.git(["ls-files", "--others", "--exclude-standard"]).splitlines()
@@ -1352,14 +1356,14 @@ class GitAnalyzer:
         total_chars = 0
 
         for label, extra_args in [("Staged", ["--cached"]), ("Unstaged", [])]:
-            stat = self.git(["diff"] + extra_args + ["--stat", "--no-color"]).strip()
+            stat = self.git(["diff"] + extra_args + ["-M", "--stat", "--no-color"]).strip()
             if not stat:
                 continue
             parts.append(f"{label}:\n{stat}\n")
 
             changed = self.git(["diff"] + extra_args + ["--name-only", "--no-ext-diff"]).splitlines()
             for fname in changed:
-                file_diff = self.git(["diff"] + extra_args + ["--no-color", "--no-ext-diff", "--", fname])
+                file_diff = self.git(["diff"] + extra_args + ["-M", "--no-color", "--no-ext-diff", "--", fname])
 
                 if self._is_skip_summarization(fname):
                     content = self._stat_only_summary(file_diff)
