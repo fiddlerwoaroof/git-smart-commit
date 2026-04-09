@@ -2800,6 +2800,7 @@ def main() -> None:
         tool_result_summarize_input=TOOL_RESULT_SUMMARIZE_INPUT,
         turns_warn_at=TURNS_WARN_AT,
         recent_tool_result_chars=RECENT_TOOL_RESULT_CHARS,
+        compaction_preserve_marker="Diff content:\n",
     )
     client = LLMClient(api_config, agent_config=agent_config,
                         log_fn=_log, log_reasoning_fn=_log_reasoning)

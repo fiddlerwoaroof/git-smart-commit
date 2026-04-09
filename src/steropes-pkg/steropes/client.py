@@ -380,12 +380,24 @@ class LLMClient:
 
             The original is already in the store (persisted on append).
             The summary is stored as a new record linked via parent_id.
+
+            If ``compaction_preserve_marker`` is set and appears in *content*,
+            everything before the marker is preserved verbatim and only the
+            remainder is summarized.
             """
+            preserved_prefix = ""
+            summarize_content = content
+            marker = ac.compaction_preserve_marker
+            if marker and marker in content:
+                idx = content.index(marker)
+                preserved_prefix = content[:idx]
+                summarize_content = content[idx:]
+
             header = (
                 f"[Summarized — id: '{original_msg_id}'. "
                 f"Use query_message to ask specific questions about the full output.]\n"
             )
-            input_snippet = content[: ac.tool_result_summarize_input]
+            input_snippet = summarize_content[: ac.tool_result_summarize_input]
 
             # Level 1 — Normal summary
             prompt_l1 = textwrap.dedent(f"""\
@@ -395,11 +407,11 @@ class LLMClient:
                 {input_snippet}
             """)
             summary_l1 = self.call(prompt_l1).strip()
-            if len(summary_l1) < len(content):
+            if len(summary_l1) < len(summarize_content):
                 self._log(
                     f"  {ansi('⋯', ANSI_DIM)} summarization level 1 (normal) succeeded for {original_msg_id}"
                 )
-                summary_text = header + summary_l1
+                summary_text = preserved_prefix + header + summary_l1
                 store.append(
                     {"role": "meta", "content": summary_text},
                     parent_id=original_msg_id, kind="summary",
@@ -414,11 +426,11 @@ class LLMClient:
                 {input_snippet}
             """)
             summary_l2 = self.call(prompt_l2).strip()
-            if len(summary_l2) < len(content):
+            if len(summary_l2) < len(summarize_content):
                 self._log(
                     f"  {ansi('⋯', ANSI_DIM)} summarization level 2 (aggressive) succeeded for {original_msg_id}"
                 )
-                summary_text = header + summary_l2
+                summary_text = preserved_prefix + header + summary_l2
                 store.append(
                     {"role": "meta", "content": summary_text},
                     parent_id=original_msg_id, kind="summary",
@@ -429,7 +441,7 @@ class LLMClient:
             self._log(
                 f"  {ansi('⋯', ANSI_DIM)} summarization level 3 (deterministic truncate) for {original_msg_id}"
             )
-            summary_text = header + content[:512] + "\n[Truncated — use query_message for full content]"
+            summary_text = preserved_prefix + header + summarize_content[:512] + "\n[Truncated — use query_message for full content]"
             store.append(
                 {"role": "meta", "content": summary_text},
                 parent_id=original_msg_id, kind="summary",

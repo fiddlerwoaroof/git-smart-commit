@@ -22,6 +22,7 @@ class AgentConfig:
     tool_result_summarize_input: int = 20_000
     turns_warn_at: int = 6
     recent_tool_result_chars: int = 10_000
+    compaction_preserve_marker: str | None = None  # if set, content before this marker survives compaction
 
 
 @dataclass
