@@ -1284,7 +1284,7 @@ class GitAnalyzer:
         """Return a concise stat-only description from a unified diff without calling the LLM."""
         adds = diff_text.count("\n+") - diff_text.count("\n+++")
         dels = diff_text.count("\n-") - diff_text.count("\n---")
-        return f"[skipped — machine-generated file] +{adds}/-{dels} lines"
+        return f"[machine-generated lockfile — group with the dependency change that caused it] +{adds}/-{dels} lines"
 
     def _summarize_file_diff(self, fname: str, diff_text: str, remaining_budget: int | None = None) -> str:
         """Ask the model to summarize each hunk, passing the last N summaries as context.
@@ -2769,6 +2769,11 @@ def main() -> None:
     # Priority: CLI arg > env var > git config (smart-commit.*) > built-in default.
     gc = read_git_config(repo)
     issue_patterns = read_issue_patterns(repo, gc)
+    model_explicit = bool(
+        args.model
+        or os.environ.get("LLM_MODEL")
+        or gc.get("smart-commit.model")
+    )
     api_config = ApiConfig(
         base_url=(
             args.api_base
@@ -2809,9 +2814,93 @@ def main() -> None:
     client = LLMClient(api_config, agent_config=agent_config,
                         log_fn=_log, log_reasoning_fn=_log_reasoning)
     try:
+        _resolve_model_interactive(client, args, model_explicit=model_explicit)
         _main_body(client, repo, args, issue_patterns)
     finally:
         client.close()
+
+
+def _resolve_model_interactive(
+    client: LLMClient, args, *, model_explicit: bool = True
+) -> None:
+    """Query the server for the real model name and let the user confirm.
+
+    Updates client.config.model in place.  In non-interactive modes
+    (--yes, --json), auto-accepts the server's model silently.
+
+    When *model_explicit* is False (no --model, no env var, no git config),
+    the prompt is always shown so the user can confirm the default.
+    """
+    resolved = client.resolve_model_name()
+    non_interactive = getattr(args, "yes", False) or getattr(args, "json", False)
+
+    if non_interactive:
+        # Auto-accept: prefer server-reported model over CLI default
+        if resolved:
+            client.config.model = resolved
+        _log(f"  Model: {client.config.model}")
+        return
+
+    # Determine effective candidates
+    cli_model = client.config.model
+    server_model = resolved
+
+    # Always prompt when: model not explicitly set, or server disagrees
+    needs_prompt = (
+        not model_explicit
+        or (server_model is not None and server_model != cli_model)
+    )
+
+    if not needs_prompt:
+        _log(f"  Model: {client.config.model}")
+        return
+
+    # Build the prompt
+    if server_model and server_model != cli_model:
+        print(
+            f"\n  {_ansi('⚠', _ANSI_YELLOW)} Server reports model: {_ansi(server_model, _ANSI_CYAN)}\n"
+            f"    --model flag says:     {_ansi(cli_model, _ANSI_DIM)}",
+            file=sys.stderr,
+        )
+        choice = _prompt(
+            f"\n  Use [{_ansi('1', _ANSI_BOLD)}] server model, "
+            f"[{_ansi('2', _ANSI_BOLD)}] --model flag, "
+            f"or type a name: ",
+            default="1",
+        )
+        if choice is None or choice == "1":
+            client.config.model = server_model
+        elif choice == "2":
+            pass  # keep --model value
+        else:
+            client.config.model = _fuzzy_pick(choice, [server_model, cli_model])
+    elif server_model:
+        # Server matches but model wasn't explicitly set — confirm
+        choice = _prompt(
+            f"  Model: {_ansi(server_model, _ANSI_CYAN)} (from server)\n"
+            f"  Press Enter to accept, or type a model name: ",
+            default=server_model,
+        )
+        if choice is not None:
+            client.config.model = choice
+    else:
+        # Can't detect from server — prompt with current default
+        choice = _prompt(
+            f"  Model: {_ansi(cli_model, _ANSI_CYAN)} (default — could not detect from server)\n"
+            f"  Press Enter to accept, or type a model name: ",
+            default=cli_model,
+        )
+        if choice is not None:
+            client.config.model = choice
+
+    _log(f"  Model: {client.config.model}")
+
+
+def _fuzzy_pick(choice: str, candidates: list[str]) -> str:
+    """Pick the best candidate matching *choice* by substring, or return verbatim."""
+    lower = choice.lower()
+    matches = [c for c in candidates if lower in c.lower()]
+    return matches[0] if len(matches) == 1 else choice
 
 
 def _main_body(client: LLMClient, repo: Path, args, issue_patterns) -> None:
