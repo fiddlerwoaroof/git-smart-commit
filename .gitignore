@@ -31,3 +31,6 @@ dolt-server.port
 
 # Beads / Dolt files (added by bd init)
 .beads-credential-key
+
+# Added by git-smart-commit
+*.patch
