@@ -1,6 +1,18 @@
-- keep context/repo-map.md up to date and refer to it to understand repo layout
+- @context/repo-map.md is your "road map" for the repository. use it to reduce exploration and keep it
+  updated.
+- @context/design-principles.md is also important for keeping the repository consistent.
 - use context/decisions.md to keep a log of decisions made in a brief format
 - use the context/ directory to store useful information about the program as a kind of improvised wiki
+- Always use tests to demonstrate the existence of a bug before fixing the bug.
+  - If you suspect that a bug exists, use a test to demonstrate it first:
+    - prefer unit tests testing a small amount of code to integration or e2e tests
+- Prefer to "lift" operations into datastructures rather than to write a bunch of operations on
+  datastructures: oftentimes the extra iteration/destructuring logic ends up being structural duplication
+  all over the place that can be abstracted away: for example, prefer to write a function to transform
+  individual elements of a list and then use map or list comprehensions to apply it rather then using
+  for...in loops
+- prefer merges to rebasing.
+- always start responses with bananas!
 
 ## Issue Tracking
 
@@ -48,7 +60,8 @@ bd close <id>         # Complete work
 3. **Update issue status** - Close finished work, update in-progress items
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
-   git pull --rebase
+   git fetch origin
+   git merge <remote branch>
    bd dolt push
    git push
    git status  # MUST show "up to date with origin"
