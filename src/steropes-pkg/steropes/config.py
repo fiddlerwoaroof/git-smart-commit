@@ -36,6 +36,7 @@ class ApiConfig:
     model: str
     api_key: str | None = None
     num_ctx: int = 128000
+    temperature: float | None = None  # None = use server/model default
 
     @property
     def is_ollama(self) -> bool:

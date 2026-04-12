@@ -86,6 +86,7 @@ Run with: `uv run --group dev pytest`
 **Key design decisions:**
 - `AgentConfig` dataclass replaces module-level tuning constants; `LLMClient` reads from it
 - `ApiConfig` is parameterized (no hardcoded OLLAMA_BASE_URL/DEFAULT_MODEL); app provides values
+- `ApiConfig.temperature` defaults to `None` (omit from payload → server/model default); previously hardcoded 1.2
 - `LLMClient.__init__` accepts `log_fn` and `log_reasoning_fn` callbacks so the app controls output (e.g. respecting `--quiet`)
 - `QueryResultArgs` moved to framework since it's integral to `agentic_loop`'s context management
 - steropes depends only on `httpx` and `pydantic`; no git, subprocess, or textual

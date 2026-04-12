@@ -13,7 +13,7 @@ Lightweight LLM agent framework with tool calling and context management.
 
 - `__init__.py` — Public API re-exports (v0.1.0)
 - `client.py` (~800 lines) — `LLMClient`: streaming LLM calls, `call_with_tool`, `agentic_loop` with LCM-inspired dual-threshold async context compaction (τ_soft/τ_hard), three-level summarization escalation, `result_store` for lossless retrieval
-- `config.py` — `AgentConfig` (tuning: `context_soft_threshold`, `context_hard_threshold`, etc.), `ApiConfig` (API connection/model)
+- `config.py` — `AgentConfig` (tuning: `context_soft_threshold`, `context_hard_threshold`, etc.), `ApiConfig` (API connection/model, optional `temperature`)
 - `parsers.py` — `ResponseParser` (abstract), `OllamaParser`, `OpenAIParser`
 - `tools.py` — `@tool(args_model)` decorator, `_summarize_args`, `_total_message_chars`
 - `types.py` — `ToolCall`, `TokenUsage`

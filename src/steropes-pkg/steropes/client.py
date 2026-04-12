@@ -147,8 +147,8 @@ class LLMClient:
                 "stream": stream,
                 "keep_alive": "1h",
                 "options": {
-                    "temperature": 0.2,
                     "num_ctx": self.config.num_ctx,
+                    **({"temperature": self.config.temperature} if self.config.temperature is not None else {}),
                 },
             }
             if tools:
@@ -158,7 +158,7 @@ class LLMClient:
                 "model": self.config.model,
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": stream,
-                "temperature": 0.2,
+                **({"temperature": self.config.temperature} if self.config.temperature is not None else {}),
             }
             if tools:
                 payload["tools"] = tools
@@ -188,8 +188,8 @@ class LLMClient:
                 "stream": stream,
                 "keep_alive": "1h",
                 "options": {
-                    "temperature": 0.2,
                     "num_ctx": self.config.num_ctx,
+                    **({"temperature": self.config.temperature} if self.config.temperature is not None else {}),
                 },
             }
             if tools:
@@ -200,7 +200,7 @@ class LLMClient:
                 "model": self.config.model,
                 "messages": messages,
                 "stream": stream,
-                "temperature": 0.2,
+                **({"temperature": self.config.temperature} if self.config.temperature is not None else {}),
             }
             if tools:
                 payload["tools"] = tools
