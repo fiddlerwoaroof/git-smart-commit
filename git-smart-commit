@@ -354,21 +354,25 @@ MAX_AGENTIC_TURNS     = 20    # base safeguard for the agentic investigation loo
 MAX_AGENTIC_TURNS_CAP = 50    # absolute ceiling when scaling with hunk count
 READ_FILE_LIMIT    = 50_000   # max chars returned by the read_file tool
 
-CONTEXT_TRIM_THRESHOLD        = 300_000  # legacy: used if soft/hard not set
-CONTEXT_SOFT_THRESHOLD        = 200_000  # τ_soft: async compaction trigger
-CONTEXT_HARD_THRESHOLD        = 300_000  # τ_hard: blocking compaction trigger
-TOOL_RESULT_SUMMARIZE_SKIP    = 500      # results shorter than this are never summarized
+# Context thresholds are measured in TOKENS (via llama-server /tokenize,
+# falling back to chars/4). Tuned for a ~128k-token model context with
+# headroom for the system prompt and generation.
+CONTEXT_TRIM_THRESHOLD        = 75_000   # legacy: used if soft/hard not set
+CONTEXT_SOFT_THRESHOLD        = 50_000   # τ_soft: async compaction trigger
+CONTEXT_HARD_THRESHOLD        = 75_000   # τ_hard: blocking compaction trigger
+TOOL_RESULT_SUMMARIZE_SKIP    = 125      # results shorter than this (in tokens) are never summarized
 TOOL_RESULT_SUMMARIZE_INPUT   = 20_000   # max chars fed to the summarizer model
 TURNS_WARN_AT                 = 6        # remaining turns at which to inject a commit warning
 
 # When compressing old context, the *most recent* tool result is kept verbatim unless it
-# exceeds this size — the model is likely still working with it and losing detail hurts quality.
-RECENT_TOOL_RESULT_CHARS      = 10_000
+# exceeds this size (tokens) — the model is likely still working with it and losing detail hurts quality.
+RECENT_TOOL_RESULT_CHARS      = 2_500
 
-# Ollama runs locally; much lower thresholds prevent timeouts from huge prompts.
-OLLAMA_CONTEXT_TRIM_THRESHOLD = 20_000
-OLLAMA_SOFT_THRESHOLD         = 14_000   # ~70% of hard
-OLLAMA_HARD_THRESHOLD         = 20_000
+# Ollama runs locally with smaller context windows; lower token thresholds
+# prevent timeouts from huge prompts.
+OLLAMA_CONTEXT_TRIM_THRESHOLD = 5_000
+OLLAMA_SOFT_THRESHOLD         = 3_500    # ~70% of hard
+OLLAMA_HARD_THRESHOLD         = 5_000
 
 # Preset backends for the setup wizard
 SETUP_BACKENDS = [

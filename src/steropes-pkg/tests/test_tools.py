@@ -2,7 +2,12 @@
 
 from pydantic import BaseModel, Field
 
-from steropes.tools import _summarize_args, _total_message_chars, tool
+from steropes.tools import (
+    _summarize_args,
+    _total_message_chars,
+    _total_message_tokens,
+    tool,
+)
 
 
 class TestSummarizeArgs:
@@ -59,6 +64,67 @@ class TestTotalMessageChars:
         result = _total_message_chars(messages)
         # str() of a list — just verify it doesn't crash
         assert result > 0
+
+
+class TestTotalMessageTokens:
+    """Token-based counterpart of _total_message_chars.
+
+    Uses an injected count_fn so tests are deterministic and don't need
+    a real tokenizer. See gsc-psn.
+    """
+
+    def test_empty_list(self):
+        assert _total_message_tokens([], lambda s: len(s) // 4) == 0
+
+    def test_sums_per_message_tokens(self):
+        # A count_fn that returns the length of the string directly lets us
+        # assert totals without needing a real tokenizer.
+        messages = [
+            {"role": "user", "content": "aa"},    # 2
+            {"role": "tool", "content": "bbbbb"}, # 5
+        ]
+        assert _total_message_tokens(messages, len) == 7
+
+    def test_cache_prevents_recount(self):
+        calls: list[str] = []
+
+        def counter(text: str) -> int:
+            calls.append(text)
+            return len(text)
+
+        msg_a = {"role": "user", "content": "hello"}
+        msg_b = {"role": "tool", "content": "world"}
+        cache: dict[int, int] = {}
+
+        total1 = _total_message_tokens([msg_a, msg_b], counter, cache)
+        total2 = _total_message_tokens([msg_a, msg_b], counter, cache)
+        assert total1 == total2 == 10
+        # Second call should hit the cache for both messages — no extra calls.
+        assert len(calls) == 2
+
+    def test_cache_invalidation_on_replacement(self):
+        """When a message dict is replaced (new identity), it must be recounted."""
+        calls: list[str] = []
+
+        def counter(text: str) -> int:
+            calls.append(text)
+            return len(text)
+
+        cache: dict[int, int] = {}
+        messages = [{"role": "user", "content": "hello"}]
+        _total_message_tokens(messages, counter, cache)
+        assert calls == ["hello"]
+
+        # Simulate compaction: swap in a new dict with shorter content.
+        # The cache must not return the stale 5 — the id() is different.
+        messages[0] = {"role": "user", "content": "hi"}
+        total = _total_message_tokens(messages, counter, cache)
+        assert total == 2
+        assert calls == ["hello", "hi"]
+
+    def test_missing_content_counts_zero(self):
+        messages = [{"role": "assistant"}]
+        assert _total_message_tokens(messages, len) == 0
 
 
 class _SampleArgs(BaseModel):

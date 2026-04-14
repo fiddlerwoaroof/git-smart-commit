@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, ValidationError
 from .config import AgentConfig, ApiConfig
 from .parsers import OllamaParser, OpenAIParser, ResponseParser
 from .store import MessageStore
-from .tools import _summarize_args, _total_message_chars, tool
+from .tools import _summarize_args, _total_message_chars, _total_message_tokens, tool
 from .types import TokenUsage, ToolCall
 from .ui import ANSI_CYAN, ANSI_DIM, ansi, log, log_reasoning
 
@@ -59,6 +59,31 @@ class LLMClient:
         self._log_reasoning = (
             log_reasoning_fn if log_reasoning_fn is not None else log_reasoning
         )
+
+    # -- tokenization ---------------------------------------------------------
+
+    def count_tokens(self, text: str) -> int:
+        """Count tokens using the server's /tokenize endpoint.
+
+        Falls back to len(text) // 4 if the endpoint is unavailable.
+        """
+        if not text:
+            return 0
+        try:
+            base = self.config.base_url.rstrip("/")
+            server_root = base.removesuffix("/v1")
+            resp = self._http.post(
+                f"{server_root}/tokenize",
+                json={"content": text},
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                tokens = data.get("tokens", [])
+                return len(tokens)
+        except Exception:
+            pass
+        return len(text) // 4
 
     # -- resource management ---------------------------------------------------
 
@@ -420,6 +445,15 @@ class LLMClient:
         store = MessageStore()
         msg_ids: list[str] = []  # parallel to messages; maps position -> store ID
 
+        # ── token counting cache ─────────────────────────────────────────────
+        _token_cache: dict[int, int] = {}  # id(msg_dict) -> token count
+
+        def _count_total_tokens() -> int:
+            return _total_message_tokens(messages, self.count_tokens, _token_cache)
+
+        def _count_content_tokens(text: str) -> int:
+            return self.count_tokens(text)
+
         def _persist_and_append(msg: dict, *, _turn: int = 0) -> str:
             """Persist to immutable store, then append to active context."""
             mid = store.append(msg, turn=_turn)
@@ -451,6 +485,8 @@ class LLMClient:
             )
             input_snippet = summarize_content[: ac.tool_result_summarize_input]
 
+            original_tokens = self.count_tokens(summarize_content)
+
             # Level 1 — Normal summary
             prompt_l1 = textwrap.dedent(f"""\
                 Summarize this tool output in 2-4 sentences. Focus on filenames,
@@ -459,7 +495,7 @@ class LLMClient:
                 {input_snippet}
             """)
             summary_l1 = self.call(prompt_l1).strip()
-            if len(summary_l1) < len(summarize_content):
+            if self.count_tokens(summary_l1) < original_tokens:
                 self._log(
                     f"  {ansi('⋯', ANSI_DIM)} summarization level 1 (normal) succeeded for {original_msg_id}"
                 )
@@ -478,7 +514,7 @@ class LLMClient:
                 {input_snippet}
             """)
             summary_l2 = self.call(prompt_l2).strip()
-            if len(summary_l2) < len(summarize_content):
+            if self.count_tokens(summary_l2) < original_tokens:
                 self._log(
                     f"  {ansi('⋯', ANSI_DIM)} summarization level 2 (aggressive) succeeded for {original_msg_id}"
                 )
@@ -505,7 +541,7 @@ class LLMClient:
 
             Stops collecting once compacting the candidates would bring the
             total below *target* (optimistic estimate: each candidate shrinks
-            to tool_result_summarize_skip size).
+            to tool_result_summarize_skip tokens).
             """
             last_tool_idx = max(
                 (i for i, m in enumerate(messages) if m.get("role") == "tool"),
@@ -513,7 +549,7 @@ class LLMClient:
             )
             candidates: list[int] = []
             savings = 0
-            total = _total_message_chars(messages)
+            total = _count_total_tokens()
             for i, msg in enumerate(messages):
                 if total - savings <= target:
                     break
@@ -524,21 +560,22 @@ class LLMClient:
                 if content.startswith("[Summarized"):
                     continue
 
+                content_tokens = _count_content_tokens(content)
                 if role == "tool":
                     if (
                         i == last_tool_idx
-                        and len(content) <= ac.recent_tool_result_chars
+                        and content_tokens <= ac.recent_tool_result_chars
                     ):
                         continue
-                    if len(content) <= ac.tool_result_summarize_skip:
+                    if content_tokens <= ac.tool_result_summarize_skip:
                         continue
                     candidates.append(i)
-                    savings += len(content) - ac.tool_result_summarize_skip
+                    savings += content_tokens - ac.tool_result_summarize_skip
                 elif role == "user" and i == 1:
-                    if len(content) <= ac.tool_result_summarize_skip:
+                    if content_tokens <= ac.tool_result_summarize_skip:
                         continue
                     candidates.append(i)
-                    savings += len(content) - ac.tool_result_summarize_skip
+                    savings += content_tokens - ac.tool_result_summarize_skip
             return candidates
 
         def _compact_indices(messages: list[dict], indices: list[int]) -> None:
@@ -548,9 +585,11 @@ class LLMClient:
                 content = msg.get("content", "")
                 if not isinstance(content, str) or content.startswith("[Summarized"):
                     continue
+                tok_count = _count_content_tokens(content)
                 self._log(
-                    f"  {ansi('⋯', ANSI_DIM)} compressing message #{i} ({len(content):,} chars)"
+                    f"  {ansi('⋯', ANSI_DIM)} compressing message #{i} (~{tok_count:,} tokens)"
                 )
+                _token_cache.pop(id(msg), None)  # invalidate before replacement
                 messages[i] = {**msg, "content": _summarize_and_store(msg_ids[i], content)}
 
         # ── async compaction state (LCM §2.4: between-turn atomic swap) ───────
@@ -587,9 +626,11 @@ class LLMClient:
             applied = 0
             for idx, new_content in swaps:
                 if idx < len(messages):
-                    old = messages[idx].get("content", "")
+                    old_msg = messages[idx]
+                    old = old_msg.get("content", "")
                     if isinstance(old, str) and not old.startswith("[Summarized"):
-                        messages[idx] = {**messages[idx], "content": new_content}
+                        _token_cache.pop(id(old_msg), None)  # invalidate before replacement
+                        messages[idx] = {**old_msg, "content": new_content}
                         applied += 1
             return applied
 
@@ -628,7 +669,7 @@ class LLMClient:
             _apply_pending_swaps(messages)
 
             # If still over hard threshold, compact synchronously
-            if _total_message_chars(messages) > hard_threshold:
+            if _count_total_tokens() > hard_threshold:
                 self._log(
                     f"  {ansi('⋯', ANSI_DIM)} τ_hard still exceeded — blocking compaction"
                 )
@@ -791,7 +832,7 @@ class LLMClient:
                     if is_last_turn and not _extended_for_terminal_validation:
                         max_turns += 1
                         _extended_for_terminal_validation = True
-                    if len(err_str) > ac.tool_result_summarize_skip:
+                    if _count_content_tokens(err_str) > ac.tool_result_summarize_skip:
                         # Store original before summarizing
                         orig_msg = self._format_tool_result(tool_call.call_id, err_str)
                         orig_id = store.append(orig_msg, turn=turn)
@@ -827,7 +868,7 @@ class LLMClient:
             # Proactive summarization: summarize large tool results immediately
             # Tools can opt out by setting _skip_summarization = True
             skip_proactive = getattr(tool_fn, "_skip_summarization", False) if tool_fn else False
-            if not skip_proactive and len(result_str) > ac.tool_result_summarize_skip:
+            if not skip_proactive and _count_content_tokens(result_str) > ac.tool_result_summarize_skip:
                 # Store original before summarizing
                 orig_msg = self._format_tool_result(tool_call.call_id, result_str)
                 orig_id = store.append(orig_msg, turn=turn)
@@ -849,18 +890,18 @@ class LLMClient:
                     f"  {ansi('⋯', ANSI_DIM)} applied {n_swapped} async compaction result(s)"
                 )
 
-            total_chars = _total_message_chars(messages)
+            total_tokens = _count_total_tokens()
 
             # Step 2: if over τ_hard, block until under threshold
-            if total_chars > hard_threshold:
+            if total_tokens > hard_threshold:
                 self._log(
-                    f"  {ansi('⋯', ANSI_DIM)} context {total_chars:,} chars > τ_hard ({hard_threshold:,}) — blocking"
+                    f"  {ansi('⋯', ANSI_DIM)} context ~{total_tokens:,} tokens > τ_hard ({hard_threshold:,}) — blocking"
                 )
                 _blocking_compaction(messages)
             # Step 3: if over τ_soft, trigger async compaction for next turn
-            elif total_chars > soft_threshold:
+            elif total_tokens > soft_threshold:
                 self._log(
-                    f"  {ansi('⋯', ANSI_DIM)} context {total_chars:,} chars > τ_soft ({soft_threshold:,})"
+                    f"  {ansi('⋯', ANSI_DIM)} context ~{total_tokens:,} tokens > τ_soft ({soft_threshold:,})"
                 )
                 _maybe_start_async_compaction(messages)
 

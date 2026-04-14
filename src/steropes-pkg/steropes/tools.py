@@ -1,7 +1,7 @@
 """Tool decorator and utilities for the steropes agent framework."""
 
 import json
-from typing import Callable
+from collections.abc import Callable
 
 from pydantic import BaseModel
 
@@ -36,3 +36,26 @@ def _summarize_args(arguments: dict, max_len: int = 80) -> str:
 def _total_message_chars(messages: list[dict]) -> int:
     """Count total characters across all message content fields."""
     return sum(len(str(m.get("content", "") or "")) for m in messages)
+
+
+def _total_message_tokens(
+    messages: list[dict],
+    count_fn: Callable[[str], int],
+    cache: dict[int, int] | None = None,
+) -> int:
+    """Count total tokens across all message content fields.
+
+    *count_fn* maps a string to its token count (e.g. LLMClient.count_tokens).
+    *cache* is keyed on (id(message_dict)) so unchanged messages aren't
+    re-tokenized.  Callers should invalidate entries when a message is replaced
+    (e.g. during compaction).
+    """
+    if cache is None:
+        cache = {}
+    total = 0
+    for m in messages:
+        key = id(m)
+        if key not in cache:
+            cache[key] = count_fn(str(m.get("content", "") or ""))
+        total += cache[key]
+    return total

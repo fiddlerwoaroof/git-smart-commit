@@ -50,7 +50,8 @@ class TestAgentConfig:
     def test_defaults(self):
         cfg = AgentConfig()
         assert cfg.max_agentic_turns == 20
-        assert cfg.context_trim_threshold == 300_000
+        # Thresholds are now measured in tokens (see config.py docstring)
+        assert cfg.context_trim_threshold == 75_000
         assert cfg.context_soft_threshold is None
         assert cfg.context_hard_threshold is None
         assert cfg.compaction_preserve_marker is None
