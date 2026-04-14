@@ -1125,9 +1125,14 @@ class GitAnalyzer:
             sys.exit(1)
 
         git_dir = self.repo / ".git"
+        # NB: we deliberately do NOT check for REBASE_HEAD on its own.
+        # REBASE_HEAD is a ref git writes during rebase to record the commit
+        # being applied, but it can linger after a successful or aborted
+        # rebase (older git, ungraceful termination, rerere). The authoritative
+        # "rebase in progress" signal is the presence of rebase-merge/ or
+        # rebase-apply/ — if neither exists, there is no active rebase.
         checks = [
             (git_dir / "MERGE_HEAD", "merge"),
-            (git_dir / "REBASE_HEAD", "rebase"),
             (git_dir / "rebase-merge", "rebase"),
             (git_dir / "rebase-apply", "rebase"),
             (git_dir / "CHERRY_PICK_HEAD", "cherry-pick"),
