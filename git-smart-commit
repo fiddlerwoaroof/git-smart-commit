@@ -134,7 +134,16 @@ HUNK_GROUPING_RULES = textwrap.dedent("""\
     - File renames: when git detects a rename (diff header shows
       "rename from ... rename to ..."), the deletion of the old path and
       addition of the new path MUST be in the same commit. Never split a
-      rename across separate delete and add commits.\
+      rename across separate delete and add commits.
+    - Emit commits in a logical order: foundational changes first, then
+      the changes that build on them. Infrastructure and configuration
+      (chore, build, ci) typically come before feature or fix commits;
+      documentation that describes a code change comes after it; standalone
+      test commits come after the code they exercise already exists.
+      When in doubt, ask: "if someone cherry-picked these commits in this
+      order, would each one make sense on its own?" Ideally the sequence
+      should be bisectable — no commit introduces a state that depends on
+      a later commit to be correct.\
 """)
 
 BREAKING_CHANGE_RULES = textwrap.dedent("""\
