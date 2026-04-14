@@ -91,3 +91,42 @@ Run with: `uv run --group dev pytest`
 - `QueryResultArgs` moved to framework since it's integral to `agentic_loop`'s context management
 - steropes depends only on `httpx` and `pydantic`; no git, subprocess, or textual
 - Symlink support: script resolves its real path via `Path(__file__).resolve()` to find the local steropes package
+
+## Token-based Compaction Thresholds (gsc-psn)
+
+**Decision:** Compaction thresholds and the 3-level summarization escalation
+compare token counts, not character counts.
+
+**Rationale:** The LCM paper specifies Tokens(S) < Tokens(X). Character count is
+a poor proxy for code-heavy content (chars/token ratios vary widely by model
+and language). Mis-sized thresholds caused aggressive proactive summarization,
+which in turn drove the model to re-fetch compacted content via query_message
+(gsc-f2w).
+
+**Implementation:**
+- `LLMClient.count_tokens(text)` posts to `{server_root}/tokenize` (llama-server
+  convention: strip `/v1` suffix from the base URL). Falls back to `len(text) // 4`
+  on any error.
+- `tools._total_message_tokens(messages, count_fn, cache)` is the token
+  equivalent of `_total_message_chars`. Keyed on `id(msg_dict)` so unchanged
+  messages aren't re-tokenized across turns. Callers must invalidate cache
+  entries *before* replacing a message dict (compaction swap) so the new
+  content is counted.
+- All `_total_message_chars` call sites in `client.py::agentic_loop` switched
+  to the token-based equivalent. `len(content)` threshold checks in
+  `_compactable_candidates` and the proactive-summarization branch likewise
+  use `count_tokens(content)`.
+- Summarization levels 1 and 2 compare `count_tokens(summary) < original_tokens`
+  instead of character length — the previous char-based check could accept a
+  "smaller" summary that was actually *more* tokens.
+- `AgentConfig` threshold fields retain their names but now represent tokens
+  (the `_chars` suffix on `recent_tool_result_chars` is kept for API stability;
+  it semantically means tokens now). Defaults moved from `300_000` chars to
+  `75_000` tokens (roughly equivalent under chars/4 heuristic, but calibrated
+  for a ~128k-token context window).
+- `git-smart-commit` constants converted: `CONTEXT_SOFT/HARD_THRESHOLD`,
+  `TOOL_RESULT_SUMMARIZE_SKIP`, `RECENT_TOOL_RESULT_CHARS`, and the Ollama
+  thresholds are all in tokens now.
+- `TOOL_RESULT_SUMMARIZE_INPUT` stays char-based — it's a safety slice before
+  sending content to the summarizer prompt and doesn't participate in threshold
+  decisions.
